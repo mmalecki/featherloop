@@ -63,3 +63,16 @@ test('run ends when the model replies without tool calls', async () => {
   assert.equal(ends[0], result);
   assert.equal(loop.running, false);
 });
+
+test("tool names the model sends are only the toolset's own, not Object's", async () => {
+  const call = (name: string, id: string) => ({ id, type: 'function' as const, function: { name, arguments: '{}' } });
+  const api = fakeProvider([
+    { role: 'assistant', content: null, stop: 'tool_use', tool_calls: [call('constructor', 'call_1'), call('toString', 'call_2')] },
+    { role: 'assistant', content: 'Done.', stop: 'end' },
+  ]);
+  const { messages } = await new AgentLoop(api, {}).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.deepEqual(
+    messages.filter((m) => m.role === 'tool').map((m) => m.content),
+    ['Error: Unknown tool "constructor"', 'Error: Unknown tool "toString"'],
+  );
+});

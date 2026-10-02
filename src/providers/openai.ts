@@ -72,7 +72,7 @@ export class OpenAIProvider implements Provider {
         on.content(delta.content);
       }
       for (const part of delta.tool_calls ?? []) {
-        const call = (calls[part.index] ??= { id: '', type: 'function', function: { name: '', arguments: '' } });
+        const call = callFor(calls, part);
         if (part.id) call.id = part.id;
         if (part.function?.name) call.function.name += part.function.name;
         if (part.function?.arguments) call.function.arguments += part.function.arguments;
@@ -109,6 +109,21 @@ export class OpenAIProvider implements Provider {
  */
 function reasoningEffort(reasoning: Reasoning | undefined): { reasoning_effort?: Reasoning } {
   return reasoning === undefined ? {} : { reasoning_effort: reasoning };
+}
+
+/**
+ * The call a streamed piece belongs to. OpenAI numbers every piece with `index`;
+ * some servers (Gemini's and Ollama's OpenAI-compatible APIs) leave it out and send
+ * each call whole, with its id. Those are matched by id, and a piece with neither
+ * continues the last call, so two calls never merge into one, as treating a
+ * missing index as 0 would do.
+ */
+function callFor(
+  calls: ChatCompletionMessageFunctionToolCall[],
+  part: ChatCompletionChunk.Choice.Delta.ToolCall,
+): ChatCompletionMessageFunctionToolCall {
+  const index = typeof part.index === 'number' ? part.index : part.id ? calls.findIndex((call) => call?.id === part.id) : calls.length - 1;
+  return (calls[index < 0 ? calls.length : index] ??= { id: '', type: 'function', function: { name: '', arguments: '' } });
 }
 
 function toUsage(usage: CompletionUsage): Usage {
