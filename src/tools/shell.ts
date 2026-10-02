@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { writeFile } from 'node:fs/promises';
+import { open, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineTool } from '../tool.ts';
@@ -10,7 +10,7 @@ export interface ShellParams {
   /** Working directory. Defaults to the process cwd at call time. */
   cwd: string | undefined;
   timeoutMs: number;
-  /** Longer output keeps only its end; the full output goes to a temporary file. */
+  /** Longer output keeps only its end; the full output stays in a temporary file. */
   maxLength: number;
   shell: string;
 }
@@ -55,9 +55,37 @@ export const ShellTool = defineTool<ShellParams>({
   },
 
   async invoke({ command, cwd, timeoutMs, maxLength, shell }, { signal }) {
-    const { output, status } = await run(command, { cwd: cwd ?? process.cwd(), timeoutMs, shell, signal });
-    const body = await fit(output.trimEnd(), maxLength);
-    return body ? `${body}\n${status}` : status;
+    // stdout and stderr both go to this file, so the kernel keeps their writes in
+    // order, whatever the shell, and long output never has to fit in memory.
+    // Owner-only and created afresh: command output can contain secrets, and the
+    // temp directory is shared. There's no size limit yet: unlike a pipe, a file
+    // never makes the command wait, so runaway output fills the disk.
+    const file = join(tmpdir(), `featherslop-shell-${randomUUID()}.log`);
+    const handle = await open(file, 'ax+', 0o600);
+    let keep = false;
+    try {
+      const { status, lingering } = await run(command, handle.fd, { cwd: cwd ?? process.cwd(), timeoutMs, shell, signal });
+      const { size } = await handle.stat();
+      const out: string[] = [];
+      if (size > 0 && maxLength === 0) {
+        keep = true;
+        out.push(`[Output (${size} bytes) saved to ${file}]`);
+      } else if (size > 0) {
+        const { text, omitted } = await tail(handle, size, maxLength);
+        keep = omitted > 0;
+        if (omitted) out.push(`[… ${omitted} bytes omitted; full output saved to ${file} …]`);
+        if (text) out.push(text);
+      }
+      out.push(status);
+      if (lingering) {
+        keep = true;
+        out.push(`[Processes it started are still running; their output goes to ${file}]`);
+      }
+      return out.join('\n');
+    } finally {
+      await handle.close();
+      if (!keep) await rm(file, { force: true });
+    }
   },
 });
 
@@ -68,15 +96,16 @@ interface RunOptions {
   signal: AbortSignal | undefined;
 }
 
-function run(command: string, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<{ output: string; status: string }> {
+interface RunResult {
+  status: string;
+  /** Whether processes the command started, e.g. with `&`, outlived it. */
+  lingering: boolean;
+}
+
+function run(command: string, output: number, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     // Own process group, so a timeout or abort also stops whatever the command spawned.
-    const child = spawn(shell, ['-c', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
-
-    let output = '';
-    const collect = (chunk: Buffer) => (output += chunk.toString('utf8'));
-    child.stdout.on('data', collect);
-    child.stderr.on('data', collect);
+    const child = spawn(shell, ['-c', command], { cwd, stdio: ['ignore', output, output], detached: true });
 
     let stopped: string | undefined;
     const stop = (reason: string) => {
@@ -99,30 +128,48 @@ function run(command: string, { cwd, timeoutMs, shell, signal }: RunOptions): Pr
       cleanup();
       reject(err);
     });
-    child.on('close', (code, sig) => {
+    // 'exit', not 'close': there are no pipes to drain, and processes the command
+    // left running in the background don't hold the tool up.
+    child.on('exit', (code, sig) => {
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
       const status = stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${sig}]`;
-      resolve({ output, status });
+      resolve({ status, lingering: !stopped && child.pid !== undefined && groupAlive(child.pid) });
     });
   });
 }
 
+/** Whether any process is left in a process group. */
+function groupAlive(pgid: number): boolean {
+  try {
+    process.kill(-pgid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Output over `max` keeps only its end inline, where errors and summaries
- * usually are; the whole of it is saved to a temporary file.
+ * Output over `max` characters keeps only its end inline, where errors and
+ * summaries usually are. Reads no more of the file than that end.
  */
-async function fit(output: string, max: number): Promise<string> {
-  if (output.length <= max) return output;
+async function tail(handle: FileHandle, size: number, max: number): Promise<{ text: string; omitted: number }> {
+  // A character is at most 4 bytes in UTF-8, so the last `max` are within the last 4 * max bytes.
+  const start = Math.max(0, size - max * 4);
+  const bytes = Buffer.alloc(size - start);
+  await handle.read(bytes, 0, bytes.length, start);
+  // Skip a character cut in half by `start`: its continuation bytes look like 10xxxxxx.
+  let from = 0;
+  while (start > 0 && from < bytes.length && (bytes[from]! & 0xc0) === 0x80) from++;
+  const text = bytes.subarray(from).toString('utf8').trimEnd();
+  if (start === 0 && text.length <= max) return { text, omitted: 0 };
 
-  // Owner-only: command output can contain secrets, and the temp directory is shared.
-  const file = join(tmpdir(), `featherslop-shell-${randomUUID()}.log`);
-  await writeFile(file, output, { encoding: 'utf8', mode: 0o600 });
-
-  if (max === 0) return `[Output (${output.length} characters) saved to ${file}]`;
-  let tail = output.slice(-max);
+  let kept = text.slice(-max);
   // Start at a whole line, unless that would drop everything.
-  const newline = tail.indexOf('\n');
-  if (newline !== -1 && newline < tail.length - 1 && output[output.length - max - 1] !== '\n') tail = tail.slice(newline + 1);
-  return `[… ${output.length - tail.length} characters omitted; full output saved to ${file} …]\n${tail}`;
+  const newline = kept.indexOf('\n');
+  if (newline !== -1 && newline < kept.length - 1 && text[text.length - kept.length - 1] !== '\n') {
+    kept = kept.slice(newline + 1);
+  }
+  const omitted = start + from + Buffer.byteLength(text) - Buffer.byteLength(kept);
+  return { text: kept, omitted };
 }
