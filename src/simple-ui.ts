@@ -2,12 +2,15 @@ import { createInterface, type Interface } from 'node:readline';
 import { styleText } from 'node:util';
 import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
 import type { ResolvedModel } from './models.ts';
-import { addUsage, emptyUsage, type Usage } from './provider.ts';
+import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
 
 type Style = Parameters<typeof styleText>[0];
 
 /** Builds a fresh agent, e.g. so `/c` also resets tool state. */
 export type AgentFactory = () => AgentLoop;
+
+/** The model runs use; without `api`, the loop's own provider runs it. */
+type CurrentModel = Pick<ResolvedModel, 'ref' | 'model' | 'variant'> & { api?: Provider };
 
 export interface SimpleUIOptions {
   /**
@@ -45,8 +48,8 @@ export class SimpleUI {
   readonly options: SimpleUIOptions;
   #factory: AgentFactory | undefined;
   #loop: AgentLoop;
-  #model: string | ResolvedModel;
-  /** Pending `/model` switches, in order; runs wait for them. */
+  #model: CurrentModel;
+  /** Pending model switches, in order; runs wait for them. */
   #switching: Promise<unknown> = Promise.resolve();
   #out: NodeJS.WriteStream;
   #rl: Interface | undefined;
@@ -68,7 +71,7 @@ export class SimpleUI {
   constructor(agent: AgentLoop | AgentFactory, options: SimpleUIOptions) {
     this.options = options;
     this.#out = options.output ?? process.stdout;
-    this.#model = options.model;
+    this.#model = typeof options.model === 'string' ? { ref: options.model, model: options.model } : options.model;
     if (typeof agent === 'function') this.#factory = agent;
     this.#loop = this.#attach(typeof agent === 'function' ? agent() : agent);
     this.#reset();
@@ -80,23 +83,37 @@ export class SimpleUI {
 
   /** The model id runs use. */
   get model(): string {
-    return typeof this.#model === 'string' ? this.#model : this.#model.model;
+    return this.#model.model;
   }
 
   /**
    * Switches models for the following runs, keeping the conversation and tool
    * state. Takes a reference for `resolveModel`, or a model id without it.
+   * Switches happen in order, and runs started meanwhile wait for them.
    */
   async switchModel(ref: string, variant?: string): Promise<void> {
-    const { resolveModel } = this.options;
-    if (resolveModel) this.#model = await resolveModel(ref, variant);
-    else if (variant !== undefined) throw new Error('Variants need a model resolver');
-    else this.#model = ref;
+    await this.#switch(ref, variant);
   }
 
-  /** The model as shown: its reference and variant, if resolved. */
+  /** Queues a switch, or with no reference just waits for earlier ones; resolves to the model's label after it. */
+  #switch(ref: string | undefined, variant?: string): Promise<string> {
+    const switched = this.#switching.then(async () => {
+      if (ref !== undefined) this.#model = await this.#resolve(ref, variant);
+      return this.#modelLabel();
+    });
+    this.#switching = switched.catch(() => {});
+    return switched;
+  }
+
+  async #resolve(ref: string, variant: string | undefined): Promise<CurrentModel> {
+    const { resolveModel } = this.options;
+    if (resolveModel) return resolveModel(ref, variant);
+    if (variant !== undefined) throw new Error('Variants need a model resolver');
+    return { ref, model: ref };
+  }
+
+  /** The model as shown: its reference, and variant if it has one. */
   #modelLabel(): string {
-    if (typeof this.#model === 'string') return this.#model;
     const { ref, variant } = this.#model;
     return variant === undefined ? ref : `${ref} (${variant})`;
   }
@@ -158,7 +175,7 @@ export class SimpleUI {
       await this.#switching;
       const { messages } = await this.#loop.run({
         model: this.model,
-        ...(typeof this.#model === 'string' ? {} : { api: this.#model.api }),
+        ...(this.#model.api ? { api: this.#model.api } : {}),
         input: [...this.#history, { role: 'user', content: prompt }],
         signal: abort.signal,
         ...(this.options.request ? { request: this.options.request } : {}),
@@ -191,20 +208,14 @@ export class SimpleUI {
         this.#reset();
         this.#print(this.#style('green', '⏺ Cleared conversation'));
         break;
-      case '/model': {
+      case '/model':
         // Resolving may take a moment (e.g. loading an SDK); lines typed meanwhile come after.
-        const switched = this.#switching.then(async () => {
-          if (args[0]) await this.switchModel(args[0], args[1]);
-          return this.#modelLabel();
-        });
-        this.#switching = switched.catch(() => {});
         try {
-          this.#print(`${this.#style('green', '⏺ Model:')} ${await switched}`);
+          this.#print(`${this.#style('green', '⏺ Model:')} ${await this.#switch(args[0], args[1])}`);
         } catch (err) {
           this.#print(this.#style('red', `⏺ ${err instanceof Error ? err.message : String(err)}`));
         }
         break;
-      }
       case '/usage':
         this.#print(`${this.#style('green', '⏺ Session usage:')} ${formatUsage(this.#sessionUsage)}`);
         break;

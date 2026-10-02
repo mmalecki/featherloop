@@ -1,9 +1,9 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import { API_PACKAGES, ConfigError, type Config, type ProviderConfig } from './config.ts';
+import { API_PACKAGES, apiOf, ConfigError, EFFORT_KEYS, type Config, type ProviderConfig } from './config.ts';
 import type { Effort, Provider } from './provider.ts';
-import { AnthropicProvider, type AnthropicProviderOptions } from './providers/anthropic.ts';
-import { OpenAIProvider, type OpenAIProviderOptions } from './providers/openai.ts';
+import { AnthropicProvider } from './providers/anthropic.ts';
+import { OpenAIProvider } from './providers/openai.ts';
 
 /**
  * A model ready to run: the provider and model id to give a loop, or that a tool
@@ -18,26 +18,17 @@ export interface ResolvedModel {
   variant?: string;
 }
 
-export interface ModelRegistryOptions {
-  /** Options for every OpenAI-compatible provider; a model's limit and variant take precedence. */
-  openai?: OpenAIProviderOptions;
-  /** Options for every Anthropic provider; a model's limit and variant take precedence. */
-  anthropic?: AnthropicProviderOptions;
-}
-
 /** The models a config's providers offer, referred to as `provider/model`. */
 export class ModelRegistry {
   /** The config's default model, if it names one. */
   readonly default: string | undefined;
   readonly #providers: Record<string, ProviderConfig>;
-  readonly #options: ModelRegistryOptions;
   /** SDK clients, one per provider, made on first use. */
   readonly #clients = new Map<string, Promise<OpenAI | Anthropic>>();
 
-  constructor(config: Config = {}, options: ModelRegistryOptions = {}) {
+  constructor(config: Config = {}) {
     this.default = config.model;
     this.#providers = config.provider ?? {};
-    this.#options = options;
   }
 
   /**
@@ -49,13 +40,6 @@ export class ModelRegistry {
     const slash = ref.indexOf('/');
     if (slash < 0 || !Object.hasOwn(this.#providers, ref.slice(0, slash))) return undefined;
     return { provider: ref.slice(0, slash), model: ref.slice(slash + 1) };
-  }
-
-  /** Every model, as `provider/model`, with its variants' names. */
-  list(): { ref: string; variants: string[] }[] {
-    return Object.entries(this.#providers).flatMap(([provider, { models }]) =>
-      Object.entries(models).map(([model, { variants }]) => ({ ref: `${provider}/${model}`, variants: Object.keys(variants ?? {}) })),
-    );
   }
 
   /** Sets up a model to run, with the variant asked for, or else its `default` variant if it has one. */
@@ -77,33 +61,24 @@ export class ModelRegistry {
     }
 
     // As OpenCode's AI SDK providers send them: the effort setting as the API's own field, the rest as they are.
-    const { reasoningEffort, effort, ...fields } = settings;
-    const output = config.limit?.output;
     const client = await this.#client(parsed.provider);
-    let api: Provider;
-    if (client instanceof OpenAI) {
-      if (effort !== undefined) throw new ConfigError(`${ref}: OpenAI-compatible variants set effort with reasoningEffort`);
-      const base = this.#options.openai ?? {};
-      api = new OpenAIProvider(client, {
-        ...base,
-        request: {
-          ...base.request,
-          ...(output ? { max_tokens: output } : {}),
-          ...(reasoningEffort !== undefined ? { reasoning_effort: reasoningEffort } : {}),
-          ...fields,
-        },
-      });
-    } else {
-      if (reasoningEffort !== undefined) throw new ConfigError(`${ref}: Anthropic variants set effort with effort`);
-      const base = this.#options.anthropic ?? {};
-      api = new AnthropicProvider(client, {
-        ...base,
-        ...(output ? { maxTokens: output } : {}),
-        // An option, not a request field, so the provider still leaves it out for models without effort.
-        ...(effort !== undefined ? { effort: effort as Effort } : {}),
-        request: { ...base.request, ...fields },
-      });
-    }
+    const { [EFFORT_KEYS[client instanceof OpenAI ? 'openai' : 'anthropic']]: effort, ...fields } = settings;
+    const output = config.limit?.output;
+    const api: Provider =
+      client instanceof OpenAI
+        ? new OpenAIProvider(client, {
+            request: {
+              ...(output ? { max_tokens: output } : {}),
+              ...(effort !== undefined ? { reasoning_effort: effort } : {}),
+              ...fields,
+            },
+          })
+        : new AnthropicProvider(client, {
+            ...(output ? { maxTokens: output } : {}),
+            // An option, not a request field, so the provider still leaves it out for models without effort.
+            ...(effort !== undefined ? { effort: effort as Effort } : {}),
+            request: fields,
+          });
     return { ref, api, model: parsed.model, ...(variant !== undefined ? { variant } : {}) };
   }
 
@@ -121,8 +96,9 @@ export class ModelRegistry {
   #client(id: string): Promise<OpenAI | Anthropic> {
     let client = this.#clients.get(id);
     if (!client) {
-      const { npm, options } = this.#providers[id]!;
-      const api = npm ? API_PACKAGES[npm as keyof typeof API_PACKAGES] : id === 'openai' || id === 'anthropic' ? id : undefined;
+      const provider = this.#providers[id]!;
+      const { options } = provider;
+      const api = apiOf(id, provider);
       if (!api) throw new ConfigError(`provider.${id} needs npm: one of ${Object.keys(API_PACKAGES).join(', ')}`);
       client =
         api === 'openai'
