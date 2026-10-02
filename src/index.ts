@@ -1,10 +1,12 @@
 export * from './loop.ts';
 export * from './agent.ts';
+export * from './agents/general.ts';
 export * from './tool.ts';
 export * from './tools/read.ts';
 export * from './tools/write.ts';
 export * from './tools/update.ts';
 export * from './tools/shell.ts';
+export * from './tools/subagent.ts';
 export { GrepTool, type GrepParams } from './tools/grep.ts';
 export { GlobTool, type GlobParams } from './tools/glob.ts';
 export * from './tools/fs.ts';

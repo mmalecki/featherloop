@@ -1,4 +1,5 @@
-import type { Provider } from './provider.ts';
+import type { AgentLoop } from './loop.ts';
+import type { Message, Provider } from './provider.ts';
 
 export type JSONSchema = Record<string, unknown>;
 
@@ -14,6 +15,19 @@ export interface ToolContext {
   /** Model the loop is currently running with. */
   model: string;
   signal?: AbortSignal;
+  /**
+   * The conversation so far, ending with the assistant message that made this
+   * call (its tool calls not yet answered), e.g. to pass on to a subagent or to
+   * compact. Read-only, and only valid during the call. The loop always sets it;
+   * it's absent when a tool is invoked directly.
+   */
+  messages?: readonly Message[];
+  /**
+   * Shows a loop the tool runs itself, such as a subagent's, as part of this one:
+   * its tool calls and results are re-emitted here, with `parent` set to this
+   * call's id. Attach it before running the child loop. Set by the loop.
+   */
+  relay?: (child: AgentLoop) => void;
 }
 
 export interface Tool<P = Record<string, unknown>> {

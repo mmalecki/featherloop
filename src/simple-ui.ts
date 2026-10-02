@@ -49,6 +49,8 @@ export class SimpleUI {
   #blankLines = 0;
   #lastCall: string | undefined;
   #calls = new Map<string, ToolCallEvent>();
+  /** The call whose nested calls would follow the last tool line without naming it. */
+  #context: string | undefined;
   #runUsage = emptyUsage();
   #sessionUsage = emptyUsage();
 
@@ -262,22 +264,50 @@ export class SimpleUI {
 
   #toolCall(call: ToolCallEvent): void {
     this.#endBlock();
-    this.#calls.set(call.id, call);
-    this.#print(`\n${this.#style('green', `⏺ ${capitalize(call.name)}`)}(${this.#style('dim', argPreview(call.arguments))})`);
-    this.#lastCall = call.id;
+    const key = callKey(call);
+    this.#calls.set(key, call);
+    // Calls made inside another call (a subagent's) sit under it, without a blank line.
+    // Parallel subagents interleave, so name the enclosing call when it changes.
+    const depth = this.#depth(call);
+    const parent = call.parent === undefined ? undefined : this.#find(call.parent);
+    const tag = parent && call.parent !== this.#context ? this.#style('dim', ` · in ${label(parent)}`) : '';
+    const line = `${this.#style('green', `⏺ ${capitalize(call.name)}`)}(${this.#style('dim', argPreview(call.arguments))})${tag}`;
+    this.#print(depth ? `${'  '.repeat(depth)}${line}` : `\n${line}`);
+    this.#lastCall = key;
+    this.#context = call.parent ?? call.id;
   }
 
-  #toolResult({ id, result, isError }: ToolResultEvent): void {
+  #toolResult(event: ToolResultEvent): void {
+    const { result, isError } = event;
     const lines = result.trimEnd().split('\n');
     let summary = preview(lines[0] ?? '', 60);
     if (lines.length > 1) summary += ` … +${lines.length - 1} lines`;
 
-    // Parallel calls finish out of order; label results that don't follow their call.
-    const call = this.#calls.get(id);
-    const label = id !== this.#lastCall && call ? `${capitalize(call.name)}(${preview(argPreview(call.arguments), 30)}) ` : '';
-    this.#print(`  ${this.#style('dim', `⎿  ${label}`)}${this.#style(isError ? 'red' : 'dim', summary)}`);
-    this.#calls.delete(id);
+    // Parallel calls finish out of order, and a subagent's calls come between its
+    // call and its result; label results that don't follow their call.
+    const key = callKey(event);
+    const call = this.#calls.get(key);
+    const name = key !== this.#lastCall && call ? `${label(call)} ` : '';
+    const indent = '  '.repeat(this.#depth(event) + 1);
+    this.#print(`${indent}${this.#style('dim', `⎿  ${name}`)}${this.#style(isError ? 'red' : 'dim', summary)}`);
+    this.#calls.delete(key);
     this.#lastCall = undefined;
+    this.#context = event.parent;
+  }
+
+  /** How many calls `call` runs inside: 0 for the loop's own calls. */
+  #depth(call: ToolCallEvent): number {
+    let depth = 0;
+    for (let parent = call.parent; parent !== undefined; depth++) parent = this.#find(parent)?.parent;
+    return depth;
+  }
+
+  /** A pending call that others run inside, by its id: one of the loop's own first, since ids repeat across levels. */
+  #find(id: string): ToolCallEvent | undefined {
+    const own = this.#calls.get(id);
+    if (own) return own;
+    for (const call of this.#calls.values()) if (call.id === id) return call;
+    return undefined;
   }
 
   /** Finishes whatever block (text or reasoning) is being streamed. */
@@ -320,6 +350,16 @@ export class SimpleUI {
   #print(value: string): void {
     this.#out.write(`${value}\n`);
   }
+}
+
+/** A call as results and nested calls refer to it, e.g. "Read(main.js)". */
+function label(call: ToolCallEvent): string {
+  return `${capitalize(call.name)}(${preview(argPreview(call.arguments), 30)})`;
+}
+
+/** Ids are unique within a loop, not across the loops nested in it. */
+function callKey({ id, parent }: ToolCallEvent): string {
+  return parent === undefined ? id : `${parent}/${id}`;
 }
 
 function hasUsage(usage: Usage): boolean {

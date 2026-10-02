@@ -32,7 +32,7 @@ export interface PermissionRule {
 const ACTIONS: Record<string, string> = { write: 'edit', update: 'edit' };
 
 /** The built-in tools' actions, valid in rules even when a tool isn't available (e.g. websearch without a key). */
-const BUILT_IN_ACTIONS = ['read', 'edit', 'grep', 'glob', 'shell', 'webfetch', 'websearch'];
+const BUILT_IN_ACTIONS = ['read', 'edit', 'grep', 'glob', 'shell', 'webfetch', 'websearch', 'subagent'];
 
 /**
  * A system prompt and the permissions that pick its tools. The loop doesn't know

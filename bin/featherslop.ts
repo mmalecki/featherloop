@@ -7,7 +7,7 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import {
   AnthropicProvider,
-  defineAgent,
+  generalAgent,
   GlobTool,
   GrepTool,
   Loop,
@@ -15,6 +15,7 @@ import {
   ParallelWebSearchTool,
   ShellTool,
   SimpleUI,
+  SubagentTool,
   WebFetchTool,
   type PermissionRule,
   type Provider,
@@ -40,8 +41,10 @@ const argv = await yargs(hideBin(process.argv))
     describe: 'OpenAI-compatible endpoint (env OPENAI_BASE_URL)',
   })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
+  .option('subagent', { type: 'boolean', default: false, describe: 'Add a subagent tool for handing off tasks' })
   .epilogue(
-    'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set.\n' +
+    'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set;\n' +
+      'shell and subagent with --shell and --subagent.\n' +
       'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.',
   )
   .version(version())
@@ -50,26 +53,16 @@ const argv = await yargs(hideBin(process.argv))
   .strictOptions()
   .parseAsync();
 
-const { model, shell } = argv;
+const { model, shell, subagent } = argv;
 const provider = argv.provider ?? (model.startsWith('claude-') ? 'anthropic' : 'openai');
 
 const api = provider === 'anthropic' ? await anthropic() : openai();
 
-// The only agent for now: every tool but the shell, which --shell turns on.
-const general = defineAgent({
-  name: 'general',
-  description: 'General-purpose assistant',
-  system: ({ date, cwd }) => `Concise assistant. Today is ${date}. cwd: ${cwd}`,
-  permissions: [
-    { action: '*', effect: 'allow' },
-    { action: 'shell', effect: 'deny' },
-  ],
-});
 // Rules from flags come after the agent's, so they win.
 const flagPermissions: PermissionRule[] = shell ? [{ action: 'shell', effect: 'allow' }] : [];
 
-// A factory, so `/c` starts over with fresh tool state (e.g. which files were read).
-const createLoop = () => {
+/** Every tool an agent may get, built afresh: each loop and subagent tracks its own file state. */
+const availableTools = (): Toolset => {
   const available: Toolset = {
     // read, write and update; updates and overwrites only after a read.
     ...ManagedFileTools(),
@@ -85,12 +78,22 @@ const createLoop = () => {
     shell: ShellTool(),
   };
   if (process.env.PARALLEL_API_KEY) available.websearch = ParallelWebSearchTool();
-  return Loop(api, general.toolset(available, flagPermissions));
+  return available;
+};
+
+// A factory, so `/c` starts over with fresh tool state (e.g. which files were read).
+const createLoop = () => {
+  const available = availableTools();
+  // Subagents get the same tools and flags, but never this tool (SubagentTool denies it).
+  if (subagent) {
+    available.subagent = SubagentTool({ agents: [generalAgent], tools: availableTools, permissions: flagPermissions });
+  }
+  return Loop(api, generalAgent.toolset(available, flagPermissions));
 };
 
 const ui = new SimpleUI(createLoop, {
   model,
-  system: general.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model }),
+  system: generalAgent.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model }),
 });
 
 const prompt = argv._.join(' ');

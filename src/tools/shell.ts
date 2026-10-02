@@ -1,9 +1,9 @@
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { open, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineTool } from '../tool.ts';
+import { spawnGroup } from './process.ts';
 
 export interface ShellParams {
   command: string;
@@ -102,51 +102,13 @@ interface RunResult {
   lingering: boolean;
 }
 
-function run(command: string, output: number, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<RunResult> {
-  return new Promise((resolve, reject) => {
-    // Own process group, so a timeout or abort also stops whatever the command spawned.
-    const child = spawn(shell, ['-c', command], { cwd, stdio: ['ignore', output, output], detached: true });
-
-    let stopped: string | undefined;
-    const stop = (reason: string) => {
-      stopped ??= reason;
-      try {
-        if (child.pid) process.kill(-child.pid, 'SIGKILL');
-      } catch {
-        // Already gone.
-      }
-    };
-    const timer = setTimeout(() => stop(`timed out after ${timeoutMs / 1000}s`), timeoutMs);
-    const onAbort = () => stop('aborted');
-    signal?.addEventListener('abort', onAbort, { once: true });
-    const cleanup = () => {
-      clearTimeout(timer);
-      signal?.removeEventListener('abort', onAbort);
-    };
-
-    child.on('error', (err) => {
-      cleanup();
-      reject(err);
-    });
-    // 'exit', not 'close': there are no pipes to drain, and processes the command
-    // left running in the background don't hold the tool up.
-    child.on('exit', (code, sig) => {
-      cleanup();
-      if (signal?.aborted) return reject(signal.reason);
-      const status = stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${sig}]`;
-      resolve({ status, lingering: !stopped && child.pid !== undefined && groupAlive(child.pid) });
-    });
-  });
-}
-
-/** Whether any process is left in a process group. */
-function groupAlive(pgid: number): boolean {
-  try {
-    process.kill(-pgid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+async function run(command: string, output: number, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<RunResult> {
+  // 'exit', not 'close': there are no pipes to drain, and processes the command
+  // left running in the background don't hold the tool up.
+  const { done } = spawnGroup(shell, ['-c', command], { cwd, stdio: ['ignore', output, output], timeoutMs, signal, until: 'exit' });
+  const { code, exitSignal, stopped, lingering } = await done;
+  const status = stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${exitSignal}]`;
+  return { status, lingering };
 }
 
 /**

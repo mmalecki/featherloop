@@ -59,6 +59,12 @@ export interface ToolCallEvent {
   id: string;
   name: string;
   arguments: unknown;
+  /**
+   * Absent for this loop's own calls. Set for calls made inside one of them, such
+   * as a subagent's: the id of that enclosing call (see `ToolContext.relay`).
+   * Listeners that count or audit the model's own calls should skip these.
+   */
+  parent?: string;
 }
 
 export interface ToolResultEvent extends ToolCallEvent {
@@ -166,7 +172,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         const skip = message.stop === 'refusal' || message.stop === 'max_tokens' ? message.stop : undefined;
         const results = skip
           ? message.tool_calls.map((call) => this.#skip(call, skip))
-          : await this.#invokeAll(message.tool_calls, toolset, { model, signal, track });
+          : await this.#invokeAll(message.tool_calls, toolset, { model, signal, track, messages });
         for (const result of results) {
           messages.push(result);
           this.emit('message', result);
@@ -212,7 +218,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   async #invoke(
     call: ChatCompletionMessageFunctionToolCall,
     toolset: Toolset,
-    { model, signal, track }: InvokeContext,
+    { model, signal, track, messages }: InvokeContext,
   ): Promise<ToolMessage> {
     const { id } = call;
     const { name, arguments: raw } = call.function;
@@ -225,7 +231,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
       const tool = toolset[name];
       if (!tool) throw new ToolInputError(`Unknown tool "${name}"`);
       if (!args) throw new ToolInputError('Arguments must be a JSON object');
-      result = await tool.invoke(args, { api: attributed(this.api, name, track), model, signal });
+      result = await tool.invoke(args, { api: attributed(this.api, name, track), model, signal, messages, relay: this.#relay(id) });
     } catch (err) {
       if (signal?.aborted) throw err;
       // Any failure goes back to the model as the tool result; it may be able to recover.
@@ -235,6 +241,17 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
 
     this.emit('tool_result', { id, name, arguments: args, result, isError });
     return { role: 'tool', tool_call_id: id, content: result, ...(isError ? { is_error: true } : {}) };
+  }
+
+  /**
+   * Re-emits a nested loop's tool calls and results as this loop's, under the call
+   * `id`. Only those two events: nested usage is already counted, via `attributed()`.
+   */
+  #relay(id: string): (child: AgentLoop) => void {
+    return (child) => {
+      child.on('tool_call', (call) => this.emit('tool_call', { ...call, parent: call.parent ?? id }));
+      child.on('tool_result', (result) => this.emit('tool_result', { ...result, parent: result.parent ?? id }));
+    };
   }
 
   #skip(call: ChatCompletionMessageFunctionToolCall, reason: 'refusal' | 'max_tokens'): ToolMessage {
@@ -259,6 +276,8 @@ interface InvokeContext {
   model: string;
   signal: AbortSignal | undefined;
   track: Track;
+  /** Tool results are added only after the whole turn's calls finish, so this doesn't change during them. */
+  messages: readonly Message[];
 }
 
 type Track = (usage: Usage, info: Pick<UsageEvent, 'model' | 'source' | 'tool'>) => void;
