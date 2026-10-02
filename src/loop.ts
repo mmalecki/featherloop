@@ -144,8 +144,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     }
   }
 
-  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, reasoning, request, ...run }: RunOptions): Promise<RunResult> {
-    const api = run.api ? toProvider(run.api) : this.api;
+  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, reasoning, request, api: client }: RunOptions): Promise<RunResult> {
+    const api = client ? toProvider(client) : this.api;
     const messages: Message[] = [...input];
     const tools = toolSpecs(toolset);
     let usage = emptyUsage();
