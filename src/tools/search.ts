@@ -74,7 +74,14 @@ interface RunOptions {
   signal: AbortSignal | undefined;
 }
 
-/** Runs a command without a shell; a timeout, abort or too much output kills it. */
+/** Only the start of stderr is kept: it's summarized into a note or an error message. */
+const MAX_STDERR_BYTES = 4_000;
+
+/**
+ * Runs a command without a shell; a timeout, abort or too much output kills it.
+ * stdout and stderr stay separate: stdout is parsed into results, which get sorted,
+ * and stderr only becomes a note, so the order between them never matters.
+ */
 export function run(command: string, args: string[], { cwd, timeoutMs, signal }: RunOptions): Promise<RunResult> {
   return new Promise((resolve, reject) => {
     // Own process group, so a timeout or abort also stops whatever the command spawned.
@@ -82,7 +89,9 @@ export function run(command: string, args: string[], { cwd, timeoutMs, signal }:
 
     const chunks: Buffer[] = [];
     let size = 0;
-    let stderr = '';
+    // Buffers, decoded once at the end, so a character split across chunks survives.
+    const errors: Buffer[] = [];
+    let errorSize = 0;
     let stopped: string | undefined;
     child.stdout.on('data', (chunk: Buffer) => {
       if (stopped) return;
@@ -91,7 +100,9 @@ export function run(command: string, args: string[], { cwd, timeoutMs, signal }:
       if (size > MAX_OUTPUT_BYTES) stop(`stopped after ${MAX_OUTPUT_BYTES / 1024 / 1024} MiB of output`);
     });
     child.stderr.on('data', (chunk: Buffer) => {
-      if (stderr.length < 4_000) stderr += chunk.toString('utf8');
+      if (errorSize >= MAX_STDERR_BYTES) return;
+      errors.push(chunk);
+      errorSize += chunk.length;
     });
 
     const stop = (reason: string) => {
@@ -117,7 +128,9 @@ export function run(command: string, args: string[], { cwd, timeoutMs, signal }:
     child.on('close', (code) => {
       cleanup();
       if (signal?.aborted) return reject(signal.reason);
-      resolve({ stdout: Buffer.concat(chunks).toString('utf8'), stderr, code, ...(stopped ? { stopped } : {}) });
+      const stdout = Buffer.concat(chunks).toString('utf8');
+      const stderr = Buffer.concat(errors).toString('utf8');
+      resolve({ stdout, stderr, code, ...(stopped ? { stopped } : {}) });
     });
   });
 }
