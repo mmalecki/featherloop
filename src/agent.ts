@@ -37,7 +37,10 @@ export interface PermissionRule {
 }
 
 /** Tools whose action isn't their own name. */
-const ACTIONS: Record<string, string> = { write: 'edit', update: 'edit' };
+const ACTIONS: ReadonlyMap<string, string> = new Map([
+  ['write', 'edit'],
+  ['update', 'edit'],
+]);
 
 /** The built-in tools' actions, valid in rules even when a tool isn't available (e.g. websearch without a key). */
 const BUILT_IN_ACTIONS = ['read', 'edit', 'grep', 'glob', 'shell', 'webfetch', 'websearch', 'subagent'];
@@ -111,7 +114,7 @@ function checkRule(rule: PermissionRule, where: string): void {
 }
 
 function actionOf(tool: string): string {
-  return ACTIONS[tool] ?? tool;
+  return ACTIONS.get(tool) ?? tool;
 }
 
 function allowed(rules: readonly PermissionRule[], action: string): boolean {
