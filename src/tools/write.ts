@@ -1,7 +1,7 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { fsError, resolvePath } from './shared/fs.ts';
+import { fsError, replaceFile, resolvePath } from './shared/fs.ts';
 
 export interface WriteParams {
   path: string;
@@ -32,9 +32,11 @@ export const WriteTool = defineTool<WriteParams>({
     if (typeof content !== 'string') throw new ToolInputError('content must be a string');
     const file = resolvePath(path, cwd);
 
+    // Stop before writing, never during: an interrupted write would leave half a file.
+    signal?.throwIfAborted();
     try {
       await mkdir(dirname(file), { recursive: true });
-      await writeFile(file, content, { encoding: 'utf8', signal });
+      await replaceFile(file, content);
     } catch (err) {
       throw fsError(err, path);
     }

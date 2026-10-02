@@ -1,6 +1,6 @@
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { fsError, resolvePath } from './shared/fs.ts';
+import { fsError, replaceFile, resolvePath } from './shared/fs.ts';
 
 export interface UpdateParams {
   path: string;
@@ -75,7 +75,13 @@ export const UpdateTool = defineTool<UpdateParams>({
     // split/join and slicing avoid String.replace's `$&`-style patterns in the replacement.
     const index = text.indexOf(old);
     const updated = all ? text.split(old).join(replacement) : text.slice(0, index) + replacement + text.slice(index + old.length);
-    await writeFile(file, updated, { encoding: 'utf8', signal });
+    // Stop before writing, never during: an interrupted write would leave half a file.
+    signal?.throwIfAborted();
+    try {
+      await replaceFile(file, updated);
+    } catch (err) {
+      throw fsError(err, path);
+    }
 
     return `Updated ${path} (${count} ${count === 1 ? 'replacement' : 'replacements'})`;
   },
