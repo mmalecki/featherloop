@@ -2,6 +2,10 @@
   "name": "featherloop",
   "version": "0.1.0",
   "description": "Minimal agent execution loop with configurable, context-lean toolsets",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mmalecki/featherloop.git"
+  },
   "type": "module",
   "main": "dist/src/index.js",
   "types": "dist/src/index.d.ts",

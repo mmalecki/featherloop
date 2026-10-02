@@ -8,6 +8,7 @@ import {
   advisorAgent,
   ConfigError,
   configPath,
+  FLAVORS,
   generalAgent,
   GlobTool,
   GrepTool,
@@ -32,17 +33,13 @@ const argv = await yargs(hideBin(process.argv))
     alias: 'm',
     type: 'string',
     describe:
-      "provider/model or an alias from the config, or a bare model id (env MODEL; default: the config's model, else qwen-3.5-9b)",
+      "provider/model or an alias from the config, or a bare model id (env MODEL; default: the config's model, or its only one)",
   })
   .option('variant', { type: 'string', describe: "One of the model's variants from the config (default: its default one, if any)" })
-  .option('provider', {
-    choices: ['openai', 'anthropic'] as const,
-    describe: 'API for a bare model id (default: anthropic for claude-* models, otherwise openai)',
-  })
+  .option('flavor', { choices: FLAVORS, default: 'openai' as const, describe: 'API a bare model id speaks' })
   .option('base-url', {
     type: 'string',
-    default: process.env.OPENAI_BASE_URL ?? 'http://127.0.0.1:9931/v1',
-    describe: 'OpenAI-compatible endpoint for a bare model id (env OPENAI_BASE_URL)',
+    describe: 'Endpoint for a bare model id, with /v1 (openai flavor: env OPENAI_BASE_URL, else http://127.0.0.1:9931/v1)',
   })
   .option('config', { type: 'string', default: configPath(), describe: 'Config file, for providers and models' })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
@@ -68,7 +65,7 @@ const { shell, subagent } = argv;
 const advisor = argv.advisor || argv.advisorModel !== undefined;
 const registry = await exitOnConfigError(() => new ModelRegistry(loadConfig(argv.config)));
 const initial = await exitOnConfigError(() =>
-  resolveModel(argv.model ?? process.env.MODEL ?? registry.default ?? 'qwen-3.5-9b', argv.variant),
+  resolveModel(argv.model ?? process.env.MODEL ?? registry.default ?? onlyModel(), argv.variant),
 );
 if (advisor) {
   // Set it up now, so a missing alias or SDK shows before the session, not on the first call.
@@ -120,18 +117,28 @@ if (prompt) await ui.ask(prompt);
 else await ui.start();
 
 /**
- * A model or alias from the config, or a bare model id run where --provider and
+ * A model or alias from the config, or a bare model id run where --flavor and
  * --base-url say. For the initial model, `/model` and agents' own models; a model
  * given to --advisor-model stands in for the advisor alias.
  */
 async function resolveModel(ref: string, variant?: string): Promise<ResolvedModel> {
   if (ref === advisorAgent.model && argv.advisorModel) ref = argv.advisorModel;
   if (registry.knows(ref)) return registry.resolve(ref, { variant });
-  const provider = argv.provider ?? (ref.startsWith('claude-') ? 'anthropic' : 'openai');
-  const flags: Config = {
-    provider: { [provider]: { ...(provider === 'openai' ? { options: { baseURL: argv.baseUrl } } : {}), models: { [ref]: {} } } },
-  };
-  return new ModelRegistry(flags).resolve(`${provider}/${ref}`, { variant });
+  const { flavor } = argv;
+  const baseURL = argv.baseUrl ?? (flavor === 'openai' ? (process.env.OPENAI_BASE_URL ?? 'http://127.0.0.1:9931/v1') : undefined);
+  const flags: Config = { provider: { [flavor]: { flavor, ...(baseURL ? { options: { baseURL } } : {}), models: { [ref]: {} } } } };
+  return new ModelRegistry(flags).resolve(`${flavor}/${ref}`, { variant });
+}
+
+/** With no model named anywhere, the config's only model; with none or several, the user picks. */
+function onlyModel(): string {
+  const models = registry.models();
+  if (models.length === 1) return models[0]!;
+  throw new ConfigError(
+    models.length
+      ? `Pick a model with --model, or set model in ${argv.config}. Configured: ${models.join(', ')}`
+      : `No model: pass --model, or configure one in ${argv.config}`,
+  );
 }
 
 /** Config errors are the user's to fix: their message is enough. */

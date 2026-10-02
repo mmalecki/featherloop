@@ -1,6 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import { API_PACKAGES, apiOf, ConfigError, EFFORT_KEYS, type AliasConfig, type Config, type ProviderConfig } from './config.ts';
+import { ConfigError, EFFORT_KEYS, FLAVORS, type AliasConfig, type Config, type ProviderConfig } from './config.ts';
 import type { Effort, Provider } from './provider.ts';
 import { AnthropicProvider } from './providers/anthropic.ts';
 import { OpenAIProvider } from './providers/openai.ts';
@@ -36,6 +36,11 @@ export class ModelRegistry {
     this.default = config.model;
     this.#providers = config.provider ?? {};
     this.#aliases = config.aliases ?? {};
+  }
+
+  /** Every configured model, as `provider/model`; aliases aren't models of their own. */
+  models(): string[] {
+    return Object.entries(this.#providers).flatMap(([provider, { models }]) => Object.keys(models).map((model) => `${provider}/${model}`));
   }
 
   /** Whether `ref` is an alias, or a model of one of this registry's providers. */
@@ -83,7 +88,7 @@ export class ModelRegistry {
 
     // As OpenCode's AI SDK providers send them: the effort setting as the API's own field, the rest as they are.
     const client = await this.#client(parsed.provider);
-    const { [EFFORT_KEYS[client instanceof OpenAI ? 'openai' : 'anthropic']]: effort, ...fields } = settings;
+    const { [EFFORT_KEYS[this.#providers[parsed.provider]!.flavor]]: effort, ...fields } = settings;
     const output = config.limit?.output;
     const api: Provider =
       client instanceof OpenAI
@@ -117,12 +122,10 @@ export class ModelRegistry {
   #client(id: string): Promise<OpenAI | Anthropic> {
     let client = this.#clients.get(id);
     if (!client) {
-      const provider = this.#providers[id]!;
-      const { options } = provider;
-      const api = apiOf(id, provider);
-      if (!api) throw new ConfigError(`provider.${id} needs npm: one of ${Object.keys(API_PACKAGES).join(', ')}`);
+      const { flavor, options } = this.#providers[id]!;
+      if (!FLAVORS.includes(flavor)) throw new ConfigError(`provider.${id}.flavor must be one of ${FLAVORS.join(', ')}`);
       client =
-        api === 'openai'
+        flavor === 'openai'
           ? Promise.resolve(
               new OpenAI({
                 ...(options?.baseURL ? { baseURL: options.baseURL } : {}),
@@ -142,7 +145,7 @@ async function anthropic(baseURL: string | undefined, apiKey: string | undefined
   try {
     const { default: Anthropic } = await import('@anthropic-ai/sdk');
     return new Anthropic({
-      // OpenCode's base URLs end in /v1, which the SDK adds itself.
+      // Base URLs include /v1, as for the openai flavor; this SDK adds it itself.
       ...(baseURL ? { baseURL: baseURL.replace(/\/v1\/?$/, '') } : {}),
       // Otherwise the SDK reads ANTHROPIC_API_KEY.
       ...(apiKey ? { apiKey } : {}),

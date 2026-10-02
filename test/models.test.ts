@@ -15,7 +15,7 @@ const CONFIG = `
 model: local/qwen
 provider:
   local:
-    npm: "@ai-sdk/openai-compatible"
+    flavor: openai
     options:
       baseURL: http://127.0.0.1:9931/v1
     models:
@@ -31,6 +31,7 @@ provider:
           default: { chat_template_kwargs: { enable_thinking: false } }
           thinking: { chat_template_kwargs: { enable_thinking: true } }
   anthropic:
+    flavor: anthropic
     models:
       claude-haiku-4-5: { limit: { output: 32000 } }
       claude-sonnet-5-5:
@@ -63,22 +64,24 @@ test('reads an OpenCode-shaped config', () => {
 test('rejects fields it does not support, by path', () => {
   const rejects = (yaml: string, message: RegExp) => assert.throws(() => parseConfig(yaml), (err) => err instanceof ConfigError && message.test(err.message));
   rejects('small_model: local/qwen', /^small_model isn't supported/);
-  rejects('provider: { openai: { models: { qwen: { limit: { context: 1000 } } } } }', /^provider\.openai\.models\.qwen\.limit\.context isn't supported/);
-  rejects('provider: { openai: { name: Local, models: {} } }', /^provider\.openai\.name isn't supported/);
-  rejects('provider: { local: { npm: "@ai-sdk/google", models: {} } }', /^provider\.local\.npm must be one of/);
-  rejects('provider: { openai: { options: {} } }', /^provider\.openai\.models is missing/);
-  rejects('provider: { openai: { models: { qwen: { limit: { output: -1 } } } } }', /must be a positive integer/);
-  rejects('provider: { openai: { models: { qwen: { variants: { low: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.low must be a mapping/);
-  rejects('provider: { openai: { models: { qwen: { variants: { default: high } } } } }', /^provider\.openai\.models\.qwen\.variants\.default names no variant: high/);
-  rejects('provider: { openai: { models: { qwen: { variants: { default: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.default must be a mapping/);
-  rejects('provider: { local: { models: {} } }', /^provider\.local needs npm: one of/);
+  rejects('provider: { openai: { flavor: openai, models: { qwen: { limit: { context: 1000 } } } } }', /^provider\.openai\.models\.qwen\.limit\.context isn't supported/);
+  rejects('provider: { openai: { flavor: openai, name: Local, models: {} } }', /^provider\.openai\.name isn't supported/);
+  rejects('provider: { local: { flavor: google, models: {} } }', /^provider\.local\.flavor must be one of openai, anthropic/);
+  rejects('provider: { local: { npm: "@ai-sdk/openai", models: {} } }', /^provider\.local\.npm isn't supported \(provider\.local: flavor, options, models\)/);
+  rejects('provider: { openai: { flavor: openai, options: {} } }', /^provider\.openai\.models is missing/);
+  rejects('provider: { openai: { flavor: openai, models: { qwen: { limit: { output: -1 } } } } }', /must be a positive integer/);
+  rejects('provider: { openai: { flavor: openai, models: { qwen: { variants: { low: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.low must be a mapping/);
+  rejects('provider: { openai: { flavor: openai, models: { qwen: { variants: { default: high } } } } }', /^provider\.openai\.models\.qwen\.variants\.default names no variant: high/);
+  rejects('provider: { openai: { flavor: openai, models: { qwen: { variants: { default: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.default must be a mapping/);
+  // No guessing from the provider's name.
+  rejects('provider: { openai: { models: {} } }', /^provider\.openai\.flavor must be one of/);
   // Each API's own name for effort, as the AI SDK has them; the other would go out as an unknown field.
-  rejects('provider: { anthropic: { models: { opus: { variants: { max: { reasoningEffort: max } } } } } }', /^provider\.anthropic\.models\.opus\.variants\.max\.reasoningEffort: anthropic variants set effort with effort/);
-  rejects('provider: { openai: { models: { gpt: { variants: { default: { effort: high } } } } } }', /^provider\.openai\.models\.gpt\.variants\.default\.effort: openai variants set effort with reasoningEffort/);
+  rejects('provider: { anthropic: { flavor: anthropic, models: { opus: { variants: { max: { reasoningEffort: max } } } } } }', /^provider\.anthropic\.models\.opus\.variants\.max\.reasoningEffort: anthropic variants set effort with effort/);
+  rejects('provider: { openai: { flavor: openai, models: { gpt: { variants: { default: { effort: high } } } } } }', /^provider\.openai\.models\.gpt\.variants\.default\.effort: openai variants set effort with reasoningEffort/);
 });
 
 test('takes an API key, from the environment as in OpenCode', async () => {
-  const yaml = 'provider: { groq: { npm: "@ai-sdk/openai", options: { apiKey: "{env:GROQ_KEY}" }, models: { llama: {} } } }';
+  const yaml = 'provider: { groq: { flavor: openai, options: { apiKey: "{env:GROQ_KEY}" }, models: { llama: {} } } }';
   const config = parseConfig(yaml, { GROQ_KEY: 'gsk-1' });
   assert.equal(config.provider!.groq!.options!.apiKey, 'gsk-1');
   const { api } = await new ModelRegistry(config).resolve('groq/llama');
@@ -167,6 +170,13 @@ test('splits references at the first slash, and knows only its providers', async
   assert.equal((await registry.resolve('local/Qwen/Qwen3.5-9B')).model, 'Qwen/Qwen3.5-9B');
   assert.equal(registry.parseRef('qwen-3.5-9b'), undefined);
   assert.equal(registry.parseRef('Qwen/Qwen3.5-9B'), undefined);
+  assert.deepEqual(registry.models(), [
+    'local/qwen',
+    'local/Qwen/Qwen3.5-9B',
+    'anthropic/claude-haiku-4-5',
+    'anthropic/claude-sonnet-5-5',
+    'anthropic/claude-opus-5-5',
+  ]);
 
   await assert.rejects(registry.resolve('local/llama'), /Unknown model "local\/llama"; local has qwen, Qwen\/Qwen3.5-9B/);
   await assert.rejects(registry.resolve('local/qwen', { variant: 'low' }), /local\/qwen has no variant "low"; variants: xhigh/);
@@ -174,9 +184,9 @@ test('splits references at the first slash, and knows only its providers', async
   await assert.rejects(registry.resolve('remote/qwen'), /Unknown provider in "remote\/qwen"; providers: local, anthropic/);
 });
 
-test('needs npm for providers other than openai and anthropic, also when not from a config file', async () => {
-  const config: Config = { provider: { local: { models: { qwen: {} } } } };
-  await assert.rejects(new ModelRegistry(config).resolve('local/qwen'), /provider\.local needs npm/);
+test('needs a flavor, also when not from a config file', async () => {
+  const config = { provider: { local: { models: { qwen: {} } } } } as unknown as Config;
+  await assert.rejects(new ModelRegistry(config).resolve('local/qwen'), /provider\.local\.flavor must be one of/);
 });
 
 test("providers send their request fields with every call, under the call's own", async () => {
