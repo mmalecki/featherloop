@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import type OpenAI from 'openai';
 import {
   AnthropicProvider,
+  checkConfig,
   ConfigError,
   ModelRegistry,
   OpenAIProvider,
@@ -39,8 +40,19 @@ provider:
       claude-opus-5-5:
         variants:
           max: { effort: max, temperature: 1 }
-          wrong: { reasoningEffort: max }
 `;
+
+/** A client that records each request's body and answers "ok", streamed or not. */
+function fakeOpenAI(bodies: Record<string, any>[]): OpenAI {
+  const create = async (body: Record<string, any>) => {
+    bodies.push(body);
+    if (!body.stream) return { choices: [{ message: { content: 'ok' } }] };
+    return (async function* () {
+      yield { choices: [{ finish_reason: 'stop', delta: { content: 'ok' } }] };
+    })();
+  };
+  return { chat: { completions: { create } } } as unknown as OpenAI;
+}
 
 test('reads an OpenCode-shaped config', () => {
   const config = parseConfig(CONFIG);
@@ -51,14 +63,18 @@ test('reads an OpenCode-shaped config', () => {
 test('rejects fields it does not support, by path', () => {
   const rejects = (yaml: string, message: RegExp) => assert.throws(() => parseConfig(yaml), (err) => err instanceof ConfigError && message.test(err.message));
   rejects('small_model: local/qwen', /^small_model isn't supported/);
-  rejects('provider: { local: { models: { qwen: { limit: { context: 1000 } } } } }', /^provider\.local\.models\.qwen\.limit\.context isn't supported/);
-  rejects('provider: { local: { name: Local, models: {} } }', /^provider\.local\.name isn't supported/);
+  rejects('provider: { openai: { models: { qwen: { limit: { context: 1000 } } } } }', /^provider\.openai\.models\.qwen\.limit\.context isn't supported/);
+  rejects('provider: { openai: { name: Local, models: {} } }', /^provider\.openai\.name isn't supported/);
   rejects('provider: { local: { npm: "@ai-sdk/google", models: {} } }', /^provider\.local\.npm must be one of/);
-  rejects('provider: { local: { options: {} } }', /^provider\.local\.models is missing/);
-  rejects('provider: { local: { models: { qwen: { limit: { output: -1 } } } } }', /must be a positive integer/);
-  rejects('provider: { local: { models: { qwen: { variants: { low: 1 } } } } }', /^provider\.local\.models\.qwen\.variants\.low must be a mapping/);
-  rejects('provider: { local: { models: { qwen: { variants: { default: high } } } } }', /^provider\.local\.models\.qwen\.variants\.default names no variant: high/);
-  rejects('provider: { local: { models: { qwen: { variants: { default: 1 } } } } }', /^provider\.local\.models\.qwen\.variants\.default must be a mapping/);
+  rejects('provider: { openai: { options: {} } }', /^provider\.openai\.models is missing/);
+  rejects('provider: { openai: { models: { qwen: { limit: { output: -1 } } } } }', /must be a positive integer/);
+  rejects('provider: { openai: { models: { qwen: { variants: { low: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.low must be a mapping/);
+  rejects('provider: { openai: { models: { qwen: { variants: { default: high } } } } }', /^provider\.openai\.models\.qwen\.variants\.default names no variant: high/);
+  rejects('provider: { openai: { models: { qwen: { variants: { default: 1 } } } } }', /^provider\.openai\.models\.qwen\.variants\.default must be a mapping/);
+  rejects('provider: { local: { models: {} } }', /^provider\.local needs npm: one of/);
+  // Each API's own name for effort, as the AI SDK has them; the other would go out as an unknown field.
+  rejects('provider: { anthropic: { models: { opus: { variants: { max: { reasoningEffort: max } } } } } }', /^provider\.anthropic\.models\.opus\.variants\.max\.reasoningEffort: anthropic variants set effort with effort/);
+  rejects('provider: { openai: { models: { gpt: { variants: { default: { effort: high } } } } } }', /^provider\.openai\.models\.gpt\.variants\.default\.effort: openai variants set effort with reasoningEffort/);
 });
 
 test('takes an API key, from the environment as in OpenCode', async () => {
@@ -86,15 +102,13 @@ test('sends a variant as OpenCode does: reasoningEffort as reasoning_effort, the
   assert.deepEqual(((await registry.resolve('local/qwen')).api as OpenAIProvider).options.request, { max_tokens: 8192 });
 });
 
-test("sets up Anthropic models with the caller's options, then the model's", async () => {
-  const registry = new ModelRegistry(parseConfig(CONFIG), { anthropic: { effort: 'high' } });
+test("sets up Anthropic models with the model's limit and variant", async () => {
+  const registry = new ModelRegistry(parseConfig(CONFIG));
   const haiku = (await registry.resolve('anthropic/claude-haiku-4-5')).api as AnthropicProvider;
-  assert.deepEqual(haiku.options, { effort: 'high', maxTokens: 32000, request: {} });
+  assert.deepEqual(haiku.options, { maxTokens: 32000, request: {} });
   // effort becomes the provider's option, which it leaves out for models without effort.
   const opus = (await registry.resolve('anthropic/claude-opus-5-5', { variant: 'max' })).api as AnthropicProvider;
   assert.deepEqual(opus.options, { effort: 'max', request: { temperature: 1 } });
-  // Each API's own name for it, as the AI SDK has them.
-  await assert.rejects(registry.resolve('anthropic/claude-opus-5-5', { variant: 'wrong' }), /Anthropic variants set effort with effort/);
 });
 
 test('uses the default variant unless asked for another, by name if it names one', async () => {
@@ -114,19 +128,45 @@ test('uses the default variant unless asked for another, by name if it names one
   assert.equal((await registry.resolve('local/qwen')).variant, undefined);
 });
 
+test('resolves aliases, with the variant asked for, else the alias\'s, else the default', async () => {
+  const config = parseConfig(`${CONFIG}
+aliases:
+  advisor: { model: anthropic/claude-opus-5-5, variant: max }
+  writer: anthropic/claude-sonnet-5-5
+`);
+  const registry = new ModelRegistry(config);
+  assert.equal(registry.knows('advisor'), true);
+  assert.equal(registry.knows('local/qwen'), true);
+  assert.equal(registry.knows('qwen'), false);
+
+  const advisor = await registry.resolve('advisor');
+  assert.deepEqual([advisor.ref, advisor.alias, advisor.model, advisor.variant], ['anthropic/claude-opus-5-5', 'advisor', 'claude-opus-5-5', 'max']);
+  assert.equal((advisor.api as AnthropicProvider).options.effort, 'max');
+  const writer = await registry.resolve('writer');
+  assert.deepEqual([writer.alias, writer.variant], ['writer', 'high']);
+  assert.equal((await registry.resolve('writer', { variant: 'default' })).variant, 'high');
+  await assert.rejects(registry.resolve('advisor', { variant: 'low' }), /claude-opus-5-5 has no variant "low"/);
+});
+
+test('rejects aliases it could not resolve', () => {
+  const base = parseConfig(CONFIG);
+  const rejects = (aliases: unknown, message: RegExp) =>
+    assert.throws(() => checkConfig({ ...base, aliases }), (err) => err instanceof ConfigError && message.test(err.message));
+  rejects({ 'a/b': 'local/qwen' }, /^aliases\.a\/b: alias names can't contain "\/"/);
+  rejects({ advisor: 'writer', writer: 'local/qwen' }, /^aliases\.advisor\.model names no configured model: writer/);
+  rejects({ advisor: 'local/llama' }, /^aliases\.advisor\.model names no configured model: local\/llama/);
+  rejects({ advisor: 'remote/qwen' }, /names no configured model: remote\/qwen/);
+  rejects({ advisor: { model: 'local/qwen', variant: 'low' } }, /^aliases\.advisor\.variant: local\/qwen has no variant low/);
+  rejects({ advisor: { model: 'local/qwen', effort: 'high' } }, /^aliases\.advisor\.effort isn't supported/);
+  rejects({ advisor: 1 }, /^aliases\.advisor must be a mapping/);
+});
+
 test('splits references at the first slash, and knows only its providers', async () => {
   const registry = new ModelRegistry(parseConfig(CONFIG));
   assert.deepEqual(registry.parseRef('local/Qwen/Qwen3.5-9B'), { provider: 'local', model: 'Qwen/Qwen3.5-9B' });
   assert.equal((await registry.resolve('local/Qwen/Qwen3.5-9B')).model, 'Qwen/Qwen3.5-9B');
   assert.equal(registry.parseRef('qwen-3.5-9b'), undefined);
   assert.equal(registry.parseRef('Qwen/Qwen3.5-9B'), undefined);
-  assert.deepEqual(registry.list().map(({ ref }) => ref), [
-    'local/qwen',
-    'local/Qwen/Qwen3.5-9B',
-    'anthropic/claude-haiku-4-5',
-    'anthropic/claude-sonnet-5-5',
-    'anthropic/claude-opus-5-5',
-  ]);
 
   await assert.rejects(registry.resolve('local/llama'), /Unknown model "local\/llama"; local has qwen, Qwen\/Qwen3.5-9B/);
   await assert.rejects(registry.resolve('local/qwen', { variant: 'low' }), /local\/qwen has no variant "low"; variants: xhigh/);
@@ -134,26 +174,14 @@ test('splits references at the first slash, and knows only its providers', async
   await assert.rejects(registry.resolve('remote/qwen'), /Unknown provider in "remote\/qwen"; providers: local, anthropic/);
 });
 
-test('needs npm for providers other than openai and anthropic', async () => {
+test('needs npm for providers other than openai and anthropic, also when not from a config file', async () => {
   const config: Config = { provider: { local: { models: { qwen: {} } } } };
   await assert.rejects(new ModelRegistry(config).resolve('local/qwen'), /provider\.local needs npm/);
 });
 
 test("providers send their request fields with every call, under the call's own", async () => {
   const bodies: Record<string, any>[] = [];
-  const client = {
-    chat: {
-      completions: {
-        async create(body: Record<string, any>) {
-          bodies.push(body);
-          if (!body.stream) return { choices: [{ message: { content: 'ok' } }] };
-          return (async function* () {
-            yield { choices: [{ finish_reason: 'stop', delta: { content: 'ok' } }] };
-          })();
-        },
-      },
-    },
-  } as unknown as OpenAI;
+  const client = fakeOpenAI(bodies);
   const provider = new OpenAIProvider(client, {
     request: { reasoning_effort: 'low', chat_template_kwargs: { preserve_thinking: false }, stream_options: { foo: 1 } },
   });
@@ -173,19 +201,7 @@ test("providers send their request fields with every call, under the call's own"
 
 test("sends a call's reasoning as reasoning_effort, over the provider's and under the call's fields", async () => {
   const bodies: Record<string, any>[] = [];
-  const client = {
-    chat: {
-      completions: {
-        async create(body: Record<string, any>) {
-          bodies.push(body);
-          if (!body.stream) return { choices: [{ message: { content: 'ok' } }] };
-          return (async function* () {
-            yield { choices: [{ finish_reason: 'stop', delta: { content: 'ok' } }] };
-          })();
-        },
-      },
-    },
-  } as unknown as OpenAI;
+  const client = fakeOpenAI(bodies);
   const provider = new OpenAIProvider(client, { request: { reasoning_effort: 'high' } });
   const messages = [{ role: 'user' as const, content: 'hi' }];
   const on = { content() {}, reasoning() {} };

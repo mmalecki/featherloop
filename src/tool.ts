@@ -1,4 +1,5 @@
 import type { AgentLoop } from './loop.ts';
+import type { ModelResolver } from './models.ts';
 import type { Message, Provider } from './provider.ts';
 
 export type JSONSchema = Record<string, unknown>;
@@ -28,6 +29,11 @@ export interface ToolContext {
    * call's id. Attach it before running the child loop. Set by the loop.
    */
   relay?: (child: AgentLoop) => void;
+  /**
+   * Sets up other models by reference, e.g. an agent's own. Their usage counts as
+   * this tool's, like `api`'s. Set by the loop when it was given `models`.
+   */
+  models?: ModelResolver;
 }
 
 export interface Tool<P = Record<string, unknown>> {

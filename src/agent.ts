@@ -8,6 +8,11 @@ export interface AgentSpec {
   system: string | ((ctx: AgentContext) => string);
   /** Ordered; the last matching rule wins. Tools that no rule matches are allowed. */
   permissions?: PermissionRule[];
+  /**
+   * The model it runs on, as `provider/model` or an alias such as `advisor`, which
+   * leaves the choice to the config. Defaults to the caller's model.
+   */
+  model?: string;
 }
 
 export interface AgentContext {
@@ -41,6 +46,7 @@ const BUILT_IN_ACTIONS = ['read', 'edit', 'grep', 'glob', 'shell', 'webfetch', '
 export class Agent {
   readonly name: string;
   readonly description: string | undefined;
+  readonly model: string | undefined;
   readonly permissions: readonly PermissionRule[];
   readonly #system: AgentSpec['system'];
 
@@ -50,8 +56,12 @@ export class Agent {
       throw new Error(`Agent ${spec.name}: system must be a string or a function`);
     }
     spec.permissions?.forEach((rule, i) => checkRule(rule, `Agent ${spec.name}, permission ${i + 1}`));
+    if (spec.model !== undefined && (typeof spec.model !== 'string' || !spec.model)) {
+      throw new Error(`Agent ${spec.name}: model must be a non-empty string`);
+    }
     this.name = spec.name;
     this.description = spec.description;
+    this.model = spec.model;
     this.permissions = [...(spec.permissions ?? [])];
     this.#system = spec.system;
   }

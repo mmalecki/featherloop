@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import {
+  advisorAgent,
   ConfigError,
   configPath,
   generalAgent,
@@ -31,7 +32,8 @@ const argv = await yargs(hideBin(process.argv))
   .option('model', {
     alias: 'm',
     type: 'string',
-    describe: "provider/model from the config, or a bare model id (env MODEL; default: the config's model, else qwen-3.5-9b)",
+    describe:
+      "provider/model or an alias from the config, or a bare model id (env MODEL; default: the config's model, else qwen-3.5-9b)",
   })
   .option('variant', { type: 'string', describe: "One of the model's variants from the config (default: its default one, if any)" })
   .option('provider', {
@@ -46,9 +48,15 @@ const argv = await yargs(hideBin(process.argv))
   .option('config', { type: 'string', default: configPath(), describe: 'Config file, for providers and models' })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
   .option('subagent', { type: 'boolean', default: false, describe: 'Add a subagent tool for handing off tasks' })
+  .option('advisor', {
+    type: 'boolean',
+    default: false,
+    describe: "Add an advisor subagent for second opinions, on the config's advisor alias",
+  })
+  .option('advisor-model', { type: 'string', describe: 'Model for the advisor instead of the alias; implies --advisor' })
   .epilogue(
     'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set;\n' +
-      'shell and subagent with --shell and --subagent.\n' +
+      'shell with --shell; subagent with --subagent or --advisor.\n' +
       'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.',
   )
   .version(version())
@@ -58,10 +66,20 @@ const argv = await yargs(hideBin(process.argv))
   .parseAsync();
 
 const { shell, subagent } = argv;
+const advisor = argv.advisor || argv.advisorModel !== undefined;
 const registry = await exitOnConfigError(() => new ModelRegistry(loadConfig(argv.config)));
 const initial = await exitOnConfigError(() =>
   resolveModel(argv.model ?? process.env.MODEL ?? registry.default ?? 'qwen-3.5-9b', argv.variant),
 );
+if (advisor) {
+  // Set it up now, so a missing alias or SDK shows before the session, not on the first call.
+  await exitOnConfigError(() => {
+    if (argv.advisorModel === undefined && !registry.knows(advisorAgent.model!)) {
+      throw new ConfigError(`--advisor needs an alias "${advisorAgent.model}" in ${argv.config}, or --advisor-model`);
+    }
+    return resolveModel(advisorAgent.model!, undefined);
+  });
+}
 
 // Rules from flags come after the agent's, so they win.
 const flagPermissions: PermissionRule[] = shell ? [{ action: 'shell', effect: 'allow' }] : [];
@@ -85,11 +103,10 @@ const availableTools = (): Toolset => {
 const createLoop = () => {
   const available = availableTools();
   // Subagents get the same tools and flags, but never this tool (SubagentTool denies it).
-  if (subagent) {
-    available.subagent = SubagentTool({ agents: [generalAgent], tools: availableTools, permissions: flagPermissions });
-  }
+  const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
+  if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools, permissions: flagPermissions });
   // The UI passes each run the current model's provider; this one is only the default.
-  return Loop(initial.api, generalAgent.toolset(available, flagPermissions));
+  return Loop(initial.api, generalAgent.toolset(available, flagPermissions), { models: resolveModel });
 };
 
 const ui = new SimpleUI(createLoop, {
@@ -103,11 +120,13 @@ if (prompt) await ui.ask(prompt);
 else await ui.start();
 
 /**
- * A model from the config, or a bare model id run where --provider and --base-url
- * say. For the initial model and `/model`.
+ * A model or alias from the config, or a bare model id run where --provider and
+ * --base-url say. For the initial model, `/model` and agents' own models; a model
+ * given to --advisor-model stands in for the advisor alias.
  */
-async function resolveModel(ref: string, variant: string | undefined): Promise<ResolvedModel> {
-  if (registry.parseRef(ref)) return registry.resolve(ref, { variant });
+async function resolveModel(ref: string, variant?: string): Promise<ResolvedModel> {
+  if (ref === advisorAgent.model && argv.advisorModel) ref = argv.advisorModel;
+  if (registry.knows(ref)) return registry.resolve(ref, { variant });
   const provider = argv.provider ?? (ref.startsWith('claude-') ? 'anthropic' : 'openai');
   const flags: Config = {
     provider: { [provider]: { ...(provider === 'openai' ? { options: { baseURL: argv.baseUrl } } : {}), models: { [ref]: {} } } },

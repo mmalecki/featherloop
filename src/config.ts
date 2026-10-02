@@ -9,9 +9,21 @@ import { parse, YAMLParseError } from 'yaml';
  * OpenCode, `{env:NAME}` in a string is replaced by that variable, or by nothing.
  */
 export interface Config {
-  /** Default model, as `provider/model`. */
+  /** Default model, as `provider/model` or an alias. */
   model?: string;
   provider?: Record<string, ProviderConfig>;
+  /**
+   * Names for models, e.g. a role such as `advisor` that an agent asks for, which
+   * the config then fills. Not in OpenCode. A string is short for `{ model }`.
+   */
+  aliases?: Record<string, string | AliasConfig>;
+}
+
+export interface AliasConfig {
+  /** As `provider/model`; not another alias. */
+  model: string;
+  /** Used unless a variant is asked for; otherwise the model's `default` is. */
+  variant?: string;
 }
 
 export interface ProviderConfig {
@@ -90,10 +102,15 @@ export function loadConfig(path = configPath()): Config {
   }
 }
 
-/** Parses and checks a config's YAML (or JSON) text. */
+/** Parses and checks a config's YAML (or JSON) text, after replacing `{env:NAME}`. */
 export function parseConfig(text: string, env: NodeJS.ProcessEnv = process.env): Config {
-  const config = object(substitute(parse(text) ?? {}, env), 'config');
-  only(config, ['model', 'provider'], '');
+  return checkConfig(substitute(parse(text) ?? {}, env));
+}
+
+/** Checks a config as parsed; throws a `ConfigError` naming the first problem's path. */
+export function checkConfig(value: unknown): Config {
+  const config = object(value, 'config');
+  only(config, ['model', 'provider', 'aliases'], '');
   if (config.model !== undefined) string(config.model, 'model');
   for (const [id, provider] of entries(config.provider, 'provider')) {
     const at = `provider.${id}`;
@@ -133,6 +150,24 @@ export function parseConfig(text: string, env: NodeJS.ProcessEnv = process.env):
         for (const [name, variant] of variants) {
           if (wrong in variant) throw new ConfigError(`${path}.variants.${name}.${wrong}: ${api} variants set effort with ${right}`);
         }
+      }
+    }
+  }
+  if (config.aliases !== undefined) {
+    for (const [name, value] of Object.entries(object(config.aliases, 'aliases'))) {
+      const at = `aliases.${name}`;
+      if (name.includes('/')) throw new ConfigError(`${at}: alias names can't contain "/", which marks provider/model`);
+      const alias = typeof value === 'string' ? { model: value } : object(value, at);
+      only(alias, ['model', 'variant'], at);
+      string(alias.model, `${at}.model`);
+      // The model must be configured: an alias can't name another alias, or a bare id.
+      const slash = alias.model.indexOf('/');
+      const provider = slash < 0 ? undefined : config.provider?.[alias.model.slice(0, slash)];
+      const model = provider && Object.hasOwn(provider.models, alias.model.slice(slash + 1)) ? provider.models[alias.model.slice(slash + 1)] : undefined;
+      if (!model) throw new ConfigError(`${at}.model names no configured model: ${alias.model}`);
+      if (alias.variant !== undefined) {
+        string(alias.variant, `${at}.variant`);
+        if (!Object.hasOwn(model.variants ?? {}, alias.variant)) throw new ConfigError(`${at}.variant: ${alias.model} has no variant ${alias.variant}`);
       }
     }
   }

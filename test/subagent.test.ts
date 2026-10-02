@@ -144,11 +144,14 @@ test('cuts long replies to maxLength, keeping the start', async () => {
   assert.equal(await tool.invoke({ input: 'x' }, { api, model: 'm' }), `${'a'.repeat(10)}\n[… 40 more characters cut]`);
 });
 
-test('hides the agent choice when there is only one agent', () => {
-  const { parameters } = SubagentTool({ agents: [worker], tools: () => ({}) }).schema() as unknown as {
+test('hides the agent choice when there is only one agent, but still describes it', () => {
+  const { description, parameters } = SubagentTool({ agents: [worker], tools: () => ({}) }).schema() as unknown as {
+    description: string;
     parameters: { properties: Record<string, unknown> };
   };
   assert.deepEqual(Object.keys(parameters.properties).sort(), ['input', 'transcript']);
+  assert.match(description, /Agent: worker: Does the work\.$/);
+  assert.doesNotMatch(subagentTool().schema().description, /Agent:/);
 });
 
 test("relays the subagent's tool calls under its own call, and counts its usage once", async () => {
@@ -191,4 +194,44 @@ test('extra permissions apply to every subagent, but never allow nesting', async
 test('agents must be given, with unique names', () => {
   assert.throws(() => SubagentTool({ agents: [], tools: () => ({}) }), /at least one agent/);
   assert.throws(() => SubagentTool({ agents: [worker, worker], tools: () => ({}) }), /unique/);
+});
+
+test('runs an agent with its own model on it, counting its usage as the tool\'s', async () => {
+  const advisor = defineAgent({ name: 'advisor', system: ({ model }) => `You advise, as ${model}.`, model: 'advisor' });
+  const strong = fakeProvider(() => say('looks fine'));
+  const resolved: string[] = [];
+  const models = async (ref: string) => {
+    resolved.push(ref);
+    return { ref: 'big/claude', alias: ref, api: strong, model: 'claude' };
+  };
+  const parent = fakeProvider((request) => (request.messages.length === 2 ? call('subagent', { input: 'Check.' }) : say('done')));
+  const events: { source: string; tool?: string | undefined; model: string }[] = [];
+  const loop = Loop(parent, { subagent: SubagentTool({ agents: [advisor], tools: () => ({}) }) }, { models });
+  loop.on('usage', ({ source, tool, model }) => events.push({ source, tool, model }));
+  const result = await loop.run({
+    model: 'small',
+    input: [
+      { role: 'system', content: 'You lead.' },
+      { role: 'user', content: 'Fix it.' },
+    ],
+  });
+
+  assert.deepEqual(resolved, ['advisor']);
+  assert.equal(strong.requests.length, 1);
+  assert.equal(strong.requests[0]!.model, 'claude');
+  assert.equal(strong.requests[0]!.messages[0]!.content, 'You advise, as claude.');
+  assert.equal(result.messages.find((m) => m.role === 'tool')?.content, 'looks fine');
+  assert.deepEqual(events, [
+    { source: 'turn', tool: undefined, model: 'small' },
+    { source: 'tool', tool: 'subagent', model: 'claude' },
+    { source: 'turn', tool: undefined, model: 'small' },
+  ]);
+  assert.deepEqual(result.usage, { input: 30, output: 3, cacheRead: 0, cacheWrite: 0 });
+});
+
+test('an agent with its own model needs a loop that can set it up', async () => {
+  const advisor = defineAgent({ name: 'advisor', system: 'You advise.', model: 'advisor' });
+  const { result, sub } = await delegate([call('subagent', { input: 'Check.' })], SubagentTool({ agents: [advisor], tools: () => ({}) }));
+  assert.equal(sub.length, 0);
+  assert.match(String(result.messages.find((m) => m.role === 'tool')?.content), /Agent advisor runs on advisor, but this loop can't set up other models/);
 });

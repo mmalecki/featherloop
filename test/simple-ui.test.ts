@@ -183,3 +183,34 @@ test('/model switches providers mid-conversation, keeping the history', async ()
   ]);
   assert.match(output, /featherslop \| local\/qwen \|/);
 });
+
+test('a run started during a switch waits for it', async () => {
+  const providers: string[] = [];
+  const fake = (name: string): Provider => ({
+    name,
+    async turn() {
+      providers.push(name);
+      return say('ok');
+    },
+    async complete() {
+      throw new Error('complete() should not be called');
+    },
+  });
+  const models = { local: fake('local'), remote: fake('remote') };
+  const resolveModel = async (ref: string) => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return { ref, api: models[ref as keyof typeof models], model: ref };
+  };
+  const ui = new SimpleUI(Loop(models.local), {
+    model: 'local',
+    resolveModel,
+    output: new PassThrough() as unknown as NodeJS.WriteStream,
+  });
+
+  // Not awaited: the run must still go to the new model.
+  const switched = ui.switchModel('remote');
+  await ui.ask('Hi.');
+  await switched;
+  assert.deepEqual(providers, ['remote']);
+  assert.equal(ui.model, 'remote');
+});

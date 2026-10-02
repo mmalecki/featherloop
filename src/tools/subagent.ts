@@ -33,9 +33,10 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
 const TRANSCRIPT_RESULT_CHARS = 2_000;
 
 /**
- * Hands a task to another agent, which runs its own loop with the caller's model
- * and provider and returns its final reply. Calls in the same turn run in
- * parallel. The subagent's token use counts as this tool's.
+ * Hands a task to another agent, which runs its own loop and returns its final
+ * reply. An agent with a `model` runs on it, set up through `ToolContext.models`;
+ * others run on the caller's model. Calls in the same turn run in parallel. The
+ * subagent's token use counts as this tool's.
  */
 export function SubagentTool({ agents, tools, permissions = [], loop: loopOptions, ...options }: SubagentToolOptions): Tool {
   const byName = new Map(agents.map((agent) => [agent.name, agent]));
@@ -46,7 +47,9 @@ export function SubagentTool({ agents, tools, permissions = [], loop: loopOption
   return defineTool<SubagentParams>({
     description:
       'Hand a self-contained task to a subagent, which works on it with its own tools and returns its final reply. ' +
-      'Several calls in one turn run in parallel.',
+      'Several calls in one turn run in parallel.' +
+      // With one agent, the agent parameter (and so its description) is hidden.
+      (byName.size === 1 ? ` Agent: ${listed}.` : ''),
     params: {
       agent: {
         schema: { type: 'string', enum: [...byName.keys()], description: `Agent to run. ${listed}` },
@@ -81,20 +84,26 @@ export function SubagentTool({ agents, tools, permissions = [], loop: loopOption
       },
     },
 
-    async invoke({ agent: name, input, transcript, cwd, maxLength }, { api, model, signal, messages, relay }) {
+    async invoke({ agent: name, input, transcript, cwd, maxLength }, { api, model, signal, messages, relay, models }) {
       const agent = byName.get(name);
       if (!agent) throw new ToolInputError(`Unknown agent "${name}"; agents: ${[...byName.keys()].join(', ')}`);
       if (typeof input !== 'string' || !input.trim()) throw new ToolInputError('input must be a non-empty task');
       if (transcript && !messages) throw new ToolInputError('There is no conversation to pass on');
 
-      const system = agent.system({ cwd: cwd ?? process.cwd(), date: new Date().toISOString().slice(0, 10), model });
+      let runner = { api, model };
+      if (agent.model) {
+        if (!models) throw new Error(`Agent ${agent.name} runs on ${agent.model}, but this loop can't set up other models`);
+        runner = await models(agent.model);
+      }
+
+      const system = agent.system({ cwd: cwd ?? process.cwd(), date: new Date().toISOString().slice(0, 10), model: runner.model });
       // The deny comes last, so no extra rule (e.g. allowing *) can let subagents nest.
       const toolset = agent.toolset(tools(), [...permissions, { action: 'subagent', effect: 'deny' }]);
       const task = transcript ? `${render(messages!)}\n\n<task>\n${input}\n</task>` : input;
-      const loop = Loop(api, toolset, loopOptions);
+      const loop = Loop(runner.api, toolset, { ...loopOptions, ...(models ? { models } : {}) });
       relay?.(loop);
       const { message } = await loop.run({
-        model,
+        model: runner.model,
         input: [
           { role: 'system', content: system },
           { role: 'user', content: task },

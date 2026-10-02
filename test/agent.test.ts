@@ -54,9 +54,15 @@ test('rejects what OpenCode has but we do not: ask, resource, and other keys', (
   assert.throws(() => agent().toolset(available, [{ action: 'shell', effect: 'ask' } as never]), /Extra permission 1: ask/);
 });
 
-test('checks the name and system prompt', () => {
+test('checks the name, system prompt and model', () => {
   assert.throws(() => defineAgent({ name: '', system: '' }), /needs a name/);
   assert.throws(() => defineAgent({ name: 'x', system: 1 as never }), /system must be a string or a function/);
+  assert.throws(() => defineAgent({ name: 'x', system: '', model: '' }), /model must be a non-empty string/);
+});
+
+test("has no model of its own unless given one", () => {
+  assert.equal(agent().model, undefined);
+  assert.equal(defineAgent({ name: 'x', system: '', model: 'advisor' }).model, 'advisor');
 });
 
 test('system prompts can depend on where and when they run', () => {

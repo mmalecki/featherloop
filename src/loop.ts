@@ -11,6 +11,7 @@ import {
   type ToolSpec,
   type Usage,
 } from './provider.ts';
+import type { ModelResolver } from './models.ts';
 import { toProvider, type ApiClient } from './providers/index.ts';
 import { ToolInputError, type Toolset } from './tool.ts';
 
@@ -34,6 +35,8 @@ export interface LoopOptions {
   endCriteria?: EndCriteria;
   /** Run every tool call in the model's order, one at a time. Off by default. */
   sequentialTools?: boolean;
+  /** Lets tools run other models (`ToolContext.models`), e.g. a subagent's own. */
+  models?: ModelResolver;
 }
 
 export interface RunOptions {
@@ -110,6 +113,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   readonly toolset: Toolset;
   readonly endCriteria: EndCriteria;
   readonly sequentialTools: boolean;
+  readonly models: ModelResolver | undefined;
   #pending: Message[] = [];
   #running = false;
 
@@ -119,6 +123,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     this.toolset = toolset;
     this.endCriteria = options.endCriteria ?? noToolCalls;
     this.sequentialTools = options.sequentialTools ?? false;
+    this.models = options.models;
   }
 
   get running(): boolean {
@@ -237,7 +242,14 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
       const tool = toolset[name];
       if (!tool) throw new ToolInputError(`Unknown tool "${name}"`);
       if (!args) throw new ToolInputError('Arguments must be a JSON object');
-      result = await tool.invoke(args, { api: attributed(api, name, track), model, signal, messages, relay: this.#relay(id) });
+      result = await tool.invoke(args, {
+        api: attributed(api, name, track),
+        model,
+        signal,
+        messages,
+        relay: this.#relay(id),
+        ...(this.models ? { models: attributedModels(this.models, name, track) } : {}),
+      });
     } catch (err) {
       if (signal?.aborted) throw err;
       // Any failure goes back to the model as the tool result; it may be able to recover.
@@ -309,6 +321,14 @@ function attributed(api: Provider, tool: string, track: Track): Provider {
           track(used, { model: request.model, source: 'tool', tool });
         },
       }),
+  };
+}
+
+/** Models a tool sets up, with their usage reported as the tool's too. */
+function attributedModels(models: ModelResolver, tool: string, track: Track): ModelResolver {
+  return async (ref, variant) => {
+    const resolved = await models(ref, variant);
+    return { ...resolved, api: attributed(resolved.api, tool, track) };
   };
 }
 

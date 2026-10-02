@@ -1,6 +1,7 @@
 export * from './loop.ts';
 export * from './agent.ts';
 export * from './agents/general.ts';
+export * from './agents/advisor.ts';
 export * from './tool.ts';
 export * from './tools/read.ts';
 export * from './tools/write.ts';

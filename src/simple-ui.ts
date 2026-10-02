@@ -1,7 +1,7 @@
 import { createInterface, type Interface } from 'node:readline';
 import { styleText } from 'node:util';
 import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
-import type { ResolvedModel } from './models.ts';
+import type { ModelResolver, ResolvedModel } from './models.ts';
 import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
 
 type Style = Parameters<typeof styleText>[0];
@@ -10,7 +10,7 @@ type Style = Parameters<typeof styleText>[0];
 export type AgentFactory = () => AgentLoop;
 
 /** The model runs use; without `api`, the loop's own provider runs it. */
-type CurrentModel = Pick<ResolvedModel, 'ref' | 'model' | 'variant'> & { api?: Provider };
+type CurrentModel = Pick<ResolvedModel, 'ref' | 'alias' | 'model' | 'variant'> & { api?: Provider };
 
 export interface SimpleUIOptions {
   /**
@@ -22,7 +22,7 @@ export interface SimpleUIOptions {
    * Resolves `/model <ref> [variant]`, e.g. with a `ModelRegistry`, so the
    * session can switch providers too. Without it, `/model` only changes the id.
    */
-  resolveModel?: (ref: string, variant: string | undefined) => Promise<ResolvedModel>;
+  resolveModel?: ModelResolver;
   /** System prompt prepended to the conversation. */
   system?: string;
   /** Shown in the header. */
@@ -112,10 +112,11 @@ export class SimpleUI {
     return { ref, model: ref };
   }
 
-  /** The model as shown: its reference, and variant if it has one. */
+  /** The model as shown: its alias if any, its reference, and its variant if any. */
   #modelLabel(): string {
-    const { ref, variant } = this.#model;
-    return variant === undefined ? ref : `${ref} (${variant})`;
+    const { ref, alias, variant } = this.#model;
+    const label = variant === undefined ? ref : `${ref} (${variant})`;
+    return alias === undefined ? label : `${alias}: ${label}`;
   }
 
   /** Runs the REPL; resolves when the user quits. */

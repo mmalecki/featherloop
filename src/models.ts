@@ -1,6 +1,6 @@
 import type Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
-import { API_PACKAGES, apiOf, ConfigError, EFFORT_KEYS, type Config, type ProviderConfig } from './config.ts';
+import { API_PACKAGES, apiOf, ConfigError, EFFORT_KEYS, type AliasConfig, type Config, type ProviderConfig } from './config.ts';
 import type { Effort, Provider } from './provider.ts';
 import { AnthropicProvider } from './providers/anthropic.ts';
 import { OpenAIProvider } from './providers/openai.ts';
@@ -12,23 +12,35 @@ import { OpenAIProvider } from './providers/openai.ts';
 export interface ResolvedModel {
   /** `provider/model`, as resolved. */
   ref: string;
+  /** The alias it was asked for by, if any. */
+  alias?: string;
   api: Provider;
   /** The id the API knows the model by. */
   model: string;
   variant?: string;
 }
 
+/** Sets up a model by reference, e.g. a `ModelRegistry`'s `resolve()` or the CLI's, which also takes bare ids. */
+export type ModelResolver = (ref: string, variant?: string) => Promise<ResolvedModel>;
+
 /** The models a config's providers offer, referred to as `provider/model`. */
 export class ModelRegistry {
   /** The config's default model, if it names one. */
   readonly default: string | undefined;
   readonly #providers: Record<string, ProviderConfig>;
+  readonly #aliases: Record<string, string | AliasConfig>;
   /** SDK clients, one per provider, made on first use. */
   readonly #clients = new Map<string, Promise<OpenAI | Anthropic>>();
 
   constructor(config: Config = {}) {
     this.default = config.model;
     this.#providers = config.provider ?? {};
+    this.#aliases = config.aliases ?? {};
+  }
+
+  /** Whether `ref` is an alias, or a model of one of this registry's providers. */
+  knows(ref: string): boolean {
+    return Object.hasOwn(this.#aliases, ref) || this.parseRef(ref) !== undefined;
   }
 
   /**
@@ -42,8 +54,17 @@ export class ModelRegistry {
     return { provider: ref.slice(0, slash), model: ref.slice(slash + 1) };
   }
 
-  /** Sets up a model to run, with the variant asked for, or else its `default` variant if it has one. */
+  /**
+   * Sets up a model, or an alias's, to run. Its variant is the one asked for, else
+   * the alias's, else the model's `default` if it has one.
+   */
   async resolve(ref: string, { variant: asked }: { variant?: string | undefined } = {}): Promise<ResolvedModel> {
+    if (Object.hasOwn(this.#aliases, ref)) {
+      const value = this.#aliases[ref]!;
+      const { model, variant } = typeof value === 'string' ? { model: value } : value;
+      if (!this.parseRef(model)) throw new ConfigError(`Alias ${ref} names no configured model: ${model}`);
+      return { ...(await this.resolve(model, { variant: asked ?? variant })), alias: ref };
+    }
     const { parsed, config } = this.#model(ref);
     const variants = config.variants ?? {};
     let variant = asked ?? (Object.hasOwn(variants, 'default') ? 'default' : undefined);
