@@ -181,7 +181,7 @@ test('/model switches providers mid-conversation, keeping the history', async ()
     { provider: 'remote', model: 'claude', messages: 4, tool: 'remote' },
     { provider: 'remote', model: 'claude', messages: 6 },
   ]);
-  assert.match(output, /featherslop \| local\/qwen \|/);
+  assert.match(output, /featherloop \| local\/qwen \|/);
 });
 
 test('a run started during a switch waits for it', async () => {

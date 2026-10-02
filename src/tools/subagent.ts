@@ -21,10 +21,10 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
   /**
    * Builds the tools a subagent may use, afresh for each call, so it doesn't share
    * state (such as which files were read) with the caller. Its agent's permissions
-   * pick from them, and subagents never get the subagent tool.
+   * pick from them. Subagents never get the tool keyed `subagent`, so they can't nest.
    */
   tools: () => Toolset;
-  /** Rules for every subagent, after its agent's, e.g. the caller's own flags. They can't allow nesting. */
+  /** Default rules for every subagent, e.g. the caller's own; each agent's rules override them. */
   permissions?: PermissionRule[];
   loop?: LoopOptions;
 }
@@ -97,8 +97,9 @@ export function SubagentTool({ agents, tools, permissions = [], loop: loopOption
       }
 
       const system = agent.system({ cwd: cwd ?? process.cwd(), date: new Date().toISOString().slice(0, 10), model: runner.model });
-      // The deny comes last, so no extra rule (e.g. allowing *) can let subagents nest.
-      const toolset = agent.toolset(tools(), [...permissions, { action: 'subagent', effect: 'deny' }]);
+      // Subagents can't nest: they're never offered this tool.
+      const { subagent: _, ...available } = tools();
+      const toolset = agent.toolset(available, permissions);
       const task = transcript ? `${render(messages!)}\n\n<task>\n${input}\n</task>` : input;
       const loop = Loop(runner.api, toolset, { ...loopOptions, ...(models ? { models } : {}) });
       relay?.(loop);

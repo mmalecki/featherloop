@@ -21,13 +21,12 @@ import {
   SubagentTool,
   WebFetchTool,
   type Config,
-  type PermissionRule,
   type ResolvedModel,
   type Toolset,
 } from '../src/index.ts';
 
 const argv = await yargs(hideBin(process.argv))
-  .scriptName('featherslop')
+  .scriptName('featherloop')
   .usage('$0 [options] [prompt]\n\nChat with an agent in the terminal, or run one prompt and exit.')
   .option('model', {
     alias: 'm',
@@ -81,10 +80,11 @@ if (advisor) {
   });
 }
 
-// Rules from flags come after the agent's, so they win.
-const flagPermissions: PermissionRule[] = shell ? [{ action: 'shell', effect: 'allow' }] : [];
-
-/** Every tool an agent may get, built afresh: each loop and subagent tracks its own file state. */
+/**
+ * Every tool an agent may get, built afresh: each loop and subagent tracks its own
+ * file state. Flags decide what's here; agents' permissions pick from it, so even
+ * an agent that allows everything gets no shell without --shell.
+ */
 const availableTools = (): Toolset => {
   const available: Toolset = {
     // read, write and update; updates and overwrites only after a read.
@@ -93,8 +93,8 @@ const availableTools = (): Toolset => {
     grep: GrepTool(),
     glob: GlobTool(),
     webfetch: WebFetchTool(),
-    shell: ShellTool(),
   };
+  if (shell) available.shell = ShellTool();
   if (process.env.PARALLEL_API_KEY) available.websearch = ParallelWebSearchTool();
   return available;
 };
@@ -102,11 +102,11 @@ const availableTools = (): Toolset => {
 // A factory, so `/c` starts over with fresh tool state (e.g. which files were read).
 const createLoop = () => {
   const available = availableTools();
-  // Subagents get the same tools and flags, but never this tool (SubagentTool denies it).
+  // Subagents get the same tools, but never this one (SubagentTool leaves it out).
   const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
-  if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools, permissions: flagPermissions });
+  if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools });
   // The UI passes each run the current model's provider; this one is only the default.
-  return Loop(initial.api, generalAgent.toolset(available, flagPermissions), { models: resolveModel });
+  return Loop(initial.api, generalAgent.toolset(available), { models: resolveModel });
 };
 
 const ui = new SimpleUI(createLoop, {

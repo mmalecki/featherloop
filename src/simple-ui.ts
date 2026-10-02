@@ -121,7 +121,7 @@ export class SimpleUI {
 
   /** Runs the REPL; resolves when the user quits. */
   start(): Promise<void> {
-    const { title = 'featherslop' } = this.options;
+    const { title = 'featherloop' } = this.options;
     this.#print(`${this.#style('bold', title)} | ${this.#style('dim', `${this.#modelLabel()} | ${process.cwd()}`)}`);
     this.#print(`${this.#style('dim', HELP)}\n`);
 

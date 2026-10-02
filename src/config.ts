@@ -4,8 +4,8 @@ import { join } from 'node:path';
 import { parse, YAMLParseError } from 'yaml';
 
 /**
- * featherslop's config file, shaped like OpenCode's (`opencode.json`) with only
- * the fields featherslop supports. Unknown fields are errors, not ignored. As in
+ * featherloop's config file, shaped like OpenCode's (`opencode.json`) with only
+ * the fields featherloop supports. Unknown fields are errors, not ignored. As in
  * OpenCode, `{env:NAME}` in a string is replaced by that variable, or by nothing.
  */
 export interface Config {
@@ -57,7 +57,7 @@ export interface ModelConfig {
   variants?: Record<string, Record<string, unknown> | string>;
 }
 
-/** The APIs featherslop speaks, by the AI SDK package OpenCode names them with. */
+/** The APIs featherloop speaks, by the AI SDK package OpenCode names them with. */
 export const API_PACKAGES = {
   '@ai-sdk/openai-compatible': 'openai',
   '@ai-sdk/openai': 'openai',
@@ -75,14 +75,14 @@ export function apiOf(id: string, { npm }: Pick<ProviderConfig, 'npm'>): Api | u
 /** Each API's name for the effort setting in a variant, as the AI SDK has them. */
 export const EFFORT_KEYS = { openai: 'reasoningEffort', anthropic: 'effort' } as const;
 
-/** Raised for a config, or a model reference, that featherslop can't use. */
+/** Raised for a config, or a model reference, that featherloop can't use. */
 export class ConfigError extends Error {
   override name = 'ConfigError';
 }
 
-/** `$XDG_CONFIG_HOME/featherslop/config.yaml`, by default `~/.config/featherslop/config.yaml`. */
+/** `$XDG_CONFIG_HOME/featherloop/config.yaml`, by default `~/.config/featherloop/config.yaml`. */
 export function configPath(): string {
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'featherslop', 'config.yaml');
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'featherloop', 'config.yaml');
 }
 
 /** Reads and checks a config file; a missing file is an empty config. */

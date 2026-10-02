@@ -14,7 +14,7 @@ const ctx: ToolContext = { api: {} as Provider, model: 'test' };
 let dir: string;
 let previous: string | undefined;
 before(async () => {
-  dir = await mkdtemp(join(tmpdir(), 'featherslop-shell-test-'));
+  dir = await mkdtemp(join(tmpdir(), 'featherloop-shell-test-'));
   previous = process.env.TMPDIR;
   process.env.TMPDIR = dir;
 });
@@ -35,7 +35,7 @@ async function shell(command: string, params: { maxLength?: number; timeoutMs?: 
   return tool.invoke({ command }, ctx);
 }
 
-const outputFiles = async () => (await readdir(dir)).filter((name) => name.startsWith('featherslop-shell-'));
+const outputFiles = async () => (await readdir(dir)).filter((name) => name.startsWith('featherloop-shell-'));
 
 test('keeps stdout and stderr in the order they were written', async () => {
   const expected = [1, 2, 3, 4, 5, 6].flatMap((i) => [`out${i}`, `err${i}`]).join('\n');

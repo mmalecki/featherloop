@@ -178,17 +178,20 @@ test("relays the subagent's tool calls under its own call, and counts its usage 
   assert.deepEqual(usage, { input: 40, output: 4, cacheRead: 0, cacheWrite: 0 });
 });
 
-test('extra permissions apply to every subagent, but never allow nesting', async () => {
+test("default permissions apply to every subagent, under its own rules, and never allow nesting", async () => {
   const tools = () => ({ read: fixed('r'), shell: fixed('s'), subagent: fixed('nested') });
-  const careful = defineAgent({ name: 'careful', system: 'You work.', permissions: [{ action: 'shell', effect: 'deny' }] });
-  const run = async (permissions: PermissionRule[]) => {
+  const open = defineAgent({ name: 'open', system: 'You work.' });
+  const careful = defineAgent({ name: 'careful', system: 'You check.', permissions: [{ action: 'shell', effect: 'deny' }] });
+  const run = async (agent: string, permissions: PermissionRule[]) => {
     const api = fakeProvider(() => say('ok'));
-    await SubagentTool({ agents: [careful], tools, permissions }).invoke({ input: 'x' }, { api, model: 'm' });
+    await SubagentTool({ agents: [open, careful], tools, permissions }).invoke({ agent, input: 'x' }, { api, model: 'm' });
     return api.requests[0]!.tools.map((t) => t.name);
   };
-  assert.deepEqual(await run([]), ['read']);
-  assert.deepEqual(await run([{ action: 'shell', effect: 'allow' }]), ['read', 'shell']);
-  assert.deepEqual(await run([{ action: '*', effect: 'allow' }]), ['read', 'shell']);
+  assert.deepEqual(await run('open', []), ['read', 'shell']);
+  assert.deepEqual(await run('open', [{ action: 'shell', effect: 'deny' }]), ['read']);
+  // The agent's own deny wins over a default allow.
+  assert.deepEqual(await run('careful', [{ action: '*', effect: 'allow' }]), ['read']);
+  assert.deepEqual(await run('open', [{ action: '*', effect: 'allow' }]), ['read', 'shell']);
 });
 
 test('agents must be given, with unique names', () => {

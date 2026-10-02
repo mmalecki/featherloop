@@ -60,7 +60,7 @@ export const ShellTool = defineTool<ShellParams>({
     // Owner-only and created afresh: command output can contain secrets, and the
     // temp directory is shared. There's no size limit yet: unlike a pipe, a file
     // never makes the command wait, so runaway output fills the disk.
-    const file = join(tmpdir(), `featherslop-shell-${randomUUID()}.log`);
+    const file = join(tmpdir(), `featherloop-shell-${randomUUID()}.log`);
     const handle = await open(file, 'ax+', 0o600);
     let keep = false;
     try {

@@ -13,7 +13,7 @@ const ctx: ToolContext = { api: {} as Provider, model: 'test' };
 
 let dir: string;
 before(async () => {
-  dir = await mkdtemp(join(tmpdir(), 'featherslop-glob-'));
+  dir = await mkdtemp(join(tmpdir(), 'featherloop-glob-'));
   const files = [
     'README.md',
     'src/a.ts',

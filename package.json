@@ -1,5 +1,5 @@
 {
-  "name": "featherslop",
+  "name": "featherloop",
   "version": "0.1.0",
   "description": "Minimal agent execution loop with configurable, context-lean toolsets",
   "type": "module",
@@ -12,7 +12,7 @@
     }
   },
   "bin": {
-    "featherslop": "dist/bin/featherslop.js"
+    "featherloop": "dist/bin/featherloop.js"
   },
   "files": [
     "dist"
@@ -25,7 +25,7 @@
     "typecheck": "tsc --noEmit",
     "mvp": "node examples/mvp.ts",
     "web": "node --env-file-if-exists=.env examples/web.ts",
-    "chat": "node --env-file-if-exists=.env bin/featherslop.ts",
+    "chat": "node --env-file-if-exists=.env bin/featherloop.ts",
     "test": "node --test \"test/**/*.test.ts\"",
     "claude": "node --env-file-if-exists=.env examples/claude.ts",
     "prepack": "npm run build",

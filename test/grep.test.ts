@@ -13,7 +13,7 @@ const ctx: ToolContext = { api: {} as Provider, model: 'test' };
 
 let dir: string;
 before(async () => {
-  dir = await mkdtemp(join(tmpdir(), 'featherslop-grep-'));
+  dir = await mkdtemp(join(tmpdir(), 'featherloop-grep-'));
   const files: Record<string, string> = {
     'src/a.ts': 'export const foo = 1;\nconst bar = foo + 1;\n',
     'src/b.ts': '-flag here\nnothing\n',

@@ -6,7 +6,10 @@ export interface AgentSpec {
   description?: string;
   /** The system prompt, or a function of where and when it runs. */
   system: string | ((ctx: AgentContext) => string);
-  /** Ordered; the last matching rule wins. Tools that no rule matches are allowed. */
+  /**
+   * Ordered; the last matching rule wins. They come after the caller's defaults
+   * (see `toolset()`), so they override them. Tools no rule matches are allowed.
+   */
   permissions?: PermissionRule[];
   /**
    * The model it runs on, as `provider/model` or an alias such as `advisor`, which
@@ -72,12 +75,13 @@ export class Agent {
   }
 
   /**
-   * The tools in `available` that the permissions allow. `extra` rules come after
-   * the agent's, so they win: e.g. a CLI flag that turns a tool on.
+   * The tools in `available` that the rules allow. `defaults` come first, e.g. a
+   * CLI's or config's, and the agent's own rules after, so the agent's win, as in
+   * OpenCode: an agent that denies a tool never gets it, whatever the defaults say.
    */
-  toolset(available: Toolset, extra: PermissionRule[] = []): Toolset {
-    extra.forEach((rule, i) => checkRule(rule, `Extra permission ${i + 1}`));
-    const rules = [...this.permissions, ...extra];
+  toolset(available: Toolset, defaults: PermissionRule[] = []): Toolset {
+    defaults.forEach((rule, i) => checkRule(rule, `Default permission ${i + 1}`));
+    const rules = [...defaults, ...this.permissions];
 
     // A rule naming an action no tool has is most likely a typo, which would
     // otherwise silently allow or deny nothing.

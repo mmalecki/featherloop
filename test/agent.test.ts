@@ -32,10 +32,14 @@ test('* matches any part of an action', () => {
   assert.deepEqual(tools([{ action: 'web.*', effect: 'deny' }]), tools());
 });
 
-test('extra rules come after the agent’s, so they win', () => {
-  const general = [{ action: '*', effect: 'allow' }, { action: 'shell', effect: 'deny' }] satisfies PermissionRule[];
-  assert.ok(!tools(general).includes('shell'));
-  assert.ok(tools(general, [{ action: 'shell', effect: 'allow' }]).includes('shell'));
+test("defaults come before the agent's rules, so the agent's win", () => {
+  const offShell = [{ action: 'shell', effect: 'deny' }] satisfies PermissionRule[];
+  // No rules of its own: the defaults decide.
+  assert.ok(!tools([], offShell).includes('shell'));
+  assert.ok(tools([], []).includes('shell'));
+  // A read-only agent stays so, whatever the defaults allow.
+  const readOnly = [{ action: '*', effect: 'deny' }, { action: 'read', effect: 'allow' }] satisfies PermissionRule[];
+  assert.deepEqual(tools(readOnly, [{ action: 'shell', effect: 'allow' }]), ['read']);
 });
 
 test('rejects actions no tool has, but not built-in actions whose tool is missing', () => {
@@ -51,7 +55,7 @@ test('rejects what OpenCode has but we do not: ask, resource, and other keys', (
   assert.throws(() => define({ action: 'shell', effect: 'deny', note: 1 }), /unknown key note/);
   assert.throws(() => define({ action: 'shell', effect: 'block' }), /effect must be allow or deny/);
   assert.throws(() => define({ action: '', effect: 'deny' }), /action must be a non-empty string/);
-  assert.throws(() => agent().toolset(available, [{ action: 'shell', effect: 'ask' } as never]), /Extra permission 1: ask/);
+  assert.throws(() => agent().toolset(available, [{ action: 'shell', effect: 'ask' } as never]), /Default permission 1: ask/);
 });
 
 test('checks the name, system prompt and model', () => {
