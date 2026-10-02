@@ -13,7 +13,7 @@ import {
 } from './provider.ts';
 import type { ModelResolver } from './models.ts';
 import { toProvider, type ApiClient } from './providers/index.ts';
-import { ToolInputError, type Toolset } from './tool.ts';
+import { ToolInputError, type Tool, type Toolset } from './tool.ts';
 
 export type { AssistantMessage, Message, Usage } from './provider.ts';
 
@@ -153,6 +153,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     const api = client ? toProvider(client) : this.api;
     const messages: Message[] = [...input];
     const tools = toolSpecs(toolset);
+    // Looked up by the names the model sends, so a Map: `constructor` isn't a tool.
+    const byName: ReadonlyMap<string, Tool> = new Map(Object.entries(toolset));
     let usage = emptyUsage();
     let turn = 0;
     const track: Track = (used, info) => {
@@ -183,7 +185,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         const skip = message.stop === 'refusal' || message.stop === 'max_tokens' ? message.stop : undefined;
         const results = skip
           ? message.tool_calls.map((call) => this.#skip(call, skip))
-          : await this.#invokeAll(message.tool_calls, toolset, { api, model, signal, track, messages });
+          : await this.#invokeAll(message.tool_calls, byName, { api, model, signal, track, messages });
         for (const result of results) {
           messages.push(result);
           this.emit('message', result);
@@ -210,11 +212,11 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
    * Runs a turn's calls concurrently, except sequential ones, which wait for
    * everything before them and run alone. Results keep the model's order.
    */
-  async #invokeAll(calls: ChatCompletionMessageFunctionToolCall[], toolset: Toolset, context: InvokeContext): Promise<ToolMessage[]> {
+  async #invokeAll(calls: ChatCompletionMessageFunctionToolCall[], toolset: ReadonlyMap<string, Tool>, context: InvokeContext): Promise<ToolMessage[]> {
     const results: ToolMessage[] = [];
     let batch: Promise<ToolMessage>[] = [];
     for (const call of calls) {
-      if (this.sequentialTools || toolset[call.function.name]?.sequential) {
+      if (this.sequentialTools || toolset.get(call.function.name)?.sequential) {
         results.push(...(await Promise.all(batch)));
         batch = [];
         results.push(await this.#invoke(call, toolset, context));
@@ -228,7 +230,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
 
   async #invoke(
     call: ChatCompletionMessageFunctionToolCall,
-    toolset: Toolset,
+    toolset: ReadonlyMap<string, Tool>,
     { api, model, signal, track, messages }: InvokeContext,
   ): Promise<ToolMessage> {
     const { id } = call;
@@ -239,7 +241,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     let result: string;
     let isError = false;
     try {
-      const tool = toolset[name];
+      const tool = toolset.get(name);
       if (!tool) throw new ToolInputError(`Unknown tool "${name}"`);
       if (!args) throw new ToolInputError('Arguments must be a JSON object');
       result = await tool.invoke(args, {
