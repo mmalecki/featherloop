@@ -1,11 +1,46 @@
-// Helpers shared by the grep and glob tools: finding a backend, running it, and
-// formatting its results the same way whichever backend ran.
+// What the grep and glob tools share: their common parameters, finding a backend,
+// running it, and formatting its results the same way whichever backend ran.
 import { execFile } from 'node:child_process';
 import { stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
-import { ToolInputError } from '../../tool.ts';
+import { ToolInputError, type ParamDefinition } from '../../tool.ts';
 import { fsError } from './fs.ts';
 import { spawnGroup } from './process.ts';
+
+/** Parameters every search tool takes. */
+export interface SearchParams {
+  /** What to look for: a regex for grep, a glob for glob. */
+  search: string;
+  /** Where to look. Defaults to the cwd. */
+  paths: string[] | undefined;
+  /** Directory paths are resolved against and shown relative to. Defaults to the process cwd at call time. */
+  cwd: string | undefined;
+  timeoutMs: number;
+  /** Longer output keeps its first lines. */
+  maxLength: number;
+}
+
+/** Definitions of the parameters every search tool hides from the model. */
+export const hiddenSearchParams = {
+  cwd: {
+    schema: { type: 'string' },
+    expose: false,
+  },
+  timeoutMs: {
+    schema: { type: 'integer', minimum: 1 },
+    default: 60_000,
+    expose: false,
+  },
+  maxLength: {
+    schema: {
+      type: 'integer',
+      minimum: 1,
+      description: 'Max characters of output to return. Longer output keeps its first lines.',
+    },
+    default: 10_000,
+    expose: false,
+  },
+} satisfies { [K in 'cwd' | 'timeoutMs' | 'maxLength']: ParamDefinition };
 
 /** Output beyond this is not collected; the search stops and says its results are incomplete. */
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;

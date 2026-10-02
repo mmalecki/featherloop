@@ -1,17 +1,12 @@
 import { resolve } from 'node:path';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { dedupe, lines, probe, relativePath, report, run, searchPaths } from './shared/search.ts';
+import { dedupe, hiddenSearchParams, lines, probe, relativePath, report, run, searchPaths, type SearchParams } from './shared/search.ts';
 
-export interface GrepParams {
+export interface GrepParams extends SearchParams {
   /** Regex: Rust syntax with rg, PCRE (or ERE without PCRE) with grep. */
   search: string;
   /** Files or directories to search. Defaults to the cwd. */
   paths: string[] | undefined;
-  /** Directory paths are resolved against and shown relative to. Defaults to the process cwd at call time. */
-  cwd: string | undefined;
-  timeoutMs: number;
-  /** Longer output keeps its first lines. */
-  maxLength: number;
   /** `auto` uses rg when it's installed, and grep otherwise. */
   backend: 'auto' | 'rg' | 'grep';
 }
@@ -39,24 +34,7 @@ export const GrepTool = defineTool<GrepParams>({
     paths: {
       schema: { type: 'array', items: { type: 'string' }, description: 'Files or directories (default: .)' },
     },
-    cwd: {
-      schema: { type: 'string' },
-      expose: false,
-    },
-    timeoutMs: {
-      schema: { type: 'integer', minimum: 1 },
-      default: 60_000,
-      expose: false,
-    },
-    maxLength: {
-      schema: {
-        type: 'integer',
-        minimum: 1,
-        description: 'Max characters of output to return. Longer output keeps its first lines.',
-      },
-      default: 10_000,
-      expose: false,
-    },
+    ...hiddenSearchParams,
     backend: {
       schema: { type: 'string', enum: ['auto', 'rg', 'grep'] },
       default: 'auto',
