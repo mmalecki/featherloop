@@ -24,20 +24,29 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface AnthropicProviderOptions {
   /** Defaults to 64000; turns are streamed, so large values are fine. */
   maxTokens?: number;
-  /** `output_config.effort`; unset uses the model's default (`medium` on Claude Opus 5.5). */
+  /** `output_config.effort`; unset uses the model's default (`medium` on Claude Opus 5.5). Not sent to Claude Haiku 4.5. */
   effort?: Effort;
   /**
    * Adaptive thinking display. `summarized` (default) returns readable thinking
-   * summaries; `false` omits the `thinking` parameter (e.g. for Claude Haiku 4.5).
+   * summaries; `false` omits the `thinking` parameter. Not sent to Claude Haiku 4.5.
    */
   thinking?: 'summarized' | 'omitted' | false;
-  /** Server-side fallback when a request is declined for policy reasons. On by default. */
+  /** Server-side fallback when a request is declined for policy reasons. On by default; not sent to Claude Haiku 4.5. */
   fallbacks?: 'default' | false;
   /** Automatic prompt caching of the conversation prefix. On by default. */
   cache?: boolean;
 }
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
+
+/**
+ * Claude Haiku 4.5 rejects adaptive thinking and `effort`, and server-side
+ * fallbacks aren't documented for it. Checked per request, not per provider,
+ * since `/model` can switch models mid-session.
+ */
+const lacksAdaptive = (model: string) => model.startsWith('claude-haiku-4-5');
+
+const NO_ADAPTIVE: AnthropicProviderOptions = { thinking: false, fallbacks: false };
 
 /** Claude through the Messages API (`@anthropic-ai/sdk`). */
 export class AnthropicProvider implements Provider {
@@ -51,7 +60,8 @@ export class AnthropicProvider implements Provider {
   }
 
   async turn({ model, messages, tools, signal, request }: TurnRequest, on: TurnHandlers): Promise<AssistantMessage> {
-    const { maxTokens = 64_000, effort, thinking = 'summarized', fallbacks = 'default', cache = true } = this.options;
+    const { maxTokens = 64_000, cache = true } = this.options;
+    const { effort, thinking = 'summarized', fallbacks = 'default' } = lacksAdaptive(model) ? NO_ADAPTIVE : this.options;
     const { system, messages: converted } = toAnthropic(messages);
 
     const stream = this.client.beta.messages.stream(
