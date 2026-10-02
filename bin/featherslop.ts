@@ -7,6 +7,7 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import {
   AnthropicProvider,
+  defineAgent,
   GlobTool,
   GrepTool,
   Loop,
@@ -15,6 +16,7 @@ import {
   ShellTool,
   SimpleUI,
   WebFetchTool,
+  type PermissionRule,
   type Provider,
   type Toolset,
 } from '../src/index.ts';
@@ -53,9 +55,22 @@ const provider = argv.provider ?? (model.startsWith('claude-') ? 'anthropic' : '
 
 const api = provider === 'anthropic' ? await anthropic() : openai();
 
+// The only agent for now: every tool but the shell, which --shell turns on.
+const general = defineAgent({
+  name: 'general',
+  description: 'General-purpose assistant',
+  system: ({ date, cwd }) => `Concise assistant. Today is ${date}. cwd: ${cwd}`,
+  permissions: [
+    { action: '*', effect: 'allow' },
+    { action: 'shell', effect: 'deny' },
+  ],
+});
+// Rules from flags come after the agent's, so they win.
+const flagPermissions: PermissionRule[] = shell ? [{ action: 'shell', effect: 'allow' }] : [];
+
 // A factory, so `/c` starts over with fresh tool state (e.g. which files were read).
-const createAgent = () => {
-  const tools: Toolset = {
+const createLoop = () => {
+  const available: Toolset = {
     // read, write and update; updates and overwrites only after a read.
     ...ManagedFileTools(),
     // rg and fd when installed, otherwise grep and find.
@@ -67,15 +82,15 @@ const createAgent = () => {
           { params: { compactOptions: { value: { chat_template_kwargs: { enable_thinking: false } } } } }
         : {},
     ),
+    shell: ShellTool(),
   };
-  if (process.env.PARALLEL_API_KEY) tools.websearch = ParallelWebSearchTool();
-  if (shell) tools.shell = ShellTool();
-  return Loop(api, tools);
+  if (process.env.PARALLEL_API_KEY) available.websearch = ParallelWebSearchTool();
+  return Loop(api, general.toolset(available, flagPermissions));
 };
 
-const ui = new SimpleUI(createAgent, {
+const ui = new SimpleUI(createLoop, {
   model,
-  system: `Concise assistant. Today is ${new Date().toISOString().slice(0, 10)}. cwd: ${process.cwd()}`,
+  system: general.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model }),
 });
 
 const prompt = argv._.join(' ');
