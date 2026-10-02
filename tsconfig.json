@@ -15,5 +15,5 @@
     "declaration": true,
     "outDir": "dist"
   },
-  "include": ["src", "examples", "test"]
+  "include": ["src", "bin", "examples", "test"]
 }
