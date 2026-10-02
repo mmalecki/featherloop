@@ -113,7 +113,8 @@ async function run(command: string, output: number, { cwd, timeoutMs, shell, sig
 
 /**
  * Output over `max` characters keeps only its end inline, where errors and
- * summaries usually are. Reads no more of the file than that end.
+ * summaries usually are. Reads no more of the file than that end, so what's
+ * omitted is counted in bytes: the rest is never decoded.
  */
 async function tail(handle: FileHandle, size: number, max: number): Promise<{ text: string; omitted: number }> {
   // A character is at most 4 bytes in UTF-8, so the last `max` are within the last 4 * max bytes.
