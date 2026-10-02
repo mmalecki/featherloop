@@ -39,7 +39,8 @@ const argv = await yargs(hideBin(process.argv))
   .option('flavor', { choices: FLAVORS, default: 'openai' as const, describe: 'API a bare model id speaks' })
   .option('base-url', {
     type: 'string',
-    describe: 'Endpoint for a bare model id, with /v1 (openai flavor: env OPENAI_BASE_URL, else http://127.0.0.1:9931/v1)',
+    describe:
+      "Endpoint for a bare model id, with /v1 (openai flavor: env OPENAI_BASE_URL, else llama-server's default, http://127.0.0.1:9931/v1)",
   })
   .option('config', { type: 'string', default: configPath(), describe: 'Config file, for providers and models' })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
