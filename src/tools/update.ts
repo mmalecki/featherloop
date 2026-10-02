@@ -1,6 +1,6 @@
 import { readFile, writeFile } from 'node:fs/promises';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { fsError, resolvePath } from './fs.ts';
+import { fsError, resolvePath } from './shared/fs.ts';
 
 export interface UpdateParams {
   path: string;

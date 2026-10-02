@@ -1,5 +1,5 @@
 import { resolve } from 'node:path';
-import { ToolInputError } from '../tool.ts';
+import { ToolInputError } from '../../tool.ts';
 
 /** Resolves a model-given path; `cwd` defaults to the process cwd at call time. */
 export function resolvePath(path: string, cwd: string | undefined): string {

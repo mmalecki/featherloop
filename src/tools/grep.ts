@@ -1,6 +1,6 @@
 import { resolve } from 'node:path';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { dedupe, lines, probe, relativePath, report, run, searchPaths } from './search.ts';
+import { dedupe, lines, probe, relativePath, report, run, searchPaths } from './shared/search.ts';
 
 export interface GrepParams {
   /** Regex: Rust syntax with rg, PCRE (or ERE without PCRE) with grep. */

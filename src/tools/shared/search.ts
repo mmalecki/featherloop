@@ -3,7 +3,7 @@
 import { execFile } from 'node:child_process';
 import { stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
-import { ToolInputError } from '../tool.ts';
+import { ToolInputError } from '../../tool.ts';
 import { fsError } from './fs.ts';
 import { spawnGroup } from './process.ts';
 

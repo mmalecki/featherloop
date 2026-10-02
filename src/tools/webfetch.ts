@@ -1,6 +1,6 @@
 import { compact } from '../compact.ts';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { htmlToMarkdown } from './html.ts';
+import { htmlToMarkdown } from './shared/html.ts';
 
 export interface WebFetchParams {
   url: string;

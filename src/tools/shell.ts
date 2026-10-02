@@ -3,7 +3,7 @@ import { open, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { defineTool } from '../tool.ts';
-import { spawnGroup } from './process.ts';
+import { spawnGroup } from './shared/process.ts';
 
 export interface ShellParams {
   command: string;

@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { fsError, resolvePath } from './fs.ts';
+import { fsError, resolvePath } from './shared/fs.ts';
 
 export interface WriteParams {
   path: string;

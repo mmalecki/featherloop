@@ -1,6 +1,6 @@
 import { basename, matchesGlob, relative, resolve, sep } from 'node:path';
 import { defineTool, ToolInputError } from '../tool.ts';
-import { dedupe, lines, probe, relativePath, report, run, searchPaths } from './search.ts';
+import { dedupe, lines, probe, relativePath, report, run, searchPaths } from './shared/search.ts';
 
 export interface GlobParams {
   /** Matched against file names, or against paths relative to the searched directory if it contains "/". */

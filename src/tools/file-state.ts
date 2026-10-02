@@ -1,6 +1,6 @@
 import { stat } from 'node:fs/promises';
 import { ToolInputError, type Tool, type ToolOptions } from '../tool.ts';
-import { resolvePath } from './fs.ts';
+import { resolvePath } from './shared/fs.ts';
 import { ReadTool, type ReadParams } from './read.ts';
 import { UpdateTool, type UpdateParams } from './update.ts';
 import { WriteTool, type WriteParams } from './write.ts';
