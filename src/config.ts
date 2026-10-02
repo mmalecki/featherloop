@@ -166,7 +166,7 @@ type Fields = Record<string, any>;
 
 /** Replaces `{env:NAME}` in every string value. */
 function substitute(value: unknown, env: NodeJS.ProcessEnv): unknown {
-  if (typeof value === 'string') return value.replace(/\{env:([^}]+)\}/g, (_, name: string) => env[name] ?? '');
+  if (typeof value === 'string') return value.replace(/\{env:([^}]+)\}/g, (_, name: string) => (Object.hasOwn(env, name) ? env[name] : undefined) ?? '');
   if (Array.isArray(value)) return value.map((item) => substitute(item, env));
   if (typeof value !== 'object' || value === null) return value;
   return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, substitute(item, env)]));
