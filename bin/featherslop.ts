@@ -7,6 +7,8 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import {
   AnthropicProvider,
+  GlobTool,
+  GrepTool,
   Loop,
   ManagedFileTools,
   ParallelWebSearchTool,
@@ -37,7 +39,7 @@ const argv = await yargs(hideBin(process.argv))
   })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
   .epilogue(
-    'Tools: read, write, update, webfetch; websearch when PARALLEL_API_KEY is set.\n' +
+    'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set.\n' +
       'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.',
   )
   .version(version())
@@ -56,6 +58,9 @@ const createAgent = () => {
   const tools: Toolset = {
     // read, write and update; updates and overwrites only after a read.
     ...ManagedFileTools(),
+    // rg and fd when installed, otherwise grep and find.
+    grep: GrepTool(),
+    glob: GlobTool(),
     webfetch: WebFetchTool(
       provider === 'openai'
         ? // llama.cpp: skip thinking for compaction; other servers ignore unknown fields.

@@ -4,6 +4,8 @@ export * from './tools/read.ts';
 export * from './tools/write.ts';
 export * from './tools/update.ts';
 export * from './tools/shell.ts';
+export { GrepTool, type GrepParams } from './tools/grep.ts';
+export { GlobTool, type GlobParams } from './tools/glob.ts';
 export * from './tools/fs.ts';
 export * from './tools/file-state.ts';
 export * from './compact.ts';

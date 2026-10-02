@@ -1,16 +1,18 @@
 {
   "name": "featherslop",
   "version": "0.1.0",
-  "author": "Maciej Małecki <me@mmalecki.com>",
   "description": "Minimal agent execution loop with configurable, context-lean toolsets",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
     }
+  },
+  "bin": {
+    "featherslop": "dist/bin/featherslop.js"
   },
   "files": [
     "dist"
@@ -19,13 +21,16 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "mvp": "node examples/mvp.ts",
     "web": "node --env-file-if-exists=.env examples/web.ts",
-    "chat": "node --env-file-if-exists=.env examples/chat.ts",
-    "test": "node --test",
-    "claude": "node --env-file-if-exists=.env examples/claude.ts"
+    "chat": "node --env-file-if-exists=.env bin/featherslop.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "claude": "node --env-file-if-exists=.env examples/claude.ts",
+    "prepack": "npm run build",
+    "validate-cases": "node test/harness-bench/validate.ts",
+    "bench": "node --use-env-proxy --env-file-if-exists=.env test/harness-bench/run.ts"
   },
   "license": "ISC",
   "dependencies": {
@@ -34,13 +39,8 @@
     "linkedom": "^0.18.13",
     "openai": "^7.27.0",
     "parallel-web": "^1.3.5",
-    "turndown": "^7.2.4"
-  },
-  "devDependencies": {
-    "@anthropic-ai/sdk": "^0.131.0",
-    "@types/node": "^26.6.4",
-    "@types/turndown": "^5.0.6",
-    "typescript": "^7.0.2"
+    "turndown": "^7.2.4",
+    "yargs": "^18.2.0"
   },
   "peerDependencies": {
     "@anthropic-ai/sdk": ">=0.131.0"
@@ -49,5 +49,13 @@
     "@anthropic-ai/sdk": {
       "optional": true
     }
-  }
+  },
+  "devDependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
+    "@types/node": "^26.6.4",
+    "@types/turndown": "^5.0.6",
+    "@types/yargs": "^17.0.35",
+    "typescript": "^7.0.2"
+  },
+  "author": "Maciej Małecki <me@mmalecki.com>"
 }
