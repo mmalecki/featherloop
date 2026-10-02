@@ -10,16 +10,16 @@ import type { ChatCompletionContentPart } from 'openai/resources/chat/completion
 import type {
   AssistantMessage,
   CompleteRequest,
+  Effort,
   Message,
   Provider,
+  Reasoning,
   StopReason,
   ToolMessage,
   TurnHandlers,
   TurnRequest,
   Usage,
 } from '../provider.ts';
-
-export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
 export interface AnthropicProviderOptions {
   /** Defaults to 64000; turns are streamed, so large values are fine. */
@@ -35,6 +35,8 @@ export interface AnthropicProviderOptions {
   fallbacks?: 'default' | false;
   /** Automatic prompt caching of the conversation prefix. On by default. */
   cache?: boolean;
+  /** Extra Messages API fields for every call; a call's own fields win. */
+  request?: Record<string, unknown>;
 }
 
 const FALLBACK_BETA = 'server-side-fallback-2026-07-01';
@@ -59,9 +61,11 @@ export class AnthropicProvider implements Provider {
     this.options = options;
   }
 
-  async turn({ model, messages, tools, signal, request }: TurnRequest, on: TurnHandlers): Promise<AssistantMessage> {
+  async turn({ model, messages, tools, signal, reasoning: asked, request }: TurnRequest, on: TurnHandlers): Promise<AssistantMessage> {
     const { maxTokens = 64_000, cache = true } = this.options;
-    const { effort, thinking = 'summarized', fallbacks = 'default' } = lacksAdaptive(model) ? NO_ADAPTIVE : this.options;
+    const { effort, thinking = 'summarized', fallbacks = 'default' } = lacksAdaptive(model)
+      ? NO_ADAPTIVE
+      : { ...this.options, ...reasoningOptions(asked) };
     const { system, messages: converted } = toAnthropic(messages);
 
     const stream = this.client.beta.messages.stream(
@@ -83,6 +87,7 @@ export class AnthropicProvider implements Provider {
         ...(effort ? { output_config: { effort } } : {}),
         ...(cache ? { cache_control: { type: 'ephemeral' as const } } : {}),
         ...(fallbacks ? { betas: [FALLBACK_BETA], fallbacks } : {}),
+        ...this.options.request,
         ...request,
       },
       { signal },
@@ -127,13 +132,17 @@ export class AnthropicProvider implements Provider {
     return message;
   }
 
-  async complete({ model, system, prompt, signal, request, onUsage }: CompleteRequest): Promise<string> {
+  /** Without thinking, unless the call asks for a reasoning level. */
+  async complete({ model, system, prompt, signal, reasoning, request, onUsage }: CompleteRequest): Promise<string> {
+    const effort = reasoning && reasoning !== 'none' && !lacksAdaptive(model) ? reasoning : undefined;
     const response = await this.client.beta.messages.create(
       {
         model,
         max_tokens: 16_000,
         ...(system ? { system } : {}),
         messages: [{ role: 'user', content: prompt }],
+        ...(effort ? { thinking: { type: 'adaptive' as const, display: 'omitted' as const }, output_config: { effort } } : {}),
+        ...this.options.request,
         ...request,
       },
       { signal },
@@ -141,6 +150,12 @@ export class AnthropicProvider implements Provider {
     onUsage?.(toUsage(response.usage));
     return textOf(response.content).trim();
   }
+}
+
+/** A call's reasoning as options: `none` turns thinking off, a level sets effort. */
+function reasoningOptions(reasoning: Reasoning | undefined): AnthropicProviderOptions {
+  if (reasoning === undefined) return {};
+  return reasoning === 'none' ? { thinking: false } : { effort: reasoning };
 }
 
 function toUsage(usage: BetaUsage): Usage {

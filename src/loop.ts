@@ -6,6 +6,7 @@ import {
   type AssistantMessage,
   type Message,
   type Provider,
+  type Reasoning,
   type ToolMessage,
   type ToolSpec,
   type Usage,
@@ -42,8 +43,12 @@ export interface RunOptions {
   toolset?: Toolset;
   endCriteria?: EndCriteria;
   signal?: AbortSignal;
+  /** Overrides the provider's configured reasoning for this run's turns. */
+  reasoning?: Reasoning;
   /** Extra provider-specific request fields (temperature, llama.cpp sampling params, ...). */
   request?: Record<string, unknown>;
+  /** Provider for this run instead of the constructor's, e.g. after switching to another provider's model. */
+  api?: ApiClient;
 }
 
 export interface RunResult {
@@ -139,7 +144,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     }
   }
 
-  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, request }: RunOptions): Promise<RunResult> {
+  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, reasoning, request, ...run }: RunOptions): Promise<RunResult> {
+    const api = run.api ? toProvider(run.api) : this.api;
     const messages: Message[] = [...input];
     const tools = toolSpecs(toolset);
     let usage = emptyUsage();
@@ -154,8 +160,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
       signal?.throwIfAborted();
       this.emit('turn', turn);
 
-      const message = await this.api.turn(
-        { model, messages, tools, signal, request },
+      const message = await api.turn(
+        { model, messages, tools, signal, reasoning, request },
         {
           reasoning: (delta) => this.emit('reasoning', delta),
           content: (delta) => this.emit('content', delta),
@@ -172,7 +178,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         const skip = message.stop === 'refusal' || message.stop === 'max_tokens' ? message.stop : undefined;
         const results = skip
           ? message.tool_calls.map((call) => this.#skip(call, skip))
-          : await this.#invokeAll(message.tool_calls, toolset, { model, signal, track, messages });
+          : await this.#invokeAll(message.tool_calls, toolset, { api, model, signal, track, messages });
         for (const result of results) {
           messages.push(result);
           this.emit('message', result);
@@ -218,7 +224,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   async #invoke(
     call: ChatCompletionMessageFunctionToolCall,
     toolset: Toolset,
-    { model, signal, track, messages }: InvokeContext,
+    { api, model, signal, track, messages }: InvokeContext,
   ): Promise<ToolMessage> {
     const { id } = call;
     const { name, arguments: raw } = call.function;
@@ -231,7 +237,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
       const tool = toolset[name];
       if (!tool) throw new ToolInputError(`Unknown tool "${name}"`);
       if (!args) throw new ToolInputError('Arguments must be a JSON object');
-      result = await tool.invoke(args, { api: attributed(this.api, name, track), model, signal, messages, relay: this.#relay(id) });
+      result = await tool.invoke(args, { api: attributed(api, name, track), model, signal, messages, relay: this.#relay(id) });
     } catch (err) {
       if (signal?.aborted) throw err;
       // Any failure goes back to the model as the tool result; it may be able to recover.
@@ -273,6 +279,7 @@ export function Loop(api: ApiClient, toolset: Toolset = {}, options: LoopOptions
 }
 
 interface InvokeContext {
+  api: Provider;
   model: string;
   signal: AbortSignal | undefined;
   track: Track;

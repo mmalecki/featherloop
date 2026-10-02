@@ -52,6 +52,14 @@ export function addUsage(a: Usage, b: Usage): Usage {
 
 export const emptyUsage = (): Usage => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
+ * How much the model should reason, for providers to send in their API's own
+ * terms: `none` turns thinking off. Raw `request` fields still win over it.
+ */
+export type Reasoning = 'none' | Effort;
+
 export interface ToolSpec {
   name: string;
   description: string;
@@ -63,6 +71,8 @@ export interface TurnRequest {
   messages: readonly Message[];
   tools: readonly ToolSpec[];
   signal?: AbortSignal | undefined;
+  /** Overrides the provider's configured reasoning for this call. */
+  reasoning?: Reasoning | undefined;
   /** Extra provider-specific request fields. */
   request?: Record<string, unknown> | undefined;
 }
@@ -79,6 +89,8 @@ export interface CompleteRequest {
   prompt: string;
   signal?: AbortSignal | undefined;
   onUsage?: ((usage: Usage) => void) | undefined;
+  /** Overrides the provider's configured reasoning for this call. */
+  reasoning?: Reasoning | undefined;
   /** Extra provider-specific request fields. */
   request?: Record<string, unknown> | undefined;
 }

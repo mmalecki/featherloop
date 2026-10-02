@@ -5,25 +5,43 @@ import type {
   ChatCompletionMessageParam,
 } from 'openai/resources/chat/completions';
 import type { CompletionUsage } from 'openai/resources/completions';
-import type { AssistantMessage, CompleteRequest, Message, Provider, StopReason, TurnHandlers, TurnRequest, Usage } from '../provider.ts';
+import type {
+  AssistantMessage,
+  CompleteRequest,
+  Message,
+  Provider,
+  Reasoning,
+  StopReason,
+  TurnHandlers,
+  TurnRequest,
+  Usage,
+} from '../provider.ts';
+
+export interface OpenAIProviderOptions {
+  /** Extra request fields for every call, e.g. `reasoning_effort`; a call's own fields win. */
+  request?: Record<string, unknown>;
+}
 
 /** OpenAI Chat Completions, and compatible servers such as llama.cpp. */
 export class OpenAIProvider implements Provider {
   readonly name = 'openai';
   readonly client: OpenAI;
+  readonly options: OpenAIProviderOptions;
 
-  constructor(client: OpenAI) {
+  constructor(client: OpenAI, options: OpenAIProviderOptions = {}) {
     this.client = client;
+    this.options = options;
   }
 
-  async turn({ model, messages, tools, signal, request }: TurnRequest, on: TurnHandlers): Promise<AssistantMessage> {
+  async turn({ model, messages, tools, signal, reasoning: asked, request: own }: TurnRequest, on: TurnHandlers): Promise<AssistantMessage> {
+    const request: Record<string, unknown> = { ...this.options.request, ...reasoningEffort(asked), ...own };
     const stream = await this.client.chat.completions.create(
       {
         ...request,
         model,
         messages: messages.map(toOpenAI),
         stream: true,
-        stream_options: { include_usage: true, ...(request?.stream_options as object | undefined) },
+        stream_options: { include_usage: true, ...(request.stream_options as object | undefined) },
         ...(tools.length
           ? { tools: tools.map(({ name, description, parameters }) => ({ type: 'function' as const, function: { name, description, parameters } })) }
           : {}),
@@ -68,9 +86,11 @@ export class OpenAIProvider implements Provider {
     return message;
   }
 
-  async complete({ model, system, prompt, signal, request, onUsage }: CompleteRequest): Promise<string> {
+  async complete({ model, system, prompt, signal, reasoning, request, onUsage }: CompleteRequest): Promise<string> {
     const completion = await this.client.chat.completions.create(
       {
+        ...this.options.request,
+        ...reasoningEffort(reasoning),
         ...request,
         model,
         stream: false,
@@ -81,6 +101,14 @@ export class OpenAIProvider implements Provider {
     if (completion.usage) onUsage?.(toUsage(completion.usage));
     return completion.choices[0]?.message.content?.trim() ?? '';
   }
+}
+
+/**
+ * OpenAI's `reasoning_effort`, which llama.cpp also takes: `none` turns thinking
+ * off in templates that can, such as Qwen's.
+ */
+function reasoningEffort(reasoning: Reasoning | undefined): { reasoning_effort?: Reasoning } {
+  return reasoning === undefined ? {} : { reasoning_effort: reasoning };
 }
 
 function toUsage(usage: CompletionUsage): Usage {

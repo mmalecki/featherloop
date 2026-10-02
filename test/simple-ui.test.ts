@@ -114,3 +114,72 @@ test('names the subagent when parallel subagents interleave', async () => {
     ].join('\n'),
   );
 });
+
+test('/model switches providers mid-conversation, keeping the history', async () => {
+  const seen: { provider: string; model: string; messages: number; tool?: string }[] = [];
+  const fake = (name: string, replies: AssistantMessage[]): Provider => ({
+    name,
+    async turn(request, on) {
+      seen.push({ provider: name, model: request.model, messages: request.messages.length });
+      const reply = replies.shift()!;
+      if (typeof reply.content === 'string') on.content(reply.content);
+      return reply;
+    },
+    async complete() {
+      throw new Error('complete() should not be called');
+    },
+  });
+  const local = fake('local', [say('Hi from local.')]);
+  const remote = fake('remote', [call('probe', {}, 'call_1'), say('Hi from remote.')]);
+  // Records which provider a tool gets in its context.
+  const probe: Tool = {
+    schema: () => ({ description: '', parameters: { type: 'object', properties: {} } }),
+    invoke: (_, ctx) => ((seen.at(-1)!.tool = ctx.api.name), 'probed'),
+  };
+  const models = { local, remote };
+  const resolveModel = async (ref: string, variant: string | undefined) => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const [provider, model] = ref.split('/') as [keyof typeof models, string];
+    if (!models[provider]) throw new Error(`Unknown provider in "${ref}"`);
+    return { ref, api: models[provider], model, ...(variant ? { variant } : {}) };
+  };
+
+  const input = new PassThrough();
+  const out = new PassThrough();
+  let output = '';
+  out.on('data', (chunk) => (output += chunk));
+  const ui = new SimpleUI(Loop(local, { probe }), {
+    model: await resolveModel('local/qwen', undefined),
+    resolveModel,
+    system: 'You lead.',
+    input: input as unknown as NodeJS.ReadableStream,
+    output: out as unknown as NodeJS.WriteStream,
+  });
+  const done = ui.start();
+  const until = async (text: string) => {
+    for (let i = 0; !output.includes(text); i++) {
+      if (i > 200) throw new Error(`Never saw ${text}; output:\n${output}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  };
+
+  input.write('Hello.\n');
+  await until('Hi from local.');
+  input.write('/model nowhere/x\n');
+  await until('Unknown provider in "nowhere/x"');
+  // Typed together: the prompt waits for the switch.
+  input.write('/model remote/claude xhigh\nHello again.\n');
+  await until('Hi from remote.');
+  assert.match(output, /Model: remote\/claude \(xhigh\)/);
+  assert.equal(ui.model, 'claude');
+  input.end();
+  await done;
+
+  assert.deepEqual(seen, [
+    { provider: 'local', model: 'qwen', messages: 2 },
+    // System, both user messages and local's reply; the tool got remote too.
+    { provider: 'remote', model: 'claude', messages: 4, tool: 'remote' },
+    { provider: 'remote', model: 'claude', messages: 6 },
+  ]);
+  assert.match(output, /featherslop \| local\/qwen \|/);
+});

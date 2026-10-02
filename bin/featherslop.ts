@@ -2,23 +2,26 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import OpenAI from 'openai';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import {
-  AnthropicProvider,
+  ConfigError,
+  configPath,
   generalAgent,
   GlobTool,
   GrepTool,
+  loadConfig,
   Loop,
   ManagedFileTools,
+  ModelRegistry,
   ParallelWebSearchTool,
   ShellTool,
   SimpleUI,
   SubagentTool,
   WebFetchTool,
+  type Config,
   type PermissionRule,
-  type Provider,
+  type ResolvedModel,
   type Toolset,
 } from '../src/index.ts';
 
@@ -28,18 +31,19 @@ const argv = await yargs(hideBin(process.argv))
   .option('model', {
     alias: 'm',
     type: 'string',
-    default: process.env.MODEL ?? 'qwen-3.5-9b',
-    describe: 'Model (env MODEL)',
+    describe: "provider/model from the config, or a bare model id (env MODEL; default: the config's model, else qwen-3.5-9b)",
   })
+  .option('variant', { type: 'string', describe: "One of the model's variants from the config (default: its default one, if any)" })
   .option('provider', {
     choices: ['openai', 'anthropic'] as const,
-    describe: 'API to use (default: anthropic for claude-* models, otherwise openai)',
+    describe: 'API for a bare model id (default: anthropic for claude-* models, otherwise openai)',
   })
   .option('base-url', {
     type: 'string',
     default: process.env.OPENAI_BASE_URL ?? 'http://127.0.0.1:9931/v1',
-    describe: 'OpenAI-compatible endpoint (env OPENAI_BASE_URL)',
+    describe: 'OpenAI-compatible endpoint for a bare model id (env OPENAI_BASE_URL)',
   })
+  .option('config', { type: 'string', default: configPath(), describe: 'Config file, for providers and models' })
   .option('shell', { type: 'boolean', default: false, describe: 'Add an unsandboxed shell tool' })
   .option('subagent', { type: 'boolean', default: false, describe: 'Add a subagent tool for handing off tasks' })
   .epilogue(
@@ -53,10 +57,11 @@ const argv = await yargs(hideBin(process.argv))
   .strictOptions()
   .parseAsync();
 
-const { model, shell, subagent } = argv;
-const provider = argv.provider ?? (model.startsWith('claude-') ? 'anthropic' : 'openai');
-
-const api = provider === 'anthropic' ? await anthropic() : openai();
+const { shell, subagent } = argv;
+const registry = await exitOnConfigError(() => new ModelRegistry(loadConfig(argv.config)));
+const initial = await exitOnConfigError(() =>
+  resolveModel(argv.model ?? process.env.MODEL ?? registry.default ?? 'qwen-3.5-9b', argv.variant),
+);
 
 // Rules from flags come after the agent's, so they win.
 const flagPermissions: PermissionRule[] = shell ? [{ action: 'shell', effect: 'allow' }] : [];
@@ -69,12 +74,7 @@ const availableTools = (): Toolset => {
     // rg and fd when installed, otherwise grep and find.
     grep: GrepTool(),
     glob: GlobTool(),
-    webfetch: WebFetchTool(
-      provider === 'openai'
-        ? // llama.cpp: skip thinking for compaction; other servers ignore unknown fields.
-          { params: { compactOptions: { value: { chat_template_kwargs: { enable_thinking: false } } } } }
-        : {},
-    ),
+    webfetch: WebFetchTool(),
     shell: ShellTool(),
   };
   if (process.env.PARALLEL_API_KEY) available.websearch = ParallelWebSearchTool();
@@ -88,34 +88,40 @@ const createLoop = () => {
   if (subagent) {
     available.subagent = SubagentTool({ agents: [generalAgent], tools: availableTools, permissions: flagPermissions });
   }
-  return Loop(api, generalAgent.toolset(available, flagPermissions));
+  // The UI passes each run the current model's provider; this one is only the default.
+  return Loop(initial.api, generalAgent.toolset(available, flagPermissions));
 };
 
 const ui = new SimpleUI(createLoop, {
-  model,
-  system: generalAgent.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model }),
+  model: initial,
+  resolveModel,
+  system: generalAgent.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model: initial.model }),
 });
 
 const prompt = argv._.join(' ');
 if (prompt) await ui.ask(prompt);
 else await ui.start();
 
-function openai(): Provider | OpenAI {
-  return new OpenAI({
-    baseURL: argv.baseUrl,
-    apiKey: process.env.OPENAI_API_KEY ?? 'none',
-  });
+/**
+ * A model from the config, or a bare model id run where --provider and --base-url
+ * say. For the initial model and `/model`.
+ */
+async function resolveModel(ref: string, variant: string | undefined): Promise<ResolvedModel> {
+  if (registry.parseRef(ref)) return registry.resolve(ref, { variant });
+  const provider = argv.provider ?? (ref.startsWith('claude-') ? 'anthropic' : 'openai');
+  const flags: Config = {
+    provider: { [provider]: { ...(provider === 'openai' ? { options: { baseURL: argv.baseUrl } } : {}), models: { [ref]: {} } } },
+  };
+  return new ModelRegistry(flags).resolve(`${provider}/${ref}`, { variant });
 }
 
-/** `@anthropic-ai/sdk` is an optional peer dependency; load it only when asked for. */
-async function anthropic(): Promise<Provider> {
+/** Config errors are the user's to fix: their message is enough. */
+async function exitOnConfigError<T>(fn: () => T | Promise<T>): Promise<T> {
   try {
-    const { default: Anthropic } = await import('@anthropic-ai/sdk');
-    // Agentic work does better at high effort than Claude Opus 5.5's medium default.
-    return new AnthropicProvider(new Anthropic(), { effort: 'high' });
+    return await fn();
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ERR_MODULE_NOT_FOUND') throw err;
-    console.error('The anthropic provider needs @anthropic-ai/sdk: npm install @anthropic-ai/sdk');
+    if (!(err instanceof ConfigError)) throw err;
+    console.error(err.message);
     process.exit(1);
   }
 }

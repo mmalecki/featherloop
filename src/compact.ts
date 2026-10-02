@@ -1,3 +1,4 @@
+import type { Reasoning } from './provider.ts';
 import type { ToolContext } from './tool.ts';
 
 export interface CompactOptions {
@@ -8,17 +9,20 @@ export interface CompactOptions {
   focus?: string | undefined;
   /** Defaults to the model the loop is running with. */
   model?: string | undefined;
-  /** Extra request fields, e.g. `{ chat_template_kwargs: { enable_thinking: false } }` for llama.cpp. */
+  /** Defaults to `none`: shrinking text needs no thinking. */
+  reasoning?: Reasoning | undefined;
+  /** Extra provider-specific request fields. */
   request?: Record<string, unknown> | undefined;
 }
 
 /** Shrinks a tool result with a single inference call before it reaches the agent's context. */
-export async function compact(ctx: ToolContext, { prompt, content, focus, model, request }: CompactOptions): Promise<string> {
+export async function compact(ctx: ToolContext, { prompt, content, focus, model, reasoning = 'none', request }: CompactOptions): Promise<string> {
   const result = await ctx.api.complete({
     model: model ?? ctx.model,
     system: prompt,
     prompt: focus ? `${content}\n\n---\nFocus: ${focus}` : content,
     signal: ctx.signal,
+    reasoning,
     request,
   });
   if (!result) throw new Error('Compaction returned no content');
