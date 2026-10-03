@@ -1,15 +1,34 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { parseDocument } from 'yaml';
 import { CACHE, ensureRepo, git } from './cases.ts';
 
 /**
  * The harnesses under test. Each gets a fresh, empty home for every run, with its
- * config copied in from harnesses/<name>: whatever the harness keeps globally
- * (sessions, databases, caches, the user's own instructions) starts empty and is
- * thrown away after.
+ * config copied in from harnesses/<name> and the model under test added from
+ * models.json: whatever the harness keeps globally (sessions, databases, caches,
+ * the user's own instructions) starts empty and is thrown away after.
  */
+
+/** A model in models.json, as the user's configs have it. */
+export interface Model {
+  /** Its key in models.json: the name harnesses send, which a single-model llama-server ignores. */
+  id: string;
+  name: string;
+  /** Its server, with /v1. */
+  upstream: string;
+  limit: { context: number; output: number };
+  /** featherloop's own model settings, e.g. variants. */
+  featherloop?: Record<string, unknown>;
+}
+
+export const MODELS: Record<string, Model> = Object.fromEntries(
+  Object.entries(JSON.parse(readFileSync(join(import.meta.dirname, 'models.json'), 'utf8')) as Record<string, Omit<Model, 'id'>>).map(
+    ([id, model]) => [id, { id, ...model }],
+  ),
+);
 
 export interface HarnessContext {
   /** The run's `HOME`, with every `XDG_*` directory under it. */
@@ -19,7 +38,7 @@ export interface HarnessContext {
   prompt: string;
   /** The run's prefix on the metering proxy, with `/v1`; also in the environment as `BENCH_BASE_URL`, for configs. */
   baseURL: string;
-  model: string;
+  model: Model;
 }
 
 export interface Invocation {
@@ -54,10 +73,15 @@ const featherloop: Harness = {
     const dirty = git(REPO, 'status', '--porcelain', '--', 'src', 'bin').trim() ? '-dirty' : '';
     return `${head}${dirty}`;
   },
-  setup: ({ xdg, prompt }) => {
-    copyConfig('featherloop', join(xdg.config, 'featherloop'));
-    // Its config's default model; `--` so no line of the prompt reads as a flag.
-    return { command: process.execPath, args: [join(REPO, 'bin', 'featherloop.ts'), '--shell', '--', prompt] };
+  setup: ({ xdg, prompt, model }) => {
+    const dir = join(xdg.config, 'featherloop');
+    copyConfig('featherloop', dir);
+    const file = join(dir, 'config.yaml');
+    const config = parseDocument(readFileSync(file, 'utf8'));
+    config.setIn(['provider', 'bench', 'models', model.id], { limit: { output: model.limit.output }, ...model.featherloop });
+    writeFileSync(file, config.toString());
+    // `--` so no line of the prompt reads as a flag.
+    return { command: process.execPath, args: [join(REPO, 'bin', 'featherloop.ts'), '--shell', '--model', `bench/${model.id}`, '--', prompt] };
   },
 };
 
@@ -65,10 +89,15 @@ const opencode = (name: string, description: string): Harness => ({
   name,
   description,
   prepare: () => isolated((env) => execFileSync(opencodeBin(), ['--version'], { encoding: 'utf8', env }).trim()),
-  setup: ({ xdg, prompt }) => {
-    copyConfig(name, join(xdg.config, 'opencode'));
+  setup: ({ xdg, prompt, model }) => {
+    const dir = join(xdg.config, 'opencode');
+    copyConfig(name, dir);
+    const file = join(dir, 'opencode.json');
+    const config = JSON.parse(readFileSync(file, 'utf8')) as { provider: { bench: { models: Record<string, unknown> } } };
+    config.provider.bench.models[model.id] = { name: model.name, limit: model.limit };
+    writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
     // --standalone: a private server, not the user's background service. --auto: no permission prompts.
-    return { command: opencodeBin(), args: ['run', '--standalone', '--auto', '--format', 'json', prompt] };
+    return { command: opencodeBin(), args: ['run', '--standalone', '--auto', '--format', 'json', '--model', `bench/${model.id}`, prompt] };
   },
 });
 
@@ -82,7 +111,7 @@ const nanocode: Harness = {
   setup: ({ model, prompt }) => ({
     command: 'python3',
     args: [join(CONFIGS, 'nanocode', 'driver.py')],
-    env: { NANOCODE: join(NANOCODE.dir, 'nanocode.py'), BENCH_MODEL: model, BENCH_PROMPT: prompt },
+    env: { NANOCODE: join(NANOCODE.dir, 'nanocode.py'), BENCH_MODEL: model.id, BENCH_PROMPT: prompt },
   }),
 };
 

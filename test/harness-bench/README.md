@@ -7,6 +7,7 @@ the same way: from the wire.
 npm run bench -- -j 4                       # every harness on every case, 4 runs at a time
 npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each
 npm run bench -- -H featherloop python/wordy
+npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --list                     # harnesses and cases
 npm run validate-cases                      # prove the grading, no model needed
 node test/harness-bench/report.ts test/harness-bench/results/<run>   # re-summarize
@@ -28,10 +29,24 @@ Results land in `results/<timestamp>/`: `summary.md` and `summary.json`, `result
 | `nanocode` | [1rgs/nanocode](https://github.com/1rgs/nanocode) at `b009d3d`, unmodified | `harnesses/nanocode/driver.py` |
 
 The configs are copies of the user's (`~/.config/featherloop`, `~/.config/opencode`),
-pointed at the bench, with only the model under test. Both opencode configs turn off
-the title agent, which would otherwise take a server slot per run, so the two differ
-only in `agents/`. `opencode-custom` leaves out websearch (it needs a key; the cases
-are offline). featherloop runs without its advisor.
+pointed at the bench. Both opencode configs turn off the title agent, which would
+otherwise take a server slot per run, so the two differ only in `agents/` (verbatim
+copies: `build.md` replaces the default agent's prompt and turns off skill, task,
+todowrite and question). `opencode-custom` leaves out websearch (it needs a key; the
+cases are offline). featherloop runs without its advisor.
+
+## Models
+
+`models.json` holds the models under test, each as the user's configs have it: its
+server, display name, context and output limits, and featherloop's own settings
+(variants). For each run the bench adds the chosen model (`-m`, default `qwen3.5-9b`)
+to the copied configs and passes it to every harness, so all four run the same model
+with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server.
+
+Benches on different models can run at once, from separate checkouts (e.g. a git
+worktree): each has its own proxy, temporary homes and results. Don't edit the checkout
+a bench runs from: featherloop runs from its source, and configs are copied per run.
+Two benches on one server share its slots.
 
 nanocode is an interactive REPL against a hard-coded Anthropic endpoint. The driver
 imports it as it is and patches its endpoint (llama.cpp serves the Messages API too),
@@ -108,6 +123,13 @@ prefix on it. It parses both API dialects, streamed or not, as they pass.
   before the timeout at `-j 4`, so compare harnesses only from runs at the same `-j`.
 - nanocode catches every error and exits 0, so it never shows as crashed: its API
   failures show as failed runs.
+- The output limit decides how a reasoning loop ends. featherloop and opencode allow
+  262k output tokens (the user's configs), so a model that keeps reconsidering can
+  generate until the timeout; nanocode stops at 8192. A request cut off by the timeout
+  never reports its tokens: the report counts its streamed chunks instead, as a lower
+  bound (llama.cpp sends some tokens together), outside the token totals.
+- Match `-j` to the server's slots: with one slot, requests queue and parallel runs only
+  wait on each other, eating into their timeouts.
 - Some exercises can be answered from memory (zebra-puzzle's tests check two names);
   they're kept, as every harness gets the same chance at them.
 - A 9B model varies a lot from run to run; use `-r 3` or more before reading much into

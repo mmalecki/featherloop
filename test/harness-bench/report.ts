@@ -187,8 +187,8 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
   const lines = [
     '# Harness bench',
     '',
-    `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slots.`,
-    `${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
+    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
     `Versions: ${Object.entries(meta.harnesses ?? {})
       .map(([name, info]) => `${name} ${(info as { version: string }).version}`)
       .join(', ')}.`,

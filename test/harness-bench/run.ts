@@ -5,7 +5,7 @@ import { delimiter, join } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
-import { HARNESSES, type Harness, type HarnessContext } from './harnesses.ts';
+import { HARNESSES, MODELS, type Harness, type HarnessContext } from './harnesses.ts';
 import { MeteringProxy } from './proxy.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
@@ -22,12 +22,11 @@ const argv = await yargs(hideBin(process.argv))
   .option('jobs', { alias: 'j', type: 'number', default: 1, describe: 'Runs at once; the server has its own slot count, beyond which requests queue' })
   .option('reps', { alias: 'r', type: 'number', default: 1, describe: 'Runs of each harness on each case' })
   .option('timeout', { type: 'number', default: 20, describe: 'Minutes a run may take before its harness is killed' })
+  .option('model', { alias: 'm', type: 'string', choices: Object.keys(MODELS), default: 'qwen3.5-9b', describe: 'Model under test, from models.json' })
   .option('base-url', {
     type: 'string',
-    default: process.env.BENCH_UPSTREAM ?? 'http://34.61.203.44:9931/v1',
-    describe: 'The model server, with /v1 (env BENCH_UPSTREAM)',
+    describe: "The model server, with /v1 (env BENCH_UPSTREAM; default: the model's upstream in models.json)",
   })
-  .option('model', { type: 'string', default: 'qwen3.5-9b', describe: 'Model name sent where a harness has no config of its own (nanocode)' })
   .option('out', { type: 'string', describe: 'Results directory (default: results/<timestamp>)' })
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
@@ -36,6 +35,8 @@ const argv = await yargs(hideBin(process.argv))
   .parseAsync();
 
 const cases = loadCases(argv._.map(String), argv.set);
+const model = MODELS[argv.model]!;
+const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? model.upstream;
 const harnesses = HARNESSES.filter((harness) => !argv.harness?.length || argv.harness.includes(harness.name));
 if (argv.list) {
   for (const harness of harnesses) console.log(`${harness.name}: ${harness.description}`);
@@ -49,13 +50,14 @@ const out = argv.out ?? join(import.meta.dirname, 'results', new Date().toISOStr
 mkdirSync(join(out, 'prompts'), { recursive: true });
 for (const c of cases) writeFileSync(join(out, 'prompts', `${caseName(c)}.md`), `${c.prompt}\n`);
 
-const server = await serverInfo(argv.baseUrl);
+const server = await serverInfo(upstream);
 writeFileSync(
   join(out, 'meta.json'),
   `${JSON.stringify(
     {
       started: new Date().toISOString(),
-      upstream: argv.baseUrl,
+      model: model.id,
+      upstream,
       server,
       harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description }])),
       cases: cases.map((c) => c.id),
@@ -69,7 +71,7 @@ writeFileSync(
   )}\n`,
 );
 
-const proxy = await MeteringProxy.start(argv.baseUrl);
+const proxy = await MeteringProxy.start(upstream);
 
 interface Job {
   harness: Harness;
@@ -121,7 +123,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   prepareWorkspace(c, workspace, toolchains.tools);
 
   const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'));
-  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model: argv.model };
+  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model };
   const invocation = harness.setup(ctx);
   const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
   const started = new Date();
