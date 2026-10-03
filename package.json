@@ -27,11 +27,10 @@
   "scripts": {
     "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
-    "mvp": "node examples/mvp.ts",
-    "web": "node --env-file-if-exists=.env examples/web.ts",
+    "example:simple": "node --env-file-if-exists=.env examples/simple.ts",
+    "example:web": "node --env-file-if-exists=.env examples/web.ts",
     "chat": "node --env-file-if-exists=.env bin/featherloop.ts",
     "test": "node --test \"test/**/*.test.ts\"",
-    "claude": "node --env-file-if-exists=.env examples/claude.ts",
     "prepack": "npm run build",
     "validate-cases": "node test/harness-bench/validate.ts",
     "bench": "node --use-env-proxy --env-file-if-exists=.env test/harness-bench/run.ts"
