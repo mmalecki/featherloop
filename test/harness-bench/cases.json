@@ -1,0 +1,45 @@
+{
+  "source": {
+    "repo": "https://github.com/Aider-AI/polyglot-benchmark",
+    "commit": "7e0611e77b54e2dea774cdc0aa00cf9f7ed6144f"
+  },
+  "selection": [
+    "Aider Polyglot's 225 exercises are the hardest of Exercism's tracks, picked because most models failed them; a 9B model would fail nearly all, which compares nothing.",
+    "Languages: Python and JavaScript, the toolchains the bench needs no extra setup for (go, rust, java and cmake for C++ aren't assumed).",
+    "Ranked by the reference solution's non-blank lines; taken from the smaller end (Python up to 41, JavaScript up to 75).",
+    "Left out despite their size: search and constraint puzzles (book-store, dominoes, zebra-puzzle, two-bucket, alphametics, connect, killer-sudoku-helper), padding-rule traps (transpose), long lyric generation (beer-song) and async/concurrency exercises (promises, parallel-letter-frequency).",
+    "`npm run validate-cases` checks every case: the stub fails its tests and the reference solution passes them all."
+  ],
+  "cases": [
+    "python/proverb",
+    "python/pig-latin",
+    "python/list-ops",
+    "python/variable-length-quantity",
+    "python/grade-school",
+    "python/bottle-song",
+    "python/robot-name",
+    "python/affine-cipher",
+    "python/tree-building",
+    "python/grep",
+    "python/wordy",
+    "python/phone-number",
+    "python/hangman",
+    "python/food-chain",
+    "python/simple-linked-list",
+    "javascript/sum-of-multiples",
+    "javascript/binary",
+    "javascript/pig-latin",
+    "javascript/space-age",
+    "javascript/grade-school",
+    "javascript/triangle",
+    "javascript/phone-number",
+    "javascript/bottle-song",
+    "javascript/wordy",
+    "javascript/complex-numbers",
+    "javascript/simple-linked-list",
+    "javascript/twelve-days",
+    "javascript/queen-attack",
+    "javascript/resistor-color-trio",
+    "javascript/say"
+  ]
+}
