@@ -2,3 +2,4 @@ node_modules/
 dist/
 .env
 test/harness-bench/results/
+test/harness-bench/cache/
