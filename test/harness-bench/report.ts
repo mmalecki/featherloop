@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 
 /**
@@ -106,7 +106,9 @@ export interface HarnessSummary {
 }
 
 export function summarize(dir: string): string {
-  const results = readFileSync(join(dir, 'results.jsonl'), 'utf8')
+  const file = join(dir, 'results.jsonl');
+  if (!existsSync(file)) return `No runs finished in ${dir}\n`;
+  const results = readFileSync(file, 'utf8')
     .split('\n')
     .filter(Boolean)
     .map((line) => JSON.parse(line) as RunResult);
@@ -244,7 +246,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     '',
     '## By case',
     '',
-    'Passes out of reps; tests passed in brackets for runs that failed.',
+    'Passes out of reps; tests passed in brackets for runs that failed. ⏱ timed out, 💥 crashed (graded all the same).',
     '',
     `| case | ${columns.join(' | ')} |`,
     `|---|${columns.map(() => ':---:').join('|')}|`,
@@ -253,8 +255,11 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
         const runs = results.filter((result) => result.case === id && result.harness === harness);
         if (!runs.length) return '–';
         const passes = runs.filter((run) => run.pass).length;
-        const partial = runs.filter((run) => !run.pass).map((run) => `${run.tests.passed}/${run.tests.total}${run.status === 'timeout' ? '⏱' : run.status === 'crash' ? '💥' : ''}`);
-        return `${passes === runs.length ? '✓' : passes ? `${passes}/${runs.length}` : '✗'}${partial.length ? ` (${partial.join(', ')})` : ''}`;
+        const mark = (run: RunResult) => (run.status === 'timeout' ? '⏱' : run.status === 'crash' ? '💥' : '');
+        const partial = runs.filter((run) => !run.pass).map((run) => `${run.tests.passed}/${run.tests.total}${mark(run)}`);
+        // A pass that never stopped on its own still shows.
+        const passed = runs.filter((run) => run.pass).map(mark).join('');
+        return `${passes === runs.length ? '✓' : passes ? `${passes}/${runs.length}` : '✗'}${passed}${partial.length ? ` (${partial.join(', ')})` : ''}`;
       });
       return `| ${id} | ${cells.join(' | ')} |`;
     }),

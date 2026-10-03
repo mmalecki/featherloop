@@ -102,6 +102,14 @@ prefix on it. It parses both API dialects, streamed or not, as they pass.
 - Wall clock depends on load. Jobs are ordered case by case, harness by harness, so at
   `-j` equal to the harness count (4) each case's runs share the server at once. Above
   the server's slot count, requests queue, and that counts as model time.
+- The timeout and `-j` are coupled: busy slots share the GPU, so generation per run slows
+  (about 60 tokens/s alone, 23 with all 4 slots busy, in testing). A 20-minute timeout at
+  `-j 4` buys about as much generation as 8 minutes alone, and pass rates on harder cases
+  move with it. Compare harnesses only from runs at the same `-j`.
+- nanocode catches every error and exits 0, so it never shows as crashed: its API
+  failures show as failed runs.
+- Some exercises can be answered from memory (zebra-puzzle's tests check two names);
+  they're kept, as every harness gets the same chance at them.
 - A 9B model varies a lot from run to run; use `-r 3` or more before reading much into
   a few points' difference.
 - Partial credit counts tests in the source; a suite that fails to load scores 0.
