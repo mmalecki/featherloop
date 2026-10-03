@@ -59,13 +59,17 @@ export class OpenAIProvider implements Provider {
       if (chunk.usage) on.usage?.(toUsage(chunk.usage));
       const choice = chunk.choices[0];
       if (choice?.finish_reason) finish = choice.finish_reason;
-      // `reasoning_content` is llama.cpp's (and vLLM's/DeepSeek's) extension.
-      const delta = choice?.delta as (ChatCompletionChunk.Choice.Delta & { reasoning_content?: string | null }) | undefined;
+      // Reasoning is an extension: `reasoning_content` from llama.cpp and DeepSeek,
+      // `reasoning` from vLLM.
+      const delta = choice?.delta as
+        | (ChatCompletionChunk.Choice.Delta & { reasoning_content?: string | null; reasoning?: string | null })
+        | undefined;
       if (!delta) continue;
 
-      if (delta.reasoning_content) {
-        reasoning += delta.reasoning_content;
-        on.reasoning(delta.reasoning_content);
+      const thought = delta.reasoning_content || delta.reasoning;
+      if (thought) {
+        reasoning += thought;
+        on.reasoning(thought);
       }
       if (delta.content) {
         content += delta.content;

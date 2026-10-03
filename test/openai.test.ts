@@ -60,3 +60,22 @@ test('without index, a piece with no id continues the last call', async () => {
     { id: 'b', name: 'glob', args: '{}' },
   ]);
 });
+
+test('reads reasoning as llama.cpp sends it (reasoning_content) and as vLLM does (reasoning)', async () => {
+  for (const key of ['reasoning_content', 'reasoning']) {
+    const create = async () =>
+      (async function* () {
+        yield { choices: [{ delta: { [key]: 'hm, ' } }] };
+        yield { choices: [{ delta: { [key]: 'yes' } }] };
+        yield { choices: [{ finish_reason: 'stop', delta: { content: 'ok' } }] };
+      })();
+    const client = { chat: { completions: { create } } } as unknown as OpenAI;
+    let streamed = '';
+    const message = await new OpenAIProvider(client).turn(
+      { model: 'm', messages: [{ role: 'user', content: 'hi' }], tools: [] },
+      { content() {}, reasoning: (delta) => (streamed += delta) },
+    );
+    assert.equal(streamed, 'hm, yes', key);
+    assert.equal(message.reasoning_content, 'hm, yes', key);
+  }
+});
