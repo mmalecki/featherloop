@@ -3,6 +3,7 @@ import { styleText } from 'node:util';
 import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
 import type { ModelResolver, ResolvedModel } from './models.ts';
 import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
+import type { Session } from './session.ts';
 
 type Style = Parameters<typeof styleText>[0];
 
@@ -25,6 +26,12 @@ export interface SimpleUIOptions {
   resolveModel?: ModelResolver;
   /** System prompt prepended to the conversation. */
   system?: string;
+  /**
+   * Saves the conversation as it goes. A session with messages is resumed: the
+   * conversation continues from them, system prompt included. `/c` starts a new
+   * session beside it.
+   */
+  session?: Session;
   /** Shown in the header. */
   title?: string;
   /** Stream the model's reasoning, dimmed. On by default. */
@@ -54,6 +61,7 @@ export class SimpleUI {
   #out: NodeJS.WriteStream;
   #rl: Interface | undefined;
   #history: Message[] = [];
+  #session: Session | undefined;
   #abort: AbortController | undefined;
   /** Block currently being streamed. */
   #block: 'text' | 'reasoning' | undefined;
@@ -74,11 +82,17 @@ export class SimpleUI {
     this.#model = typeof options.model === 'string' ? { ref: options.model, model: options.model } : options.model;
     if (typeof agent === 'function') this.#factory = agent;
     this.#loop = this.#attach(typeof agent === 'function' ? agent() : agent);
+    this.#session = options.session;
     this.#reset();
   }
 
   get loop(): AgentLoop {
     return this.#loop;
+  }
+
+  /** Where the conversation is saved; a new one after `/c`. */
+  get session(): Session | undefined {
+    return this.#session;
   }
 
   /** The model id runs use. */
@@ -98,7 +112,11 @@ export class SimpleUI {
   /** Queues a switch, or with no reference just waits for earlier ones; resolves to the model's label after it. */
   #switch(ref: string | undefined, variant?: string): Promise<string> {
     const switched = this.#switching.then(async () => {
-      if (ref !== undefined) this.#model = await this.#resolve(ref, variant);
+      if (ref !== undefined) {
+        this.#model = await this.#resolve(ref, variant);
+        // As asked for, not as resolved: resuming resolves it again.
+        this.#session?.setModel(variant === undefined ? { ref } : { ref, variant });
+      }
       return this.#modelLabel();
     });
     this.#switching = switched.catch(() => {});
@@ -124,9 +142,16 @@ export class SimpleUI {
     const { title = 'featherloop' } = this.options;
     this.#print(`${this.#style('bold', title)} | ${this.#style('dim', `${this.#modelLabel()} | ${process.cwd()}`)}`);
     this.#print(`${this.#style('dim', HELP)}\n`);
+    // Shown up front: a run that dies takes the exit message with it.
+    const session = this.#session;
+    const resumed = session ? said(session.messages) : 0;
+    if (resumed) {
+      this.#print(`${this.#style('green', '⏺ Resumed session')} ${session!.id} ${this.#style('dim', `(${resumed} messages)`)}`);
+      this.#showLastTurn(session!.messages);
+    } else if (session) this.#print(`${this.#style('dim', `Session ${session.id}`)}\n`);
 
     const rl = (this.#rl = createInterface({ input: this.options.input ?? process.stdin, output: this.#out }));
-    rl.setPrompt(`${this.#style(['bold', 'blue'], '❯')} `);
+    rl.setPrompt(`${this.#promptMark()} `);
 
     return new Promise((resolve) => {
       rl.on('close', () => {
@@ -165,6 +190,24 @@ export class SimpleUI {
   }
 
   /**
+   * The last user message and the reply to it, laid out as when they were typed
+   * and streamed. Only the reply's text: no reasoning, tool calls or results.
+   */
+  #showLastTurn(messages: readonly Message[]): void {
+    const last = messages.findLastIndex((message) => message.role === 'user');
+    if (last === -1) return this.#print('');
+    const reply = messages.slice(last + 1).findLast((message) => message.role === 'assistant' && text(message.content).trim());
+    this.#print(this.#separator());
+    this.#print(`${this.#promptMark()} ${text(messages[last]!.content).trim().replaceAll('\n', '\n  ')}`);
+    this.#print(this.#separator());
+    if (reply) {
+      this.#content(text(reply.content));
+      this.#endBlock();
+    }
+    this.#print('');
+  }
+
+  /**
    * Sends one prompt and renders the run, without the REPL. Resolves when the
    * run ends; failures are rendered, not thrown.
    */
@@ -172,12 +215,16 @@ export class SimpleUI {
     if (this.#abort) throw new Error('SimpleUI is already running');
     const abort = (this.#abort = new AbortController());
     this.#runUsage = emptyUsage();
+    const input: Message[] = [...this.#history, { role: 'user', content: prompt }];
     try {
+      // The session holds a prefix of the history: save the rest (the system prompt
+      // on the first run, and the prompt); the run's own messages follow as they come.
+      this.#session?.append(...input.slice(this.#session.messages.length));
       await this.#switching;
       const { messages } = await this.#loop.run({
         model: this.model,
         ...(this.#model.api ? { api: this.#model.api } : {}),
-        input: [...this.#history, { role: 'user', content: prompt }],
+        input,
         signal: abort.signal,
         ...(this.options.request ? { request: this.options.request } : {}),
       });
@@ -189,6 +236,8 @@ export class SimpleUI {
           ? this.#style('yellow', '⏺ Interrupted')
           : this.#style('red', `⏺ Error: ${err instanceof Error ? err.message : String(err)}`),
       );
+      // The run is discarded, prompt included; so is what was saved of it.
+      this.#session?.truncate(this.#history.length);
     } finally {
       this.#endBlock();
       this.#abort = undefined;
@@ -206,8 +255,11 @@ export class SimpleUI {
           this.#detach(this.#loop);
           this.#loop = this.#attach(this.#factory());
         }
+        const previous = this.#session;
+        this.#session = previous?.fresh();
         this.#reset();
         this.#print(this.#style('green', '⏺ Cleared conversation'));
+        if (previous && said(previous.messages)) this.#print(this.#style('dim', `  ↳ session ${previous.id} saved; now ${this.#session!.id}`));
         break;
       case '/model':
         // Resolving may take a moment (e.g. loading an SDK); lines typed meanwhile come after.
@@ -236,7 +288,10 @@ export class SimpleUI {
     this.#sessionUsage = addUsage(this.#sessionUsage, usage);
   };
   #onMessage = (message: Message) => {
-    if (message.role === 'user' && this.#abort) this.#print(this.#style('dim', `  ↳ sent: ${preview(text(message.content), 60)}`));
+    // Only this UI's runs: they're what the history holds.
+    if (!this.#abort) return;
+    this.#session?.append(message);
+    if (message.role === 'user') this.#print(this.#style('dim', `  ↳ sent: ${preview(text(message.content), 60)}`));
   };
 
   #attach(loop: AgentLoop): AgentLoop {
@@ -373,7 +428,13 @@ export class SimpleUI {
   }
 
   #reset(): void {
-    this.#history = this.options.system ? [{ role: 'system', content: this.options.system }] : [];
+    const saved = this.#session?.messages;
+    if (saved?.length) this.#history = [...saved];
+    else this.#history = this.options.system ? [{ role: 'system', content: this.options.system }] : [];
+  }
+
+  #promptMark(): string {
+    return this.#style(['bold', 'blue'], '❯');
   }
 
   #prompt(): void {
@@ -446,6 +507,11 @@ function preview(value: string, max: number): string {
 
 function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+/** Messages past the system prompt. */
+function said(messages: readonly Message[]): number {
+  return messages.filter((message) => message.role !== 'system').length;
 }
 
 function text(content: Message['content']): string {

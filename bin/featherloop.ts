@@ -17,12 +17,15 @@ import {
   ManagedFileTools,
   ModelRegistry,
   ParallelWebSearchTool,
+  Session,
+  SessionError,
   ShellTool,
   SimpleUI,
   SubagentTool,
   WebFetchTool,
   type Config,
   type ResolvedModel,
+  sessionsDir,
   type Toolset,
 } from '../src/index.ts';
 
@@ -51,10 +54,17 @@ const argv = await yargs(hideBin(process.argv))
     describe: "Add an advisor subagent for second opinions, on the config's advisor alias",
   })
   .option('advisor-model', { type: 'string', describe: 'Model for the advisor instead of the alias; implies --advisor' })
+  .option('resume', {
+    alias: 'r',
+    type: 'string',
+    describe: "Continue a saved session by its id, on its last model unless --model or --variant is given",
+  })
   .epilogue(
     'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set;\n' +
       'shell with --shell; subagent with --subagent or --advisor.\n' +
-      'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.',
+      'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.\n' +
+      `Sessions are saved in ${sessionsDir()}. Flags aren't: a session on a bare model id\n` +
+      'needs its --flavor and --base-url again to resume.',
   )
   .version(version())
   .alias('h', 'help')
@@ -64,13 +74,20 @@ const argv = await yargs(hideBin(process.argv))
 
 const { shell, subagent } = argv;
 const advisor = argv.advisor || argv.advisorModel !== undefined;
-const registry = await exitOnConfigError(() => new ModelRegistry(loadConfig(argv.config)));
-const initial = await exitOnConfigError(() =>
-  resolveModel(argv.model ?? process.env.MODEL ?? registry.default ?? onlyModel(), argv.variant),
-);
+const registry = await exitOnUserError(() => new ModelRegistry(loadConfig(argv.config)));
+const resumed = argv.resume === undefined ? undefined : await exitOnUserError(() => Session.open(argv.resume!));
+// A resumed session stays on its model and variant, unless the flags pick them.
+const ref = await exitOnUserError(() => argv.model ?? resumed?.model?.ref ?? process.env.MODEL ?? registry.default ?? onlyModel());
+const variant = argv.model === undefined && argv.variant === undefined ? resumed?.model?.variant : argv.variant;
+const initial = await exitOnUserError(() => resolveModel(ref, variant));
+const model = variant === undefined ? { ref } : { ref, variant };
+const session = resumed ?? Session.create({ model });
+// Flags switched a resumed session's model: the next resume should stay on it.
+if (resumed && (argv.model !== undefined || argv.variant !== undefined)) resumed.setModel(model);
+if (session.cwd !== process.cwd()) console.error(`Note: the session started in ${session.cwd}; tools now run in ${process.cwd()}`);
 if (advisor) {
   // Set it up now, so a missing alias or SDK shows before the session, not on the first call.
-  await exitOnConfigError(() => {
+  await exitOnUserError(() => {
     if (argv.advisorModel === undefined && !registry.knows(advisorAgent.model!)) {
       throw new ConfigError(`--advisor needs an alias "${advisorAgent.model}" in ${argv.config}, or --advisor-model`);
     }
@@ -110,12 +127,15 @@ const createLoop = () => {
 const ui = new SimpleUI(createLoop, {
   model: initial,
   resolveModel,
+  session,
   system: generalAgent.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model: initial.model }),
 });
 
 const prompt = argv._.join(' ');
 if (prompt) await ui.ask(prompt);
 else await ui.start();
+// After /c, the UI's session is a newer one. One with only a system prompt (its first run failed) isn't worth it.
+if (ui.session?.messages.some((message) => message.role !== 'system')) console.error(`Resume with: featherloop --resume ${ui.session.id}`);
 
 /**
  * A model or alias from the config, or a bare model id run where --flavor and
@@ -142,12 +162,12 @@ function onlyModel(): string {
   );
 }
 
-/** Config errors are the user's to fix: their message is enough. */
-async function exitOnConfigError<T>(fn: () => T | Promise<T>): Promise<T> {
+/** Config and session errors are the user's to fix: their message is enough. */
+async function exitOnUserError<T>(fn: () => T | Promise<T>): Promise<T> {
   try {
     return await fn();
   } catch (err) {
-    if (!(err instanceof ConfigError)) throw err;
+    if (!(err instanceof ConfigError || err instanceof SessionError)) throw err;
     console.error(err.message);
     process.exit(1);
   }
