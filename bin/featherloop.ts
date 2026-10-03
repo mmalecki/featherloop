@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
+import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
@@ -8,9 +9,12 @@ import {
   advisorAgent,
   ConfigError,
   configPath,
+  findInstructions,
   FLAVORS,
+  formatInstructions,
   generalAgent,
   GlobTool,
+  instructionsDir,
   GrepTool,
   loadConfig,
   Loop,
@@ -54,6 +58,11 @@ const argv = await yargs(hideBin(process.argv))
     describe: "Add an advisor subagent for second opinions, on the config's advisor alias",
   })
   .option('advisor-model', { type: 'string', describe: 'Model for the advisor instead of the alias; implies --advisor' })
+  .option('instructions', {
+    type: 'boolean',
+    default: true,
+    describe: `Load AGENTS.md, or else CLAUDE.md, from ${instructionsDir()} and each directory from the git root down to the cwd (--no-instructions to skip)`,
+  })
   .option('resume', {
     alias: 'r',
     type: 'string',
@@ -119,16 +128,25 @@ const createLoop = () => {
   const available = availableTools();
   // Subagents get the same tools, but never this one (SubagentTool leaves it out).
   const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
-  if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools });
+  if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools, instructions });
   // The UI passes each run the current model's provider; this one is only the default.
   return Loop(initial.api, generalAgent.toolset(available), { models: resolveModel });
 };
+
+// Read again for each new conversation and subagent task, so edits apply from then on.
+const instructions = (cwd: string) => (argv.instructions ? formatInstructions(findInstructions({ cwd })) : '');
+const loaded = argv.instructions && !resumed ? findInstructions().map(({ path }) => shortPath(path)) : [];
 
 const ui = new SimpleUI(createLoop, {
   model: initial,
   resolveModel,
   session,
-  system: generalAgent.system({ cwd: process.cwd(), date: new Date().toISOString().slice(0, 10), model: initial.model }),
+  // A resumed session keeps the system prompt it was saved with; `/c` builds a new one.
+  system: () => {
+    const cwd = process.cwd();
+    return generalAgent.system({ cwd, date: new Date().toISOString().slice(0, 10), model: initial.model, instructions: instructions(cwd) });
+  },
+  ...(loaded.length ? { notes: [`instructions: ${loaded.join(', ')}`] } : {}),
 });
 
 const prompt = argv._.join(' ');
@@ -160,6 +178,13 @@ function onlyModel(): string {
       ? `Pick a model with --model, or set model in ${argv.config}. Configured: ${models.join(', ')}`
       : `No model: pass --model, or configure one in ${argv.config}`,
   );
+}
+
+/** Relative for the cwd's and its parents' files (e.g. `../AGENTS.md`), else from the home directory. */
+function shortPath(path: string): string {
+  const rel = relative(process.cwd(), path);
+  if (rel.split(sep).slice(0, -1).every((part) => part === '..')) return rel;
+  return path.startsWith(`${homedir()}${sep}`) ? `~${path.slice(homedir().length)}` : path;
 }
 
 /** Config and session errors are the user's to fix: their message is enough. */

@@ -24,8 +24,11 @@ export interface SimpleUIOptions {
    * session can switch providers too. Without it, `/model` only changes the id.
    */
   resolveModel?: ModelResolver;
-  /** System prompt prepended to the conversation. */
-  system?: string;
+  /**
+   * System prompt prepended to the conversation; a function is called again for
+   * each new conversation (`/c`), e.g. to pick up edited instructions.
+   */
+  system?: string | (() => string);
   /**
    * Saves the conversation as it goes. A session with messages is resumed: the
    * conversation continues from them, system prompt included. `/c` starts a new
@@ -34,6 +37,8 @@ export interface SimpleUIOptions {
   session?: Session;
   /** Shown in the header. */
   title?: string;
+  /** More lines for the header, dimmed, e.g. which instruction files were loaded. */
+  notes?: string[];
   /** Stream the model's reasoning, dimmed. On by default. */
   showReasoning?: boolean;
   /** Print token usage after each run. On by default. */
@@ -141,6 +146,7 @@ export class SimpleUI {
   start(): Promise<void> {
     const { title = 'featherloop' } = this.options;
     this.#print(`${this.#style('bold', title)} | ${this.#style('dim', `${this.#modelLabel()} | ${process.cwd()}`)}`);
+    for (const note of this.options.notes ?? []) this.#print(this.#style('dim', note));
     this.#print(`${this.#style('dim', HELP)}\n`);
     // Shown up front: a run that dies takes the exit message with it.
     const session = this.#session;
@@ -430,7 +436,11 @@ export class SimpleUI {
   #reset(): void {
     const saved = this.#session?.messages;
     if (saved?.length) this.#history = [...saved];
-    else this.#history = this.options.system ? [{ role: 'system', content: this.options.system }] : [];
+    else {
+      const { system } = this.options;
+      const content = typeof system === 'function' ? system() : system;
+      this.#history = content ? [{ role: 'system', content }] : [];
+    }
   }
 
   #promptMark(): string {

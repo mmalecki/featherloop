@@ -26,6 +26,11 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
   tools: () => Toolset;
   /** Default rules for every subagent, e.g. the caller's own; each agent's rules override them. */
   permissions?: PermissionRule[];
+  /**
+   * Instructions (AGENTS.md) for the agents' system prompts, or a function of the
+   * directory they work in, called for each task.
+   */
+  instructions?: string | ((cwd: string) => string);
   loop?: LoopOptions;
 }
 
@@ -38,7 +43,7 @@ const TRANSCRIPT_RESULT_CHARS = 2_000;
  * others run on the caller's model. Calls in the same turn run in parallel. The
  * subagent's token use counts as this tool's.
  */
-export function SubagentTool({ agents, tools, permissions = [], loop: loopOptions, ...options }: SubagentToolOptions): Tool {
+export function SubagentTool({ agents, tools, permissions = [], instructions, loop: loopOptions, ...options }: SubagentToolOptions): Tool {
   const byName = new Map(agents.map((agent) => [agent.name, agent]));
   if (!byName.size) throw new Error('SubagentTool needs at least one agent');
   if (byName.size !== agents.length) throw new Error('SubagentTool: agent names must be unique');
@@ -96,7 +101,13 @@ export function SubagentTool({ agents, tools, permissions = [], loop: loopOption
         runner = await models(agent.model);
       }
 
-      const system = agent.system({ cwd: cwd ?? process.cwd(), date: new Date().toISOString().slice(0, 10), model: runner.model });
+      const dir = cwd ?? process.cwd();
+      const system = agent.system({
+        cwd: dir,
+        date: new Date().toISOString().slice(0, 10),
+        model: runner.model,
+        ...(instructions === undefined ? {} : { instructions: typeof instructions === 'function' ? instructions(dir) : instructions }),
+      });
       // Subagents can't nest: they're never offered this tool.
       const { subagent: _, ...available } = tools();
       const toolset = agent.toolset(available, permissions);

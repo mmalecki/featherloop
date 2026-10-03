@@ -6,6 +6,8 @@ export interface AgentSpec {
   description?: string;
   /** The system prompt, or a function of where and when it runs. */
   system: string | ((ctx: AgentContext) => string);
+  /** Whether the context's instructions (AGENTS.md) follow the system prompt. On by default. */
+  instructions?: boolean;
   /**
    * Ordered; the last matching rule wins. They come after the caller's defaults
    * (see `toolset()`), so they override them. Tools no rule matches are allowed.
@@ -23,6 +25,8 @@ export interface AgentContext {
   /** Today, as YYYY-MM-DD. */
   date: string;
   model: string;
+  /** From the user and the project (e.g. `formatInstructions()`), for `system()` to append. */
+  instructions?: string;
 }
 
 /**
@@ -54,6 +58,7 @@ export class Agent {
   readonly description: string | undefined;
   readonly model: string | undefined;
   readonly permissions: readonly PermissionRule[];
+  readonly instructions: boolean;
   readonly #system: AgentSpec['system'];
 
   constructor(spec: AgentSpec) {
@@ -69,12 +74,14 @@ export class Agent {
     this.description = spec.description;
     this.model = spec.model;
     this.permissions = [...(spec.permissions ?? [])];
+    this.instructions = spec.instructions ?? true;
     this.#system = spec.system;
   }
 
-  /** The system prompt. */
+  /** The system prompt, followed by the context's instructions unless the agent opts out. */
   system(ctx: AgentContext): string {
-    return typeof this.#system === 'function' ? this.#system(ctx) : this.#system;
+    const system = typeof this.#system === 'function' ? this.#system(ctx) : this.#system;
+    return this.instructions && ctx.instructions ? `${system}\n\n${ctx.instructions}` : system;
   }
 
   /**

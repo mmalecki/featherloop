@@ -17,6 +17,7 @@ export * from './tools/webfetch.ts';
 export * from './tools/parallel-search.ts';
 export * from './simple-ui.ts';
 export * from './session.ts';
+export * from './instructions.ts';
 export * from './provider.ts';
 export * from './providers/index.ts';
 export * from './config.ts';
