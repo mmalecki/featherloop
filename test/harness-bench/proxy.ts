@@ -47,6 +47,8 @@ export interface RequestRecord {
   serverMs?: { prompt: number; predicted: number };
   /** Names of the tools the model called, in order. */
   toolCalls: string[];
+  /** Calls to tools the request didn't offer: hallucinated names. */
+  unknownTools: string[];
   finish: string | null;
   contentChars: number;
   reasoningChars: number;
@@ -151,8 +153,8 @@ export class MeteringProxy {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = Buffer.concat(chunks);
-    const record = describeRequest(++sink.seq, path, body);
-    const response = new ResponseParser(record);
+    const { record, offered } = describeRequest(++sink.seq, path, body);
+    const response = new ResponseParser(record, offered);
     const target = new URL(path, this.upstream);
 
     const headers: Record<string, string> = {};
@@ -217,12 +219,15 @@ export class MeteringProxy {
   }
 }
 
-function describeRequest(seq: number, path: string, body: Buffer): RequestRecord {
-  const json = tryParse(body) as Record<string, unknown> | undefined;
+function describeRequest(seq: number, path: string, body: Buffer): { record: RequestRecord; offered: Set<string> } {
+  const json = tryParse(body) as Record<string, any> | undefined;
   const dialect = path.startsWith('chat/completions') ? 'openai' : path.startsWith('messages') ? 'anthropic' : 'other';
   const params: Record<string, unknown> = {};
   for (const key of PARAMS) if (json && Object.hasOwn(json, key)) params[key] = json[key];
-  return {
+  const tools: Json[] = Array.isArray(json?.tools) ? json.tools : [];
+  // OpenAI nests the name under function; Anthropic doesn't.
+  const offered = new Set(tools.map((tool) => String(tool.function?.name ?? tool.name)));
+  const record: RequestRecord = {
     seq,
     start: Date.now(),
     ms: 0,
@@ -231,16 +236,18 @@ function describeRequest(seq: number, path: string, body: Buffer): RequestRecord
     status: 0,
     stream: json?.stream === true,
     messages: Array.isArray(json?.messages) ? json.messages.length : 0,
-    tools: Array.isArray(json?.tools) ? json.tools.length : 0,
+    tools: tools.length,
     requestBytes: body.length,
     params,
     tokens: null,
     toolCalls: [],
+    unknownTools: [],
     finish: null,
     contentChars: 0,
     reasoningChars: 0,
     unparsedToolCall: false,
   };
+  return { record, offered };
 }
 
 function tryParse(text: Buffer | string): unknown {
@@ -259,6 +266,7 @@ type Json = Record<string, any>;
  */
 class ResponseParser {
   #record: RequestRecord;
+  #offered: Set<string>;
   #raw: Buffer[] = [];
   #pending = '';
   #content = '';
@@ -267,8 +275,9 @@ class ResponseParser {
   #calls = new Map<number, { name: string; arguments: string }>();
   #message: unknown;
 
-  constructor(record: RequestRecord) {
+  constructor(record: RequestRecord, offered: Set<string>) {
     this.#record = record;
+    this.#offered = offered;
   }
 
   write(chunk: Buffer): void {
@@ -296,6 +305,7 @@ class ResponseParser {
     }
     const record = this.#record;
     record.toolCalls = [...this.#calls.values()].map((call) => call.name);
+    record.unknownTools = record.toolCalls.filter((name) => !this.#offered.has(name));
     record.contentChars = this.#content.length;
     record.reasoningChars = this.#reasoning.length;
     record.unparsedToolCall = TOOL_MARKUP.test(this.#content);
