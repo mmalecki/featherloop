@@ -29,8 +29,10 @@ export interface RunResult {
   apiErrors: number;
   /** Summed over requests: every request's whole prompt, cached or not; `uncached` is what the server processed. */
   tokens: { prompt: number; cached: number; uncached: number; completion: number };
-  /** Requests whose tokens weren't reported (e.g. aborted). */
+  /** Requests whose tokens weren't reported (e.g. cut off at the timeout). */
   uncounted: number;
+  /** At least this much output in those requests, from streamed chunks; not in `tokens`. */
+  uncountedOutput: number;
   /** The most context any one request filled: prompt plus completion. */
   peakContext: number;
   /** The first request's prompt: the harness's system prompt and tools, plus the task, which is the same for all. */
@@ -89,6 +91,8 @@ export interface HarnessSummary {
   requests: number;
   tokens: { prompt: number; uncached: number; completion: number; total: number };
   tokensPerPass: number | null;
+  /** Output of requests cut off before reporting their tokens, at least; per run, not in `tokens`. */
+  uncountedOutput: number;
   peakContext: { median: number; max: number };
   firstPrompt: number | null;
   toolCalls: number;
@@ -159,6 +163,8 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
       total: allTokens / runs.length,
     },
     tokensPerPass: passes ? allTokens / passes : null,
+    // Older results lack it.
+    uncountedOutput: mean((run) => run.uncountedOutput ?? 0),
     peakContext: { median: quantile(runs.map((run) => run.peakContext), 0.5), max: Math.max(...runs.map((run) => run.peakContext)) },
     firstPrompt: firstPrompts.length ? quantile(firstPrompts, 0.5) : null,
     toolCalls: mean((run) => run.toolCalls),
@@ -209,6 +215,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('↳ prompt (processed, not cached)', (s) => k(s.tokens.uncached)),
     row('↳ completion', (s) => k(s.tokens.completion)),
     row('Tokens / pass', (s) => (s.tokensPerPass === null ? '–' : k(s.tokensPerPass))),
+    row('Output cut off uncounted, at least', (s) => k(s.uncountedOutput)),
     row('First prompt (system + tools + task)', (s) => (s.firstPrompt === null ? '–' : k(s.firstPrompt))),
     row('Peak context, median (max)', (s) => `${k(s.peakContext.median)} (${k(s.peakContext.max)})`),
     row('Tool calls / run', (s) => s.toolCalls.toFixed(1)),

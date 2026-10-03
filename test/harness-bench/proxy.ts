@@ -41,6 +41,11 @@ export interface RequestRecord {
   /** Sampling and length fields the harness sent, e.g. `temperature`, `max_tokens`. */
   params: Record<string, unknown>;
   tokens: Tokens | null;
+  /**
+   * Streamed chunks carrying output: for a response cut off before it reported its
+   * tokens, a lower bound on what it generated (llama.cpp sends some tokens together).
+   */
+  chunks: number;
   /** Where `tokens` came from: the API's `usage`, or llama.cpp's `timings` when streams carry no usage. */
   tokenSource?: 'usage' | 'timings';
   /** Server-side model time, from llama.cpp's `timings`. */
@@ -240,6 +245,7 @@ function describeRequest(seq: number, path: string, body: Buffer): { record: Req
     requestBytes: body.length,
     params,
     tokens: null,
+    chunks: 0,
     toolCalls: [],
     unknownTools: [],
     finish: null,
@@ -336,6 +342,7 @@ class ResponseParser {
     if (!choice) return;
     if (choice.finish_reason) this.#record.finish = choice.finish_reason;
     const delta = choice.delta ?? {};
+    if (delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length) this.#record.chunks++;
     if (typeof delta.content === 'string') this.#content += delta.content;
     const reasoning = delta.reasoning_content ?? delta.reasoning;
     if (typeof reasoning === 'string') this.#reasoning += reasoning;
@@ -357,6 +364,7 @@ class ResponseParser {
         if (event.content_block?.type === 'tool_use') this.#calls.set(event.index, { name: event.content_block.name, arguments: '' });
         break;
       case 'content_block_delta': {
+        this.#record.chunks++;
         const delta = event.delta ?? {};
         if (delta.type === 'text_delta') this.#content += delta.text;
         else if (delta.type === 'thinking_delta') this.#reasoning += delta.thinking;

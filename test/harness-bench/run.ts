@@ -184,6 +184,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
       completion: sum((tokens) => tokens.completion),
     },
     uncounted: records.filter((record) => !record.tokens).length,
+    uncountedOutput: records.reduce((total, record) => total + (record.tokens ? 0 : record.chunks), 0),
     peakContext: Math.max(0, ...records.map((record) => (record.tokens ? record.tokens.prompt + record.tokens.completion : 0))),
     firstPrompt: records[0]?.tokens?.prompt ?? null,
     toolCalls: Object.values(tools).reduce((total, count) => total + count, 0),
