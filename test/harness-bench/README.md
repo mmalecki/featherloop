@@ -102,10 +102,10 @@ prefix on it. It parses both API dialects, streamed or not, as they pass.
 - Wall clock depends on load. Jobs are ordered case by case, harness by harness, so at
   `-j` equal to the harness count (4) each case's runs share the server at once. Above
   the server's slot count, requests queue, and that counts as model time.
-- The timeout and `-j` are coupled: busy slots share the GPU, so generation per run slows
-  (about 60 tokens/s alone, 23 with all 4 slots busy, in testing). A 20-minute timeout at
-  `-j 4` buys about as much generation as 8 minutes alone, and pass rates on harder cases
-  move with it. Compare harnesses only from runs at the same `-j`.
+- The timeout and `-j` are coupled: busy slots share the GPU, so each run generates more
+  slowly. Measured on short prompts: 59 tokens/s alone, 38 per stream with 4 at once
+  (141 in all, 2.7× the throughput); long contexts slow it further. A run gets less done
+  before the timeout at `-j 4`, so compare harnesses only from runs at the same `-j`.
 - nanocode catches every error and exits 0, so it never shows as crashed: its API
   failures show as failed runs.
 - Some exercises can be answered from memory (zebra-puzzle's tests check two names);
