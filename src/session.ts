@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
-import { appendFileSync, mkdirSync, readFileSync, truncateSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { appendFileSync, linkSync, mkdirSync, readFileSync, rmSync, truncateSync, writeFileSync } from 'node:fs';
+import { homedir, hostname } from 'node:os';
 import { join } from 'node:path';
 import type { Message, ToolMessage } from './provider.ts';
 
@@ -8,6 +8,11 @@ import type { Message, ToolMessage } from './provider.ts';
 export interface SessionModel {
   ref: string;
   variant?: string;
+}
+
+/** A `SessionModel`, without a `variant` key when there's none. */
+export function sessionModel(ref: string, variant?: string): SessionModel {
+  return variant === undefined ? { ref } : { ref, variant };
 }
 
 /**
@@ -22,7 +27,7 @@ export type SessionRecord = { time: string } & (
   | ({ type: 'model' } & SessionModel)
 );
 
-/** A session that can't be resumed: a bad id, a missing or unreadable file. */
+/** A session that can't be resumed: a bad id, a missing or unreadable file, or one open elsewhere. */
 export class SessionError extends Error {
   override name = 'SessionError';
 }
@@ -48,6 +53,9 @@ export interface SessionOptions {
  * transcripts can sit beside it). `messages` is always what replaying the file
  * gives. Nothing is written until the first message, so an unused session
  * leaves no trace. Writes are synchronous: whatever was appended survives a crash.
+ *
+ * One process at a time writes a session: it holds `<root>/<id>/lock` from its
+ * first write, or from `open()`, until `close()` or exit. `read()` only looks.
  */
 export class Session {
   readonly id: string;
@@ -60,6 +68,12 @@ export class Session {
   #messages: Message[] = [];
   #model: SessionModel | undefined;
   #stored: boolean;
+  /** Fixes for what a crash left behind, found on opening; written with the next record, so just looking changes nothing. */
+  #repair: (() => void) | undefined;
+  /** The lock file, while this session holds it. */
+  #lock: string | undefined;
+  /** Why it can't write: opened with `read()`, or closed. */
+  #readOnly: string | undefined;
 
   private constructor(id: string, root: string, cwd: string, created: string, model: SessionModel | undefined, stored: boolean) {
     this.id = id;
@@ -79,21 +93,48 @@ export class Session {
   }
 
   /**
-   * A saved session, by id. A torn last line (the process died mid-write) is cut
-   * off, and calls left without a result get an error result, so the
-   * conversation can go on.
+   * A saved session, by id, to continue: it's locked until `close()` or exit, and
+   * refused while another process has it. A torn last line (the process died
+   * mid-write) is cut off, and calls left without a result get an error result,
+   * so the conversation can go on. Those fixes reach the file with the next write.
    */
   static open(id: string, options: SessionOptions = {}): Session {
     const { root = sessionsDir() } = options;
-    if (!UUID.test(id)) throw new SessionError(`Not a session id: ${id}`);
-    id = id.toLowerCase();
+    id = sessionId(id);
+    const lockFile = join(root, id, 'lock');
+    try {
+      lock(lockFile, id);
+    } catch (err) {
+      if (err instanceof SessionError) throw err;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SessionError(`No session ${id} in ${root}`);
+      throw new SessionError(`Can't lock session ${id}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      const session = Session.#load(id, root);
+      session.#lock = lockFile;
+      return session;
+    } catch (err) {
+      unlock(lockFile);
+      throw err;
+    }
+  }
+
+  /** A saved session as it is, without locking it, e.g. while another process has it. It can't be written. */
+  static read(id: string, options: SessionOptions = {}): Session {
+    const { root = sessionsDir() } = options;
+    const session = Session.#load(sessionId(id), root);
+    session.#readOnly = 'was opened with read()';
+    return session;
+  }
+
+  static #load(id: string, root: string): Session {
     const file = join(root, id, 'session.jsonl');
     let text: string;
     try {
       text = readFileSync(file, 'utf8');
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') throw new SessionError(`No session ${id} in ${root}`);
-      throw err;
+      throw new SessionError(`Can't read ${file}: ${err instanceof Error ? err.message : String(err)}`);
     }
 
     const records: SessionRecord[] = [];
@@ -112,14 +153,20 @@ export class Session {
     if (header?.type !== 'session') throw new SessionError(`${file}: no session header`);
     if (header.version > VERSION) throw new SessionError(`${file}: format version ${header.version}; this featherloop reads ${VERSION}`);
 
-    // Appends must start on a fresh line. The write may have stopped just before the newline.
-    const intact = lines.slice(0, good).join('\n') + '\n';
-    if (intact.length > text.length) appendFileSync(file, '\n');
-    else if (intact !== text) truncateSync(file, Buffer.byteLength(intact));
-
     const session = new Session(id, root, header.cwd, header.created, header.model, true);
     for (const record of records.slice(1)) session.#replay(record);
-    session.append(...unanswered(session.#messages));
+    const answers = unanswered(session.#messages);
+    session.#messages.push(...answers);
+
+    // Appends must start on a fresh line. The write may have stopped just before the newline.
+    const intact = lines.slice(0, good).join('\n') + '\n';
+    if (intact !== text || answers.length) {
+      session.#repair = () => {
+        if (intact.length > text.length) appendFileSync(file, '\n');
+        else if (intact !== text) truncateSync(file, Buffer.byteLength(intact));
+        for (const message of answers) session.#append({ type: 'message', message });
+      };
+    }
     return session;
   }
 
@@ -153,19 +200,33 @@ export class Session {
     else this.#model = model;
   }
 
+  /** Lets other processes open the session; this one can't write it any more. */
+  close(): void {
+    if (this.#lock) unlock(this.#lock);
+    this.#lock = undefined;
+    this.#readOnly ??= 'is closed';
+  }
+
   /** A new, empty session kept beside this one, on the same model, starting in the current directory. */
   fresh(): Session {
     return Session.create({ root: this.root, ...(this.#model ? { model: this.#model } : {}) });
   }
 
   #write(record: DistributiveOmit<SessionRecord, 'time'>): void {
+    if (this.#readOnly) throw new SessionError(`Session ${this.id} ${this.#readOnly}`);
     if (!this.#stored) {
       // Tool output may hold secrets: only the user can read sessions.
       mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+      const lockFile = join(this.dir, 'lock');
+      lock(lockFile, this.id);
+      this.#lock = lockFile;
       const { id, created, cwd } = this;
       this.#append({ type: 'session', version: VERSION, id, created, cwd, ...(this.#model ? { model: this.#model } : {}) });
       this.#stored = true;
     }
+    const repair = this.#repair;
+    this.#repair = undefined;
+    repair?.();
     this.#append(record);
     this.#replay(record);
   }
@@ -183,12 +244,106 @@ export class Session {
         this.#messages.length = Math.min(record.length, this.#messages.length);
         break;
       case 'model': {
-        const { ref, variant } = record;
-        this.#model = variant === undefined ? { ref } : { ref, variant };
+        this.#model = sessionModel(record.ref, record.variant);
         break;
       }
       // Unknown records come from newer versions with the same format version: skip them.
     }
+  }
+}
+
+function sessionId(id: string): string {
+  if (!UUID.test(id)) throw new SessionError(`Not a session id: ${id}`);
+  return id.toLowerCase();
+}
+
+/** What a lock file holds. */
+interface LockHolder {
+  pid: number;
+  host: string;
+}
+
+/** Lock files this process holds, removed on exit. */
+const held = new Set<string>();
+let releasesOnExit = false;
+
+/**
+ * Takes a session's lock, or says who has it. A lock whose process is gone (on
+ * this host) is taken over; one from another host is left alone, as there's no
+ * telling whether its process runs.
+ */
+function lock(path: string, id: string): void {
+  const mine = JSON.stringify({ pid: process.pid, host: hostname() } satisfies LockHolder);
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // Written aside and linked into place: linking fails if there's a lock, and a lock is never half-written.
+    const temp = `${path}.${randomUUID()}`;
+    writeFileSync(temp, mine, { mode: 0o600 });
+    try {
+      linkSync(temp, path);
+      if (!releasesOnExit) process.once('exit', () => held.forEach(unlock));
+      releasesOnExit = true;
+      held.add(path);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    } finally {
+      rmSync(temp, { force: true });
+    }
+
+    const seen = readLock(path);
+    if (seen === undefined) continue; // Released meanwhile.
+    const holder = parseLock(seen);
+    if (holder && holder.host !== hostname()) {
+      throw new SessionError(`Session ${id} is open on ${holder.host} (pid ${holder.pid}); if it isn't any more, delete ${path}`);
+    }
+    if (holder && running(holder.pid)) {
+      throw new SessionError(
+        holder.pid === process.pid ? `Session ${id} is already open in this process` : `Session ${id} is open in another featherloop (pid ${holder.pid})`,
+      );
+    }
+    // Its process is gone: take over, unless another process just did.
+    if (readLock(path) === seen) rmSync(path, { force: true });
+  }
+  throw new SessionError(`Couldn't lock session ${id}: ${path} keeps changing`);
+}
+
+/** Removes a lock this process holds; best-effort, as it may be gone already. */
+function unlock(path: string): void {
+  held.delete(path);
+  try {
+    const holder = parseLock(readLock(path) ?? '');
+    if (holder?.pid === process.pid && holder.host === hostname()) rmSync(path, { force: true });
+  } catch {
+    // Left behind, it's taken over as stale.
+  }
+}
+
+function readLock(path: string): string | undefined {
+  try {
+    return readFileSync(path, 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw err;
+  }
+}
+
+/** Unreadable content (written by hand, or damaged) counts as a lock whose process is gone. */
+function parseLock(text: string): LockHolder | undefined {
+  try {
+    const value = JSON.parse(text) as Partial<LockHolder>;
+    return typeof value.pid === 'number' && typeof value.host === 'string' ? { pid: value.pid, host: value.host } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function running(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM: it runs, as another user.
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
   }
 }
 

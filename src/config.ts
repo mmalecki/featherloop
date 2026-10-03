@@ -71,9 +71,14 @@ export class ConfigError extends Error {
   override name = 'ConfigError';
 }
 
-/** `$XDG_CONFIG_HOME/featherloop/config.yaml`, by default `~/.config/featherloop/config.yaml`. */
+/** `$XDG_CONFIG_HOME/featherloop`, by default `~/.config/featherloop`: the config and the user's AGENTS.md. */
+export function configDir(): string {
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'featherloop');
+}
+
+/** `config.yaml` in `configDir()`. */
 export function configPath(): string {
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'featherloop', 'config.yaml');
+  return join(configDir(), 'config.yaml');
 }
 
 /** Reads and checks a config file; a missing file is an empty config. */

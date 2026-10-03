@@ -8,13 +8,13 @@ import { hideBin } from 'yargs/helpers';
 import {
   advisorAgent,
   ConfigError,
+  configDir,
   configPath,
   findInstructions,
   FLAVORS,
   formatInstructions,
   generalAgent,
   GlobTool,
-  instructionsDir,
   GrepTool,
   loadConfig,
   Loop,
@@ -23,6 +23,7 @@ import {
   ParallelWebSearchTool,
   Session,
   SessionError,
+  sessionModel,
   ShellTool,
   SimpleUI,
   SubagentTool,
@@ -61,7 +62,7 @@ const argv = await yargs(hideBin(process.argv))
   .option('instructions', {
     type: 'boolean',
     default: true,
-    describe: `Load AGENTS.md, or else CLAUDE.md, from ${instructionsDir()} and each directory from the git root down to the cwd (--no-instructions to skip)`,
+    describe: `Load AGENTS.md, or else CLAUDE.md, from ${configDir()} and each directory from the git root down to the cwd (--no-instructions to skip)`,
   })
   .option('resume', {
     alias: 'r',
@@ -89,7 +90,7 @@ const resumed = argv.resume === undefined ? undefined : await exitOnUserError(()
 const ref = await exitOnUserError(() => argv.model ?? resumed?.model?.ref ?? process.env.MODEL ?? registry.default ?? onlyModel());
 const variant = argv.model === undefined && argv.variant === undefined ? resumed?.model?.variant : argv.variant;
 const initial = await exitOnUserError(() => resolveModel(ref, variant));
-const model = variant === undefined ? { ref } : { ref, variant };
+const model = sessionModel(ref, variant);
 const session = resumed ?? Session.create({ model });
 // Flags switched a resumed session's model: the next resume should stay on it.
 if (resumed && (argv.model !== undefined || argv.variant !== undefined)) resumed.setModel(model);
@@ -133,9 +134,14 @@ const createLoop = () => {
   return Loop(initial.api, generalAgent.toolset(available), { models: resolveModel });
 };
 
-// Read again for each new conversation and subagent task, so edits apply from then on.
+// Read for each new conversation (`/c`) and subagent task, so edits apply from then on. The startup
+// read serves the header and the first prompt, and is the only one that warns.
 const instructions = (cwd: string) => (argv.instructions ? formatInstructions(findInstructions({ cwd })) : '');
-const loaded = argv.instructions && !resumed ? findInstructions().map(({ path }) => shortPath(path)) : [];
+const startup = argv.instructions
+  ? findInstructions({ onSkip: (path, err) => console.error(`Skipping instructions in ${path}: ${(err as Error).message}`) })
+  : [];
+const loaded = resumed ? [] : startup.map(({ path }) => shortPath(path));
+let first = true;
 
 const ui = new SimpleUI(createLoop, {
   model: initial,
@@ -144,7 +150,9 @@ const ui = new SimpleUI(createLoop, {
   // A resumed session keeps the system prompt it was saved with; `/c` builds a new one.
   system: () => {
     const cwd = process.cwd();
-    return generalAgent.system({ cwd, date: new Date().toISOString().slice(0, 10), model: initial.model, instructions: instructions(cwd) });
+    const text = first ? formatInstructions(startup) : instructions(cwd);
+    first = false;
+    return generalAgent.system({ cwd, date: new Date().toISOString().slice(0, 10), model: initial.model, instructions: text });
   },
   ...(loaded.length ? { notes: [`instructions: ${loaded.join(', ')}`] } : {}),
 });

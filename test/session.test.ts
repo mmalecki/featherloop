@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { hostname, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
@@ -53,7 +54,7 @@ test('saves nothing until the first message, then reopens with messages and mode
   assert.equal(statSync(session.file).mode & 0o777, 0o600);
   assert.equal(statSync(session.dir).mode & 0o777, 0o700);
 
-  const opened = Session.open(session.id.toUpperCase(), { root: dir });
+  const opened = Session.read(session.id.toUpperCase(), { root: dir });
   assert.equal(opened.id, session.id);
   assert.equal(opened.cwd, '/work');
   assert.deepEqual(opened.model, { ref: 'anthropic/claude-haiku-4-5', variant: 'fast' });
@@ -69,7 +70,7 @@ test('replays truncations and model switches', () => {
   session.setModel({ ref: 'big' });
   session.append({ role: 'user', content: 'Three.' });
 
-  const opened = Session.open(session.id, { root: dir });
+  const opened = Session.read(session.id, { root: dir });
   assert.deepEqual(opened.messages, [{ role: 'user', content: 'One.' }, say('1'), { role: 'user', content: 'Three.' }]);
   assert.deepEqual(opened.model, { ref: 'big' });
   assert.equal(readFileSync(session.file, 'utf8').trimEnd().split('\n').length, 7);
@@ -80,29 +81,38 @@ test('cuts off a torn last line, so later appends start on a fresh line', () => 
   const session = Session.create({ root: dir });
   session.append({ role: 'user', content: 'Hi.' });
   appendFileSync(session.file, '{"time":"2026-10-03T00:00:00Z","type":"mess');
+  const torn = readFileSync(session.file, 'utf8');
+  session.close();
 
   const opened = Session.open(session.id, { root: dir });
+  assert.equal(readFileSync(session.file, 'utf8'), torn, 'opening alone changes nothing');
   assert.deepEqual(opened.messages, [{ role: 'user', content: 'Hi.' }]);
   opened.append(say('Hello.'));
-  assert.deepEqual(Session.open(session.id, { root: dir }).messages, [{ role: 'user', content: 'Hi.' }, say('Hello.')]);
+  opened.close();
+  assert.deepEqual(Session.read(session.id, { root: dir }).messages, [{ role: 'user', content: 'Hi.' }, say('Hello.')]);
 
   // Cut just before the newline: the line is whole and stays.
   appendFileSync(session.file, JSON.stringify({ time: '2026-10-03T00:00:00Z', type: 'message', message: { role: 'user', content: 'More.' } }));
   Session.open(session.id, { root: dir }).append(say('Yes.'));
-  assert.deepEqual(Session.open(session.id, { root: dir }).messages.slice(2), [{ role: 'user', content: 'More.' }, say('Yes.')]);
+  assert.deepEqual(Session.read(session.id, { root: dir }).messages.slice(2), [{ role: 'user', content: 'More.' }, say('Yes.')]);
 });
 
 test('refuses a damaged file, a bad id and a missing session', () => {
   const dir = root();
   const session = Session.create({ root: dir });
   session.append({ role: 'user', content: 'Hi.' }, say('Hello.'));
+  session.close();
   writeFileSync(session.file, readFileSync(session.file, 'utf8').replace('"type":"message"', '"type":"mess'));
   assert.throws(() => Session.open(session.id, { root: dir }), (err) => err instanceof SessionError && /:2: not JSON/.test(err.message));
+  assert.equal(existsSync(join(session.dir, 'lock')), false, 'a failed open lets go of the lock');
   assert.throws(() => Session.open('../../etc', { root: dir }), SessionError);
   assert.throws(() => Session.open(crypto.randomUUID(), { root: dir }), /No session/);
+  const id = crypto.randomUUID();
+  mkdirSync(join(dir, id, 'session.jsonl'), { recursive: true });
+  assert.throws(() => Session.open(id, { root: dir }), (err) => err instanceof SessionError && /Can't read/.test(err.message));
 });
 
-test('answers calls the session ended in, and saves those answers', () => {
+test('answers calls the session ended in, saving the answers with the next write', () => {
   const dir = root();
   const session = Session.create({ root: dir });
   const turn: AssistantMessage = {
@@ -111,11 +121,18 @@ test('answers calls the session ended in, and saves those answers', () => {
   };
   session.append({ role: 'user', content: 'Read.' }, turn, { role: 'tool', tool_call_id: 'a', content: 'done' });
 
+  session.close();
+  const before = readFileSync(session.file, 'utf8');
   const opened = Session.open(session.id, { root: dir });
   const last = opened.messages.at(-1)!;
   assert.equal(opened.messages.length, 4);
   assert.equal(last.role === 'tool' && last.tool_call_id, 'b');
-  assert.deepEqual(Session.open(session.id, { root: dir }).messages, opened.messages);
+  assert.equal(readFileSync(session.file, 'utf8'), before);
+
+  opened.append({ role: 'user', content: 'Go on.' });
+  const lines = readFileSync(session.file, 'utf8').trimEnd().split('\n');
+  assert.equal(lines.length, 6);
+  assert.deepEqual(Session.read(session.id, { root: dir }).messages, opened.messages);
 });
 
 test('SimpleUI saves each run as it goes and resumes with the saved system prompt', async () => {
@@ -132,10 +149,11 @@ test('SimpleUI saves each run as it goes and resumes with the saved system promp
   assert.deepEqual(first.messages, conversation);
 
   const api = fake([say('Sure.')]);
+  first.close();
   const resumed = ui(api, Session.open(first.id, { root: dir }), 'A newer prompt.');
   await resumed.ask('Thanks.');
   assert.deepEqual(api.seen[0], [...conversation, { role: 'user', content: 'Thanks.' }]);
-  assert.deepEqual(Session.open(first.id, { root: dir }).messages, [...conversation, { role: 'user', content: 'Thanks.' }, say('Sure.')]);
+  assert.deepEqual(Session.read(first.id, { root: dir }).messages, [...conversation, { role: 'user', content: 'Thanks.' }, say('Sure.')]);
 });
 
 test('SimpleUI drops a failed run from the session, as from its history', async () => {
@@ -154,9 +172,9 @@ test('SimpleUI drops a failed run from the session, as from its history', async 
   );
   await chat.ask('Hi.');
   await chat.ask('Read it.');
-  assert.equal(Session.open(session.id, { root: dir }).messages.length, 3);
+  assert.equal(Session.read(session.id, { root: dir }).messages.length, 3);
   await chat.ask('Again?');
-  assert.deepEqual(Session.open(session.id, { root: dir }).messages.slice(3), [{ role: 'user', content: 'Again?' }, say('Back.')]);
+  assert.deepEqual(Session.read(session.id, { root: dir }).messages.slice(3), [{ role: 'user', content: 'Again?' }, say('Back.')]);
 });
 
 test('SimpleUI shows the last turn of a resumed session', async () => {
@@ -171,6 +189,7 @@ test('SimpleUI shows the last turn of a resumed session', async () => {
     { role: 'tool', tool_call_id: 'c1', content: 'contents' },
     say('It says **contents**.'),
   );
+  session.close();
 
   const input = new PassThrough();
   const out = new PassThrough();
@@ -188,4 +207,93 @@ test('SimpleUI shows the last turn of a resumed session', async () => {
     ),
     output,
   );
+});
+
+test('SimpleUI keeps working when saving fails, and stops saving', async () => {
+  // Sessions can't be kept under a file.
+  const blocker = join(root(), 'file');
+  writeFileSync(blocker, '');
+  const session = Session.create({ root: blocker });
+  const out = new PassThrough();
+  let output = '';
+  out.on('data', (chunk) => (output += chunk));
+  const api = fake([say('Hello.'), say('Again.')]);
+  const chat = new SimpleUI(Loop(api), { model: 'm', session, output: out as unknown as NodeJS.WriteStream });
+
+  await chat.ask('Hi.');
+  await chat.ask('More?');
+  assert.equal(output.match(/Session not saved from here on: ENOTDIR/g)?.length, 1, output);
+  assert.equal(chat.session, undefined);
+  // Both runs went through, the second with the first in its history.
+  assert.deepEqual(api.seen[1], [{ role: 'user', content: 'Hi.' }, say('Hello.'), { role: 'user', content: 'More?' }]);
+});
+
+test('one process at a time: a session is locked from its first write, or from open(), until closed', () => {
+  const dir = root();
+  const session = Session.create({ root: dir });
+  const lock = join(session.dir, 'lock');
+  session.setModel({ ref: 'm' });
+  assert.equal(existsSync(lock), false);
+  session.append({ role: 'user', content: 'Hi.' });
+  assert.deepEqual(JSON.parse(readFileSync(lock, 'utf8')), { pid: process.pid, host: hostname() });
+  assert.equal(statSync(lock).mode & 0o777, 0o600);
+
+  assert.throws(() => Session.open(session.id, { root: dir }), /already open in this process/);
+  const look = Session.read(session.id, { root: dir });
+  assert.deepEqual(look.messages, session.messages);
+  assert.throws(() => look.append(say('No.')), /opened with read\(\)/);
+
+  session.close();
+  assert.equal(existsSync(lock), false);
+  assert.throws(() => session.append(say('No.')), /is closed/);
+  const opened = Session.open(session.id, { root: dir });
+  assert.equal(existsSync(lock), true);
+  opened.close();
+  assert.equal(existsSync(lock), false);
+});
+
+test('takes over a lock whose process is gone, but not a running one or one from another host', () => {
+  const dir = root();
+  const session = Session.create({ root: dir });
+  session.append({ role: 'user', content: 'Hi.' });
+  session.close();
+  const lock = join(session.dir, 'lock');
+  const holder = (pid: number | undefined, host = hostname()) => writeFileSync(lock, JSON.stringify({ pid, host }));
+
+  holder(process.ppid);
+  assert.throws(() => Session.open(session.id, { root: dir }), new RegExp(`open in another featherloop \\(pid ${process.ppid}\\)`));
+  holder(1, 'elsewhere');
+  assert.throws(() => Session.open(session.id, { root: dir }), (err) => err instanceof SessionError && err.message.includes(`on elsewhere (pid 1); if it isn't any more, delete ${lock}`));
+
+  holder(spawnSync(process.execPath, ['-e', '']).pid);
+  Session.open(session.id, { root: dir }).close();
+  writeFileSync(lock, 'damaged');
+  Session.open(session.id, { root: dir }).close();
+});
+
+test('a process lets go of its sessions when it exits', () => {
+  const dir = root();
+  const script = `
+    import { Session } from ${JSON.stringify(new URL('../src/session.ts', import.meta.url).href)};
+    const session = Session.create({ root: ${JSON.stringify(dir)} });
+    session.append({ role: 'user', content: 'Hi.' });
+    console.log(session.id);
+  `;
+  const id = execFileSync(process.execPath, ['--input-type=module', '-e', script], { encoding: 'utf8' }).trim();
+  assert.equal(existsSync(join(dir, id, 'session.jsonl')), true);
+  assert.equal(existsSync(join(dir, id, 'lock')), false);
+});
+
+test('SimpleUI lets go of a session on /c', async () => {
+  const dir = root();
+  const session = Session.create({ root: dir });
+  const input = new PassThrough();
+  const chat = new SimpleUI(Loop(fake([say('Hello.')])), { model: 'm', session, input, output: new PassThrough().resume() as unknown as NodeJS.WriteStream });
+  await chat.ask('Hi.');
+  assert.equal(existsSync(join(session.dir, 'lock')), true);
+  const done = chat.start();
+  input.end('/c\n');
+  await done;
+  assert.equal(existsSync(join(session.dir, 'lock')), false);
+  assert.notEqual(chat.session?.id, session.id);
 });

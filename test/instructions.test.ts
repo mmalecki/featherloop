@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -62,6 +62,16 @@ test('a .git file marks the root too; outside a repository only the cwd counts',
   assert.deepEqual(paths(root, { cwd: join(root, 'wt/sub'), global: null }), ['wt/AGENTS.md', 'wt/sub/AGENTS.md']);
   const loose = tree({ 'AGENTS.md': 'Parent.', 'dir/AGENTS.md': 'Here.' });
   assert.deepEqual(paths(loose, { cwd: join(loose, 'dir'), global: null }), ['dir/AGENTS.md']);
+});
+
+test('skips what it can\'t read, saying so', () => {
+  const root = tree({ '.git/': '', 'AGENTS.md': 'Root.', 'sub/': '' });
+  // A link to itself: stat fails with ELOOP, as unreadable files fail with EACCES.
+  symlinkSync('AGENTS.md', join(root, 'sub/AGENTS.md'));
+  const skipped: string[] = [];
+  const found = findInstructions({ cwd: join(root, 'sub'), global: null, onSkip: (path, err) => skipped.push(`${path}: ${(err as NodeJS.ErrnoException).code}`) });
+  assert.deepEqual(found.map(({ content }) => content), ['Root.']);
+  assert.deepEqual(skipped, [`${join(root, 'sub')}: ELOOP`]);
 });
 
 test('formats files with their paths, cutting long ones', () => {

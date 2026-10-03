@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
+import { configDir } from './config.ts';
 
 /** The files a directory's instructions may be in, by preference: CLAUDE.md only where there's no AGENTS.md. */
 export const INSTRUCTION_FILES = ['AGENTS.md', 'CLAUDE.md'] as const;
@@ -18,13 +18,10 @@ export interface InstructionFile {
 export interface FindInstructionsOptions {
   /** Where the agent works. Defaults to the process cwd. */
   cwd?: string;
-  /** The user's own instructions, before the project's; `null` for none. Defaults to `instructionsDir()`. */
+  /** The user's own instructions, before the project's; `null` for none. Defaults to `configDir()`. */
   global?: string | null;
-}
-
-/** `$XDG_CONFIG_HOME/featherloop`, by default `~/.config/featherloop`, beside the config. */
-export function instructionsDir(): string {
-  return join(process.env.XDG_CONFIG_HOME || join(homedir(), '.config'), 'featherloop');
+  /** Told about a directory or file that can't be read (e.g. no permission), which is then skipped. */
+  onSkip?: (path: string, error: unknown) => void;
 }
 
 /**
@@ -32,15 +29,23 @@ export function instructionsDir(): string {
  * then one per directory from the git root down to `cwd` (outside a repository,
  * only `cwd`'s). Each directory gives its AGENTS.md, or else its CLAUDE.md.
  */
-export function findInstructions({ cwd = process.cwd(), global = instructionsDir() }: FindInstructionsOptions = {}): InstructionFile[] {
-  const dirs = [...(global === null ? [] : [resolve(global)]), ...projectDirs(resolve(cwd))];
+export function findInstructions(options: FindInstructionsOptions = {}): InstructionFile[] {
+  const { cwd = process.cwd(), global = configDir(), onSkip } = options;
+  const dirs = [...(global === null ? [] : [resolve(global)]), ...projectDirs(resolve(cwd), onSkip)];
   return [...new Set(dirs)].flatMap((dir) => {
-    const path = INSTRUCTION_FILES.map((name) => join(dir, name)).find(isFile);
-    if (!path) return [];
-    const text = readFileSync(path, 'utf8').trim();
-    if (!text) return [];
-    const truncated = text.length > MAX_INSTRUCTION_CHARS;
-    return [{ path, content: truncated ? text.slice(0, MAX_INSTRUCTION_CHARS) : text, truncated }];
+    let path = dir;
+    try {
+      const found = INSTRUCTION_FILES.map((name) => join(dir, name)).find(isFile);
+      if (!found) return [];
+      path = found;
+      const text = readFileSync(path, 'utf8').trim();
+      if (!text) return [];
+      const truncated = text.length > MAX_INSTRUCTION_CHARS;
+      return [{ path, content: truncated ? text.slice(0, MAX_INSTRUCTION_CHARS) : text, truncated }];
+    } catch (err) {
+      onSkip?.(path, err);
+      return [];
+    }
   });
 }
 
@@ -58,13 +63,19 @@ export function formatInstructions(files: readonly InstructionFile[]): string {
   ].join('\n\n');
 }
 
-/** From the git root down to `cwd`; just `cwd` outside a repository. */
-function projectDirs(cwd: string): string[] {
+/** From the git root down to `cwd`; just `cwd` outside a repository, or when the walk up can't go on. */
+function projectDirs(cwd: string, onSkip: FindInstructionsOptions['onSkip']): string[] {
   const dirs = [cwd];
-  for (let dir = cwd; !exists(join(dir, '.git')); dir = dirname(dir)) {
+  let dir = cwd;
+  try {
     // `.git` is a directory, or a file in worktrees and submodules.
-    if (dir === dirname(dir)) return [cwd];
-    dirs.unshift(dirname(dir));
+    for (; !exists(join(dir, '.git')); dir = dirname(dir)) {
+      if (dir === dirname(dir)) return [cwd];
+      dirs.unshift(dirname(dir));
+    }
+  } catch (err) {
+    onSkip?.(dir, err);
+    return [cwd];
   }
   return dirs;
 }

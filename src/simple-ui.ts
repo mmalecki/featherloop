@@ -3,7 +3,7 @@ import { styleText } from 'node:util';
 import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
 import type { ModelResolver, ResolvedModel } from './models.ts';
 import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
-import type { Session } from './session.ts';
+import { sessionModel, type Session } from './session.ts';
 
 type Style = Parameters<typeof styleText>[0];
 
@@ -120,7 +120,7 @@ export class SimpleUI {
       if (ref !== undefined) {
         this.#model = await this.#resolve(ref, variant);
         // As asked for, not as resolved: resuming resolves it again.
-        this.#session?.setModel(variant === undefined ? { ref } : { ref, variant });
+        this.#save((session) => session.setModel(sessionModel(ref, variant)));
       }
       return this.#modelLabel();
     });
@@ -225,7 +225,7 @@ export class SimpleUI {
     try {
       // The session holds a prefix of the history: save the rest (the system prompt
       // on the first run, and the prompt); the run's own messages follow as they come.
-      this.#session?.append(...input.slice(this.#session.messages.length));
+      this.#save((session) => session.append(...input.slice(session.messages.length)));
       await this.#switching;
       const { messages } = await this.#loop.run({
         model: this.model,
@@ -243,7 +243,7 @@ export class SimpleUI {
           : this.#style('red', `⏺ Error: ${err instanceof Error ? err.message : String(err)}`),
       );
       // The run is discarded, prompt included; so is what was saved of it.
-      this.#session?.truncate(this.#history.length);
+      this.#save((session) => session.truncate(this.#history.length));
     } finally {
       this.#endBlock();
       this.#abort = undefined;
@@ -262,6 +262,8 @@ export class SimpleUI {
           this.#loop = this.#attach(this.#factory());
         }
         const previous = this.#session;
+        // Done with: other processes may resume it now.
+        previous?.close();
         this.#session = previous?.fresh();
         this.#reset();
         this.#print(this.#style('green', '⏺ Cleared conversation'));
@@ -296,9 +298,25 @@ export class SimpleUI {
   #onMessage = (message: Message) => {
     // Only this UI's runs: they're what the history holds.
     if (!this.#abort) return;
-    this.#session?.append(message);
+    this.#save((session) => session.append(message));
     if (message.role === 'user') this.#print(this.#style('dim', `  ↳ sent: ${preview(text(message.content), 60)}`));
   };
+
+  /**
+   * Saving is best-effort: a failure (e.g. a read-only or full disk) mustn't stop
+   * the agent. The first one is reported and ends saving, so the saved session
+   * can't drift from the history.
+   */
+  #save(write: (session: Session) => void): void {
+    if (!this.#session) return;
+    try {
+      write(this.#session);
+    } catch (err) {
+      this.#session = undefined;
+      this.#endBlock();
+      this.#print(this.#style('yellow', `⏺ Session not saved from here on: ${err instanceof Error ? err.message : String(err)}`));
+    }
+  }
 
   #attach(loop: AgentLoop): AgentLoop {
     return loop
