@@ -1,6 +1,6 @@
 {
   "name": "featherloop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Minimal agent execution loop with configurable, context-lean toolsets",
   "repository": {
     "type": "git",
