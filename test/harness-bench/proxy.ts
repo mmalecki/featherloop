@@ -112,13 +112,15 @@ export interface Meter {
 
 interface Sink {
   meter: Meter;
+  /** The server this run's requests go to, with `/v1/`. */
+  upstream: URL;
   /** Each record is appended here as it completes. */
   file: string;
   /** The last request and its assembled response: the whole conversation, for reading what happened. */
   transcript: string;
   seq: number;
   /** Responses still being proxied, to abort if the run ends first. */
-  live: Set<() => void>;
+  live: Set<(reason: string) => void>;
   /** Their records, to count their output as it streams. */
   inflight: Set<RequestRecord>;
 }
@@ -153,8 +155,7 @@ export class MeteringProxy {
 
   private constructor(upstream: string, options: ProxyOptions) {
     this.options = options;
-    // Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces.
-    this.upstream = new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
+    this.upstream = withSlash(upstream);
     this.#server = http.createServer((req, res) => void this.#handle(req, res));
     // Requests last as long as the model takes; the harness owns the timeouts.
     this.#server.requestTimeout = 0;
@@ -170,8 +171,11 @@ export class MeteringProxy {
     return proxy;
   }
 
-  /** Starts metering a run; `file` gets a line per request, `transcript` the last exchange. */
-  open(run: string, file: string, transcript: string): Meter {
+  /**
+   * Starts metering a run; `file` gets a line per request, `transcript` the last
+   * exchange. Its requests go to `upstream` (with `/v1`), or the proxy's.
+   */
+  open(run: string, file: string, transcript: string, upstream?: string): Meter {
     if (!/^[\w.-]+$/.test(run)) throw new Error(`Bad run id: ${run}`);
     const inflight = new Set<RequestRecord>();
     const records: RequestRecord[] = [];
@@ -183,15 +187,19 @@ export class MeteringProxy {
         [...inflight].reduce((sum, record) => sum + record.chunks, 0),
     };
     writeFileSync(file, '');
-    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set(), inflight });
+    this.#runs.set(run, { meter, file, transcript, upstream: upstream === undefined ? this.upstream : withSlash(upstream), seq: 0, live: new Set(), inflight });
     return meter;
   }
 
-  /** Stops metering a run, aborting its requests still in flight so they free their server slots. */
-  close(run: string): void {
+  /**
+   * Stops metering a run, aborting its requests still in flight so they free their
+   * server slots. Their records say `reason`: the bench's own, unless it ended the run
+   * because its server was lost, which is the infrastructure's (`infrastructureError`).
+   */
+  close(run: string, reason: string = RUN_ENDED): void {
     const sink = this.#runs.get(run);
     if (!sink) return;
-    for (const abort of sink.live) abort();
+    for (const abort of sink.live) abort(reason);
     this.#runs.delete(run);
   }
 
@@ -242,7 +250,7 @@ export class MeteringProxy {
           )
         : body;
     const response = new ResponseParser(record, offered);
-    const target = new URL(path, this.upstream);
+    const target = new URL(path, sink.upstream);
 
     const headers: Record<string, string> = {};
     for (const name of ['content-type', 'authorization', 'x-api-key', 'anthropic-version', 'anthropic-beta', 'accept']) {
@@ -301,9 +309,9 @@ export class MeteringProxy {
         finish(err.message);
       });
     });
-    const abort = () => {
+    const abort = (reason: string) => {
       upstream.destroy();
-      finish('aborted: run ended');
+      finish(reason);
     };
     sink.live.add(abort);
     sink.inflight.add(record);
@@ -322,6 +330,11 @@ export class MeteringProxy {
     upstream.end(sent);
   }
 }
+
+const RUN_ENDED = 'aborted: run ended';
+
+/** What a request's record says when the bench ended its run because the run's server was lost: the infrastructure's doing. */
+export const SERVER_LOST = 'aborted: server lost';
 
 /** The bench's own aborts, when a run ends or its harness hangs up: not the server's doing. */
 const OWN_ABORT = /^aborted: (run ended|client disconnected)$/;
@@ -397,6 +410,11 @@ function foldSystem(messages: Json[], dialect: 'openai' | 'anthropic'): Json[] |
     }
   });
   return changed ? out : undefined;
+}
+
+/** Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces. */
+function withSlash(upstream: string): URL {
+  return new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
 }
 
 function tryParse(text: Buffer | string): unknown {
