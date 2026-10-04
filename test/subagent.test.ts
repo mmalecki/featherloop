@@ -1,12 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  advisorAgent,
   defineAgent,
+  generalAgent,
   Loop,
   SubagentTool,
   type AssistantMessage,
   type PermissionRule,
   type Provider,
+  type ResolvedModel,
   type Tool,
   type Toolset,
   type TurnRequest,
@@ -251,4 +254,86 @@ test('an agent with its own model needs a loop that can set it up', async () => 
   const { result, sub } = await delegate([call('subagent', { input: 'Check.' })], SubagentTool({ agents: [advisor], tools: () => ({}) }));
   assert.equal(sub.length, 0);
   assert.match(String(result.messages.find((m) => m.role === 'tool')?.content), /Agent advisor runs on advisor, but this loop can't set up other models/);
+});
+
+/**
+ * Models named `ref` or `ref@variant`, each advised by the one `advisors` maps it
+ * to. Each asks its advisor when it has one, then reports what it was told.
+ */
+function advisorChain(advisors: Record<string, string | null>) {
+  const asked: string[] = [];
+  const offered: Record<string, string[]> = {};
+  const provider = (id: string): Provider => ({
+    name: id,
+    async turn(request, on) {
+      on.usage?.({ input: 10, output: 1, cacheRead: 0, cacheWrite: 0 });
+      offered[id] = request.tools.map(({ name }) => name);
+      const last = request.messages.at(-1)!;
+      if (last.role === 'tool') return say(`${id}: ${last.content}`);
+      if (!offered[id].includes('subagent')) return say(`${id} ok`);
+      asked.push(id);
+      return call('subagent', { agent: 'advisor', input: 'Check.', transcript: true });
+    },
+    async complete() {
+      throw new Error('complete() should not be called');
+    },
+  });
+  const resolve = (id: string): ResolvedModel => {
+    const [ref, variant] = id.split('@') as [string, string | undefined];
+    return {
+      ref,
+      ...(variant ? { variant } : {}),
+      api: provider(id),
+      model: id,
+      submodel: async (name) => (name === 'advisor' && advisors[id] ? resolve(advisors[id]) : undefined),
+    };
+  };
+  return { asked, offered, resolve };
+}
+
+async function askAdvisors(advisors: Record<string, string | null>, from: string, options: { maxDepth?: number } = {}) {
+  const { asked, offered, resolve } = advisorChain(advisors);
+  const user = resolve(from);
+  const tool = SubagentTool({ agents: [generalAgent, advisorAgent], tools: () => ({ read: fixed('x'), grep: fixed('x') }), ...options });
+  const loop = Loop(user.api, { subagent: tool }, { submodel: user.submodel! });
+  const calls: { name: string; parent?: string | undefined }[] = [];
+  const usage: string[] = [];
+  loop.on('tool_call', ({ name, parent }) => calls.push({ name, parent }));
+  loop.on('usage', ({ model, source }) => usage.push(`${source} ${model}`));
+  const result = await loop.run({ model: user.model, input: [{ role: 'user', content: 'Fix it.' }] });
+  return { reply: result.message.content, asked, offered, calls, usage, total: result.usage };
+}
+
+test('an advisor asks its own advisor, until a model has none', async () => {
+  const { reply, asked, offered, calls, usage, total } = await askAdvisors({ small: 'mid', mid: 'big', big: null }, 'small');
+  assert.equal(reply, 'small: mid: big ok');
+  assert.deepEqual(asked, ['small', 'mid']);
+  // The advisors get only the advisor, and only while there's a stronger one.
+  assert.deepEqual(offered, { small: ['subagent'], mid: ['read', 'grep', 'subagent'], big: ['read', 'grep'] });
+  // The inner call shows under the outer one.
+  assert.deepEqual(calls, [
+    { name: 'subagent', parent: undefined },
+    { name: 'subagent', parent: 'call_subagent' },
+  ]);
+  // Every model's usage counts as the outer call's.
+  assert.deepEqual(usage, ['turn small', 'tool mid', 'tool big', 'tool mid', 'turn small']);
+  assert.deepEqual(total, { input: 50, output: 5, cacheRead: 0, cacheWrite: 0 });
+});
+
+test('a chain of advisors ends at a model already on the task, even at another variant', async () => {
+  // b's advisor is a, which is already advising.
+  assert.equal((await askAdvisors({ small: 'a', a: 'b', b: 'a' }, 'small')).reply, 'small: a: b ok');
+  // An advisor that is its own advisor has none.
+  assert.equal((await askAdvisors({ small: 'x', x: 'x' }, 'small')).reply, 'small: x ok');
+  // The same model at a higher effort is another model, though.
+  const { reply } = await askAdvisors({ small: 'x@low', 'x@low': 'x@max', 'x@max': 'x@max' }, 'small');
+  assert.equal(reply, 'small: x@low: x@max ok');
+  // The user's own model may advise, as with a single advisor.
+  assert.equal((await askAdvisors({ x: 'x' }, 'x')).reply, 'x: x ok');
+});
+
+test('advisors hand tasks on only as deep as allowed', async () => {
+  const chain = { m0: 'm1', m1: 'm2', m2: 'm3', m3: 'm4', m4: 'm5' };
+  assert.equal((await askAdvisors(chain, 'm0')).reply, 'm0: m1: m2: m3 ok');
+  assert.equal((await askAdvisors(chain, 'm0', { maxDepth: 1 })).reply, 'm0: m1 ok');
 });

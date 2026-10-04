@@ -22,7 +22,8 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
   /**
    * Builds the tools a subagent may use, afresh for each call, so it doesn't share
    * state (such as which files were read) with the caller. Its agent's permissions
-   * pick from them. Subagents never get the tool keyed `subagent`, so they can't nest.
+   * pick from them. Any tool keyed `subagent` is left out: a subagent gets one only
+   * for its agent's own `agents`.
    */
   tools: () => Toolset;
   /** Default rules for every subagent, e.g. the caller's own; each agent's rules override them. */
@@ -33,10 +34,15 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
    */
   instructions?: string | ((cwd: string) => string);
   loop?: LoopOptions;
+  /**
+   * How deep subagents may hand tasks on to their own (see `AgentSpec.agents`),
+   * counting this tool's: 1 keeps them from it. Defaults to 3.
+   */
+  maxDepth?: number;
 }
 
-/** The model a subagent runs on. */
-type Runner = { api: Provider; model: string; submodel?: Submodel | undefined };
+/** The model a subagent runs on: the caller's, or its agent's own, which has a reference. */
+type Runner = { api: Provider; model: string; ref?: string; variant?: string; submodel?: Submodel | undefined };
 
 /** A transcript's tool results are cut to this; the subagent can re-read files itself. */
 const TRANSCRIPT_RESULT_CHARS = 2_000;
@@ -44,13 +50,32 @@ const TRANSCRIPT_RESULT_CHARS = 2_000;
 /**
  * Hands a task to another agent, which runs its own loop and returns its final
  * reply. An agent with a `model` runs on it, as the caller's model refers to it
- * (`ToolContext.submodel`); others run on the caller's model. Calls in the same turn run in parallel. The
- * subagent's token use counts as this tool's.
+ * (`ToolContext.submodel`); others run on the caller's model. An agent with
+ * `agents` may hand tasks on in turn. Calls in the same turn run in parallel.
+ * The subagents' token use counts as this tool's.
  */
-export function SubagentTool({ agents, tools, permissions = [], instructions, loop: loopOptions, ...options }: SubagentToolOptions): Tool {
+export function SubagentTool(options: SubagentToolOptions): Tool {
+  const pool = new Map(options.agents.map((agent) => [agent.name, agent]));
+  if (!pool.size) throw new Error('SubagentTool needs at least one agent');
+  if (pool.size !== options.agents.length) throw new Error('SubagentTool: agent names must be unique');
+  return subagentTool(options, { depth: 1, chain: [], pool });
+}
+
+interface Nesting {
+  /** 1 for the caller's own tool, 2 for its subagents', and so on. */
+  depth: number;
+  /**
+   * The models already working on the task, by `key()`: a subagent isn't offered
+   * one of them again, so a chain of advisors ends, even if the config goes round.
+   */
+  chain: readonly string[];
+  /** The caller's agents, which subagents' `agents` name. */
+  pool: ReadonlyMap<string, Agent>;
+}
+
+function subagentTool(all: SubagentToolOptions, { depth, chain, pool }: Nesting): Tool {
+  const { agents, tools, permissions = [], instructions, loop: loopOptions, maxDepth = 3, ...options } = all;
   const byName = new Map(agents.map((agent) => [agent.name, agent]));
-  if (!byName.size) throw new Error('SubagentTool needs at least one agent');
-  if (byName.size !== agents.length) throw new Error('SubagentTool: agent names must be unique');
   const listed = agents.map(({ name, description }) => (description ? `${name}: ${description}` : name)).join('; ');
 
   return defineTool<SubagentParams>({
@@ -114,8 +139,10 @@ export function SubagentTool({ agents, tools, permissions = [], instructions, lo
         model: runner.model,
         ...(instructions === undefined ? {} : { instructions: typeof instructions === 'function' ? instructions(dir) : instructions }),
       });
-      // Subagents can't nest: they're never offered this tool.
+      // Only an agent with agents of its own gets a subagent tool, for those.
       const { subagent: _, ...available } = tools();
+      const nested = depth < maxDepth ? await offer(agent, runner) : undefined;
+      if (nested) available.subagent = nested;
       const toolset = agent.toolset(available, permissions);
       const task = transcript ? `${render(messages!)}\n\n<task>\n${input}\n</task>` : input;
       // The subagent's tools set up models as its own model refers to them.
@@ -134,6 +161,29 @@ export function SubagentTool({ agents, tools, permissions = [], instructions, lo
       return reply.length > maxLength ? `${reply.slice(0, maxLength)}\n[… ${reply.length - maxLength} more characters cut]` : reply;
     },
   })(options);
+
+  /** A subagent tool for `agent`'s own agents that `runner` can run, one level down; none if there are none. */
+  async function offer(agent: Agent, runner: Runner): Promise<Tool | undefined> {
+    const below = runner.ref === undefined ? chain : [...chain, key(runner)];
+    const offered: Agent[] = [];
+    for (const name of agent.agents) {
+      const next = pool.get(name);
+      if (!next) continue;
+      if (next.model) {
+        const model = runner.submodel ? await runner.submodel(next.model) : undefined;
+        // A model already on the task would be no stronger: e.g. the strongest model's advisor is itself.
+        if (!model || below.includes(key(model))) continue;
+      }
+      offered.push(next);
+    }
+    if (!offered.length) return undefined;
+    return subagentTool({ ...all, agents: offered }, { depth: depth + 1, chain: below, pool });
+  }
+}
+
+/** A model as the chain of models on a task tells them apart: the same model at another variant is another. */
+function key({ ref, variant }: Runner): string {
+  return JSON.stringify([ref, variant]);
 }
 
 /**
