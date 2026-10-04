@@ -8,7 +8,7 @@ export interface WebFetchParams {
   focus: string | undefined;
   /** Summarize the page with a model before returning it. */
   compact: boolean;
-  /** Model used for compaction. Defaults to the loop's model. */
+  /** Model id for compaction, on the loop's provider. Defaults to the loop's model's `compact` alias, else that model. */
   compactAgent: string | undefined;
   compactPrompt: string;
   /** Extra request fields for the compaction call. */
