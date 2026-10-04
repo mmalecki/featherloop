@@ -51,7 +51,7 @@ const argv = await yargs(hideBin(process.argv))
   .option('rerun-api-errors', {
     type: 'string',
     describe:
-      "A results directory: run again the runs in it that hit API errors (e.g. a proxy's timeout), replacing them, on its model, server and timeout",
+      "A results directory: run again the runs in it that hit API errors (e.g. a proxy's timeout), replacing them, and any an interrupted bench never started, on its model, server and timeout",
   })
   .strictOptions()
   .parseAsync();
@@ -183,7 +183,7 @@ process.on('SIGINT', () => {
 
 console.error(
   rerun
-    ? `Running again ${jobs.length} runs that hit API errors, ${argv.jobs} at a time → ${out}`
+    ? `Running ${jobs.length} runs that hit infrastructure errors or never ran, ${argv.jobs} at a time → ${out}`
     : `${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`,
 );
 let done = 0;
@@ -402,13 +402,22 @@ function rerunTargets(dir: string) {
       .map((line) => JSON.parse(line) as RequestRecord)
       .some((req) => req.status >= 500 || req.status === 429 || (req.status === 0 && req.error && !req.error.startsWith('aborted')));
   };
-  const failed = [...rows].filter(([, row]) => row.apiErrors > 0 && infrastructure(row));
+  const failed = [...rows].filter(([, row]) => row.apiErrors > 0 && infrastructure(row)).map(([key]) => key);
+  // An interrupted bench leaves runs it never started: every harness on every case, for every rep.
+  const missing: string[] = [];
+  for (let rep = 1; rep <= (meta.reps ?? 1); rep++) {
+    for (const id of meta.cases ?? []) for (const harness of Object.keys(meta.harnesses ?? {})) {
+      const key = `${harness}|${id}|${rep}`;
+      if (!rows.has(key)) missing.push(key);
+    }
+  }
+  const keys = [...failed, ...missing];
   return {
     dir,
     meta,
-    keys: new Set(failed.map(([key]) => key)),
-    cases: new Set(failed.map(([, row]) => row.case)),
-    harnesses: new Set(failed.map(([, row]) => row.harness)),
+    keys: new Set(keys),
+    cases: new Set(keys.map((key) => key.split('|')[1]!)),
+    harnesses: new Set(keys.map((key) => key.split('|')[0]!)),
   };
 }
 

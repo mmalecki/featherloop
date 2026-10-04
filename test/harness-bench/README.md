@@ -19,8 +19,10 @@ npm run bench:analyze -- test/harness-bench/results/<run>    # why runs failed, 
 npm run bench:analyze -- A=results/<before> B=results/<after> -H featherloop   # A/B
 ```
 
-`--rerun-api-errors` runs again, in place, the runs of a results directory that hit API
-errors (a server restart, a proxy timeout), on its model, server and timeout. The old
+`--rerun-api-errors` runs again, in place, the runs of a results directory that hit
+infrastructure errors (a server restart, a proxy timeout: 5xx, 429, a dropped connection),
+and any an interrupted bench never started, on its model, server and timeout. Other API
+errors, say a request over the context, are the harness's doing and stay results. The old
 run's directory is kept beside the new one as `<case>-r<rep>.replaced`, `meta.json` lists
 the reruns, and the report counts the latest run of each.
 
