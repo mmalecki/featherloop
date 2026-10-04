@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, fstatSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
+import { text } from 'node:stream/consumers';
 import { fileURLToPath } from 'node:url';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
@@ -36,7 +37,10 @@ import {
 
 const argv = await yargs(hideBin(process.argv))
   .scriptName('featherloop')
-  .usage('$0 [options] [prompt]\n\nChat with an agent in the terminal, or run one prompt and exit.')
+  .usage(
+    '$0 [options] [prompt]\n\nChat with an agent in the terminal, or run one prompt and exit.\n' +
+      'A prompt can also be piped on stdin; it goes after the argument prompt:\n  git diff | $0 "review this"',
+  )
   .option('model', {
     alias: 'm',
     type: 'string',
@@ -81,6 +85,14 @@ const argv = await yargs(hideBin(process.argv))
   .alias('v', 'version')
   .strictOptions()
   .parseAsync();
+
+// Read before the session is set up: piped input with no prompt in it is an error, not a REPL.
+const piped = stdinIsInput() ? (await text(process.stdin)).trimEnd() : undefined;
+const prompt = [argv._.join(' '), piped].filter(Boolean).join('\n\n');
+if (piped !== undefined && !prompt) {
+  console.error('No prompt: pass one as an argument or pipe it on stdin');
+  process.exit(1);
+}
 
 const { shell, subagent } = argv;
 const advisor = argv.advisor || argv.advisorModel !== undefined;
@@ -157,7 +169,7 @@ const ui = new SimpleUI(createLoop, {
   ...(loaded.length ? { notes: [`instructions: ${loaded.join(', ')}`] } : {}),
 });
 
-const prompt = argv._.join(' ');
+// Piped stdin always has a prompt by now: with no terminal to chat in, it never starts the REPL.
 if (prompt) await ui.ask(prompt);
 else await ui.start();
 // After /c, the UI's session is a newer one. One with only a system prompt (its first run failed) isn't worth it.
@@ -186,6 +198,21 @@ function onlyModel(): string {
       ? `Pick a model with --model, or set model in ${argv.config}. Configured: ${models.join(', ')}`
       : `No model: pass --model, or configure one in ${argv.config}`,
   );
+}
+
+/**
+ * Whether stdin is a pipe or a file, and so carries a prompt. Not just `!isTTY`:
+ * stdin may also be /dev/null or a socket (e.g. Node's default for child processes)
+ * that never closes, and waiting on it would hang `featherloop "prompt"`.
+ */
+function stdinIsInput(): boolean {
+  try {
+    const stat = fstatSync(0);
+    return stat.isFIFO() || stat.isFile();
+  } catch {
+    // stdin is closed.
+    return false;
+  }
 }
 
 /** Relative for the cwd's and its parents' files (e.g. `../AGENTS.md`), else from the home directory. */
