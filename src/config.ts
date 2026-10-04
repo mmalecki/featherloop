@@ -15,6 +15,7 @@ export interface Config {
   /**
    * Names for models, e.g. a role such as `advisor` that an agent asks for, which
    * the config then fills. Not in OpenCode. A string is short for `{ model }`.
+   * A model's own aliases come first (see `ModelConfig.aliases`).
    */
   aliases?: Record<string, string | AliasConfig>;
 }
@@ -56,6 +57,13 @@ export interface ModelConfig {
    * variant, e.g. `default: high`. Without it, requests carry only the model's limit.
    */
   variants?: Record<string, Record<string, unknown> | string>;
+  /**
+   * Aliases as this model sees them, before the config's: e.g. its own `advisor`,
+   * so that model's advisor can have a stronger one in turn, or a `compact` model
+   * to shrink its tool results. `null` leaves this model without the config's
+   * alias, e.g. no `advisor` for the strongest model. Not in OpenCode.
+   */
+  aliases?: Record<string, string | AliasConfig | null>;
 }
 
 /** The APIs featherloop speaks. */
@@ -121,7 +129,7 @@ export function checkConfig(value: unknown): Config {
     if (provider.models === undefined) throw new ConfigError(`${at}.models is missing`);
     for (const [name, model] of entries(provider.models, `${at}.models`)) {
       const path = `${at}.models.${name}`;
-      only(model, ['limit', 'variants'], path);
+      only(model, ['limit', 'variants', 'aliases'], path);
       if (model.limit !== undefined) {
         only(object(model.limit, `${path}.limit`), ['output'], `${path}.limit`);
         const output = model.limit.output;
@@ -146,28 +154,38 @@ export function checkConfig(value: unknown): Config {
       }
     }
   }
-  if (config.aliases !== undefined) {
-    for (const [name, value] of Object.entries(object(config.aliases, 'aliases'))) {
-      const at = `aliases.${name}`;
-      if (name.includes('/')) throw new ConfigError(`${at}: alias names can't contain "/", which marks provider/model`);
-      const alias = typeof value === 'string' ? { model: value } : object(value, at);
-      only(alias, ['model', 'variant'], at);
-      string(alias.model, `${at}.model`);
-      // The model must be configured: an alias can't name another alias, or a bare id.
-      const slash = alias.model.indexOf('/');
-      const provider = slash < 0 ? undefined : config.provider?.[alias.model.slice(0, slash)];
-      const model = provider && Object.hasOwn(provider.models, alias.model.slice(slash + 1)) ? provider.models[alias.model.slice(slash + 1)] : undefined;
-      if (!model) throw new ConfigError(`${at}.model names no configured model: ${alias.model}`);
-      if (alias.variant !== undefined) {
-        string(alias.variant, `${at}.variant`);
-        if (!Object.hasOwn(model.variants ?? {}, alias.variant)) throw new ConfigError(`${at}.variant: ${alias.model} has no variant ${alias.variant}`);
-      }
+  // Aliases name configured models, so they're checked once every provider is.
+  for (const [id, provider] of Object.entries((config.provider ?? {}) as Fields)) {
+    for (const [name, model] of Object.entries(provider.models as Fields)) {
+      if (model.aliases !== undefined) checkAliases(config, model.aliases, `provider.${id}.models.${name}.aliases`, true);
     }
   }
+  if (config.aliases !== undefined) checkAliases(config, config.aliases, 'aliases', false);
   return config as Config;
 }
 
 type Fields = Record<string, any>;
+
+/** Each alias must name a configured model, and a variant it has; a model's own may also be `null`. */
+function checkAliases(config: Fields, aliases: unknown, path: string, nullable: boolean): void {
+  for (const [name, value] of Object.entries(object(aliases, path))) {
+    const at = `${path}.${name}`;
+    if (name.includes('/')) throw new ConfigError(`${at}: alias names can't contain "/", which marks provider/model`);
+    if (value === null && nullable) continue;
+    const alias = typeof value === 'string' ? { model: value } : object(value, at);
+    only(alias, ['model', 'variant'], at);
+    string(alias.model, `${at}.model`);
+    // The model must be configured: an alias can't name another alias, or a bare id.
+    const slash = alias.model.indexOf('/');
+    const provider = slash < 0 ? undefined : config.provider?.[alias.model.slice(0, slash)];
+    const model = provider && Object.hasOwn(provider.models, alias.model.slice(slash + 1)) ? provider.models[alias.model.slice(slash + 1)] : undefined;
+    if (!model) throw new ConfigError(`${at}.model names no configured model: ${alias.model}`);
+    if (alias.variant !== undefined) {
+      string(alias.variant, `${at}.variant`);
+      if (!Object.hasOwn(model.variants ?? {}, alias.variant)) throw new ConfigError(`${at}.variant: ${alias.model} has no variant ${alias.variant}`);
+    }
+  }
+}
 
 /** Replaces `{env:NAME}` in every string value. */
 function substitute(value: unknown, env: NodeJS.ProcessEnv): unknown {
