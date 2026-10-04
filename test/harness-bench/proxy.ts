@@ -39,6 +39,11 @@ export interface ProxyOptions {
    * message anywhere but first; Claude Code sends one after the first user message.
    */
   foldSystemMessages?: boolean;
+  /**
+   * Caps the model's reasoning per response (`reasoning_budget_tokens`, which llama.cpp
+   * honours: thinking ends at the budget and the answer follows), whatever the harness asks.
+   */
+  reasoningBudget?: number;
 }
 
 /** Token counts for one request. `prompt` is all of it, cached or not: the context the model saw. */
@@ -98,6 +103,11 @@ export interface Meter {
   /** Includes `/v1`, as harness configs expect. */
   baseURL: string;
   records: RequestRecord[];
+  /**
+   * Output generated so far, live: finished requests' completion tokens, plus the
+   * streamed chunks of those in flight (a little under their tokens). For budgets.
+   */
+  generated(): number;
 }
 
 interface Sink {
@@ -109,6 +119,8 @@ interface Sink {
   seq: number;
   /** Responses still being proxied, to abort if the run ends first. */
   live: Set<() => void>;
+  /** Their records, to count their output as it streams. */
+  inflight: Set<RequestRecord>;
 }
 
 const PARAMS = [
@@ -161,9 +173,17 @@ export class MeteringProxy {
   /** Starts metering a run; `file` gets a line per request, `transcript` the last exchange. */
   open(run: string, file: string, transcript: string): Meter {
     if (!/^[\w.-]+$/.test(run)) throw new Error(`Bad run id: ${run}`);
-    const meter: Meter = { baseURL: `http://127.0.0.1:${this.#port}/${run}/v1`, records: [] };
+    const inflight = new Set<RequestRecord>();
+    const records: RequestRecord[] = [];
+    const meter: Meter = {
+      baseURL: `http://127.0.0.1:${this.#port}/${run}/v1`,
+      records,
+      generated: () =>
+        records.reduce((sum, record) => sum + (record.tokens?.completion ?? record.chunks), 0) +
+        [...inflight].reduce((sum, record) => sum + record.chunks, 0),
+    };
     writeFileSync(file, '');
-    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set() });
+    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set(), inflight });
     return meter;
   }
 
@@ -199,6 +219,10 @@ export class MeteringProxy {
     if (this.options.thinking === false && record.dialect !== 'other' && json !== undefined) {
       forced.chat_template_kwargs = { ...(json.chat_template_kwargs as Json | undefined), enable_thinking: false };
       record.overrides = ['enable_thinking=false'];
+    }
+    if (this.options.reasoningBudget !== undefined && record.dialect !== 'other' && json !== undefined) {
+      forced.reasoning_budget_tokens = this.options.reasoningBudget;
+      record.overrides = [...(record.overrides ?? []), `reasoning_budget_tokens=${this.options.reasoningBudget}`];
     }
     if (this.options.foldSystemMessages && record.dialect !== 'other' && Array.isArray(json?.messages)) {
       const folded = foldSystem(json.messages as Json[], record.dialect);
@@ -237,6 +261,7 @@ export class MeteringProxy {
       if (finished) return;
       finished = true;
       sink.live.delete(abort);
+      sink.inflight.delete(record);
       if (error) record.error = error;
       record.ms = Date.now() - record.start;
       response.end();
@@ -281,6 +306,7 @@ export class MeteringProxy {
       finish('aborted: run ended');
     };
     sink.live.add(abort);
+    sink.inflight.add(record);
     upstream.on('error', (err) => {
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
       else res.destroy();

@@ -15,8 +15,11 @@ export interface RunResult {
   lang: string;
   rep: number;
   started: string;
-  /** `pass` and `fail` by the tests; `timeout` and `crash` when the harness didn't exit cleanly, whatever the tests say. */
-  status: 'pass' | 'fail' | 'timeout' | 'crash';
+  /**
+   * `pass` and `fail` by the tests; `timeout`, `budget` (`--max-output` spent) and
+   * `crash` when the harness didn't exit cleanly, whatever the tests say.
+   */
+  status: 'pass' | 'fail' | 'timeout' | 'budget' | 'crash';
   /** The tests, as shipped, pass on what the agent left; graded even after a timeout or crash. */
   pass: boolean;
   tests: { passed: number; total: number };
@@ -102,6 +105,8 @@ export interface HarnessSummary {
   testsPassed: number;
   byLang: Record<string, { runs: number; passes: number }>;
   timeouts: number;
+  /** Runs ended for spending `--max-output`. */
+  budgets: number;
   crashes: number;
   wallSec: { median: number; mean: number; p90: number };
   /** Share of wall clock spent waiting on the model. */
@@ -182,6 +187,7 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     testsPassed: mean((run) => (run.tests.total ? run.tests.passed / run.tests.total : 0)),
     byLang,
     timeouts: runs.filter((run) => run.status === 'timeout').length,
+    budgets: runs.filter((run) => run.status === 'budget').length,
     crashes: runs.filter((run) => run.status === 'crash').length,
     wallSec: { median: quantile(wall, 0.5), mean: mean((run) => run.wallMs / 1000), p90: quantile(wall, 0.9) },
     llmShare: total((run) => run.llmMs) / total((run) => run.wallMs),
@@ -264,6 +270,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     ...langs.map((lang) => row(`↳ ${lang}`, (s) => (s.byLang[lang] ? `${s.byLang[lang].passes}/${s.byLang[lang].runs}` : '–'))),
     row('Tests passed (partial credit)', (s) => pct(s.testsPassed)),
     row('Timeouts / crashes', (s) => `${s.timeouts} / ${s.crashes}`),
+    ...(summaries.some((s) => s.budgets) ? [row('Out of output budget', (s) => String(s.budgets))] : []),
     row('Wall clock, median (p90)', (s) => `${s.wallSec.median.toFixed(0)}s (${s.wallSec.p90.toFixed(0)}s)`),
     row('Share waiting on the model', (s) => pct(s.llmShare)),
     row('Model requests / run', (s) => s.requests.toFixed(1)),
@@ -351,7 +358,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     '',
     '## By case',
     '',
-    'Passes out of reps; tests passed in brackets for runs that failed. ⏱ timed out, 💥 crashed (graded all the same).',
+    'Passes out of reps; tests passed in brackets for runs that failed. ⏱ timed out, 🪙 out of output budget, 💥 crashed (graded all the same).',
     '',
     `| case | ${columns.join(' | ')} |`,
     `|---|${columns.map(() => ':---:').join('|')}|`,
@@ -360,7 +367,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
         const runs = results.filter((result) => result.case === id && result.harness === harness);
         if (!runs.length) return '–';
         const passes = runs.filter((run) => run.pass).length;
-        const mark = (run: RunResult) => (run.status === 'timeout' ? '⏱' : run.status === 'crash' ? '💥' : '');
+        const mark = (run: RunResult) => (run.status === 'timeout' ? '⏱' : run.status === 'budget' ? '🪙' : run.status === 'crash' ? '💥' : '');
         const partial = runs.filter((run) => !run.pass).map((run) => `${run.tests.passed}/${run.tests.total}${mark(run)}`);
         // A pass that never stopped on its own still shows.
         const passed = runs.filter((run) => run.pass).map(mark).join('');

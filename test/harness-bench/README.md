@@ -9,6 +9,8 @@ npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each
 npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
+npm run bench -- --max-output 200000 --timeout 120 -j 8   # a budget of work, not wall clock
+npm run bench -- --reasoning-budget 4096 -j 4  # cap reasoning per response, for every harness
 npm run bench -- -m claude-haiku-4-5 --max-cost 20 -j 4   # a hosted model, with a spending limit
 npm run bench -- --advisor claude-sonnet-5-5 -H featherloop -H featherloop-advisor --max-cost 10   # with and without an advisor
 npm run bench -- --list                     # harnesses and cases
@@ -183,6 +185,20 @@ test on the cases both columns ran, the cases they split on, how much and how ea
 the model reasons, what it does right after failing tests, and the runaway responses
 themselves, with how much of their reasoning repeats. Given several directories, each
 harness gets a column per directory, labelled `<label>:<harness>`.
+
+## Budgets
+
+`--timeout` is wall clock, so what a run gets done before it depends on the hardware
+and the load: a faster GPU, or fewer runs at once, lets a runaway response generate
+more before it's cut off, and moves pass rates. `--max-output N` ends a run once it has
+generated N tokens instead (status `budget`, 🪙 in the report), counted as they stream:
+the same amount of work on any machine, and a faster one finishes sooner rather than
+spending the time on more of the same. Keep a generous `--timeout` as a safety net.
+
+`--reasoning-budget N` caps the model's reasoning per response, at the proxy, for every
+harness (`reasoning_budget_tokens`, which llama.cpp honours: thinking ends at the
+budget and the answer follows). llama.cpp ignores `reasoning_effort` for Qwen; this works.
+Both are recorded in `meta.json`, so reruns match.
 
 ## Caveats
 

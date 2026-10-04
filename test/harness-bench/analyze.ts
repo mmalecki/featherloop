@@ -303,6 +303,7 @@ function classify(run: Run): string {
   if (run.apiErrors || run.reqs.some(infrastructureError)) return 'API errors';
   if (run.pass) return run.status === 'timeout' ? 'passed, then timed out' : 'passed';
   const last = run.reqs.at(-1);
+  if (run.status === 'budget') return 'out of output budget';
   if (run.status === 'timeout') {
     if (last && abortedByBench(last) && (last.ms > RUNAWAY_MS || last.reasoningChars > RUNAWAY_CHARS)) return 'timeout: runaway response';
     if (run.wallMs && run.llmMs / run.wallMs < 0.5) return 'timeout: mostly in tools';

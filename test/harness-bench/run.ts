@@ -43,6 +43,14 @@ const argv = await yargs(hideBin(process.argv))
     type: 'number',
     describe: "Dollars: start no more runs once the runs so far cost this much (priced models only; runs in flight finish)",
   })
+  .option('max-output', {
+    type: 'number',
+    describe: 'Tokens a run may generate before it is ended, its harness killed as at the timeout: a budget of work, the same on any hardware (keep --timeout as a safety net)',
+  })
+  .option('reasoning-budget', {
+    type: 'number',
+    describe: "Caps the model's reasoning per response, for every harness, at the proxy (reasoning_budget_tokens; llama.cpp)",
+  })
   .option('thinking', {
     type: 'boolean',
     default: true,
@@ -64,7 +72,13 @@ const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
 // Reruns as the run they replace; results from before settings ran nanocode as shipped.
 const settings: Settings = rerun
   ? (rerun.meta.settings ?? {})
-  : { nanocodeMaxTokens: model.limit.output, ...(argv.thinking ? {} : { thinking: false }), ...(argv.advisor ? { advisor: argv.advisor } : {}) };
+  : {
+      nanocodeMaxTokens: model.limit.output,
+      ...(argv.thinking ? {} : { thinking: false }),
+      ...(argv.advisor ? { advisor: argv.advisor } : {}),
+      ...(argv.maxOutput ? { maxOutput: argv.maxOutput } : {}),
+      ...(argv.reasoningBudget ? { reasoningBudget: argv.reasoningBudget } : {}),
+    };
 const advisorModel = settings.advisor === undefined ? undefined : MODELS[settings.advisor];
 if (settings.advisor !== undefined && !advisorModel) throw new Error(`No model ${settings.advisor} in models.json`);
 const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
@@ -135,6 +149,9 @@ writeFileSync(
 if (settings.thinking === false && model.flavor !== 'openai') {
   throw new Error(`--no-thinking sets llama.cpp's chat template; ${model.id} speaks ${model.flavor}`);
 }
+if (settings.reasoningBudget !== undefined && model.flavor !== 'openai') {
+  throw new Error(`--reasoning-budget is llama.cpp's; ${model.id} speaks ${model.flavor}`);
+}
 // A hosted API's key stays here: the proxy adds it upstream, harnesses get none.
 const keyFor = (m: typeof model) => {
   if (m.flavor !== 'anthropic') return undefined;
@@ -147,6 +164,7 @@ const proxy = await MeteringProxy.start(upstream, {
   ...(apiKey ? { apiKey } : {}),
   // llama.cpp's chat templates take one system message, first.
   ...(model.flavor === 'openai' ? { foldSystemMessages: true } : {}),
+  ...(settings.reasoningBudget !== undefined ? { reasoningBudget: settings.reasoningBudget } : {}),
 });
 // The advisor's own proxy: its calls are metered apart from the model's.
 const advisorKey = advisorModel && keyFor(advisorModel);
@@ -234,13 +252,26 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   const invocation = harness.setup(ctx);
   const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
   const started = new Date();
+  // A budget of output, checked as it streams: past it, the run ends as at the timeout.
+  let overBudget = false;
+  let budgetCheck: NodeJS.Timeout | undefined;
   const result = await run(invocation.command, invocation.args, {
     cwd: workspace,
     env,
     timeoutMs: timeout * 60_000,
     log: { stdout: join(dir, 'stdout.log'), stderr: join(dir, 'stderr.log') },
-    onSpawn: (pid) => live.add(pid),
+    onSpawn: (pid) => {
+      live.add(pid);
+      if (settings.maxOutput === undefined) return;
+      budgetCheck = setInterval(() => {
+        if (meter.generated() < settings.maxOutput!) return;
+        overBudget = true;
+        clearInterval(budgetCheck);
+        killGroup(pid);
+      }, 1000);
+    },
   });
+  clearInterval(budgetCheck);
   if (result.pid !== undefined) live.delete(result.pid);
   proxy.close(id);
   advisorProxy?.close(`${id}.advisor`);
@@ -294,7 +325,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     lang: c.lang,
     rep,
     started: started.toISOString(),
-    status: result.timedOut ? 'timeout' : result.exitCode !== 0 ? 'crash' : graded.pass ? 'pass' : 'fail',
+    status: overBudget ? 'budget' : result.timedOut ? 'timeout' : result.exitCode !== 0 ? 'crash' : graded.pass ? 'pass' : 'fail',
     pass: graded.pass,
     tests: { passed: graded.passed, total: graded.total },
     exitCode: result.exitCode,

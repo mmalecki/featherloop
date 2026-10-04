@@ -56,6 +56,10 @@ export interface Settings {
   thinking?: boolean;
   /** A model from models.json that `featherloop-advisor` asks for second opinions. */
   advisor?: string;
+  /** Tokens a run may generate before the bench ends it: work, not wall clock, so results don't depend on the hardware. */
+  maxOutput?: number;
+  /** Reasoning tokens per response, set at the proxy for every harness (llama.cpp only). */
+  reasoningBudget?: number;
 }
 
 export interface Invocation {
