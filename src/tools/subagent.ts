@@ -1,6 +1,7 @@
 import type { Agent, PermissionRule } from '../agent.ts';
 import { Loop, type LoopOptions } from '../loop.ts';
-import type { Message } from '../provider.ts';
+import type { Submodel } from '../models.ts';
+import type { Message, Provider } from '../provider.ts';
 import { defineTool, ToolInputError, type Tool, type ToolOptions, type Toolset } from '../tool.ts';
 
 export interface SubagentParams {
@@ -34,13 +35,16 @@ export interface SubagentToolOptions extends ToolOptions<SubagentParams> {
   loop?: LoopOptions;
 }
 
+/** The model a subagent runs on. */
+type Runner = { api: Provider; model: string; submodel?: Submodel | undefined };
+
 /** A transcript's tool results are cut to this; the subagent can re-read files itself. */
 const TRANSCRIPT_RESULT_CHARS = 2_000;
 
 /**
  * Hands a task to another agent, which runs its own loop and returns its final
- * reply. An agent with a `model` runs on it, set up through `ToolContext.models`;
- * others run on the caller's model. Calls in the same turn run in parallel. The
+ * reply. An agent with a `model` runs on it, as the caller's model refers to it
+ * (`ToolContext.submodel`); others run on the caller's model. Calls in the same turn run in parallel. The
  * subagent's token use counts as this tool's.
  */
 export function SubagentTool({ agents, tools, permissions = [], instructions, loop: loopOptions, ...options }: SubagentToolOptions): Tool {
@@ -89,16 +93,18 @@ export function SubagentTool({ agents, tools, permissions = [], instructions, lo
       },
     },
 
-    async invoke({ agent: name, input, transcript, cwd, maxLength }, { api, model, signal, messages, relay, models }) {
+    async invoke({ agent: name, input, transcript, cwd, maxLength }, { api, model, signal, messages, relay, submodel }) {
       const agent = byName.get(name);
       if (!agent) throw new ToolInputError(`Unknown agent "${name}"; agents: ${[...byName.keys()].join(', ')}`);
       if (typeof input !== 'string' || !input.trim()) throw new ToolInputError('input must be a non-empty task');
       if (transcript && !messages) throw new ToolInputError('There is no conversation to pass on');
 
-      let runner = { api, model };
+      let runner: Runner = { api, model, submodel };
       if (agent.model) {
-        if (!models) throw new Error(`Agent ${agent.name} runs on ${agent.model}, but this loop can't set up other models`);
-        runner = await models(agent.model);
+        if (!submodel) throw new Error(`Agent ${agent.name} runs on ${agent.model}, but this loop can't set up other models`);
+        const resolved = await submodel(agent.model);
+        if (!resolved) throw new Error(`Agent ${agent.name} runs on ${agent.model}, which this model has none of`);
+        runner = resolved;
       }
 
       const dir = cwd ?? process.cwd();
@@ -112,7 +118,8 @@ export function SubagentTool({ agents, tools, permissions = [], instructions, lo
       const { subagent: _, ...available } = tools();
       const toolset = agent.toolset(available, permissions);
       const task = transcript ? `${render(messages!)}\n\n<task>\n${input}\n</task>` : input;
-      const loop = Loop(runner.api, toolset, { ...loopOptions, ...(models ? { models } : {}) });
+      // The subagent's tools set up models as its own model refers to them.
+      const loop = Loop(runner.api, toolset, { ...loopOptions, ...(runner.submodel ? { submodel: runner.submodel } : {}) });
       relay?.(loop);
       const { message } = await loop.run({
         model: runner.model,

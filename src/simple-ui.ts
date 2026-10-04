@@ -10,8 +10,8 @@ type Style = Parameters<typeof styleText>[0];
 /** Builds a fresh agent, e.g. so `/c` also resets tool state. */
 export type AgentFactory = () => AgentLoop;
 
-/** The model runs use; without `api`, the loop's own provider runs it. */
-type CurrentModel = Pick<ResolvedModel, 'ref' | 'alias' | 'model' | 'variant'> & { api?: Provider };
+/** The model runs use; without `api` and `submodel`, the loop's own. */
+type CurrentModel = Pick<ResolvedModel, 'ref' | 'alias' | 'model' | 'variant' | 'submodel'> & { api?: Provider };
 
 export interface SimpleUIOptions {
   /**
@@ -239,6 +239,7 @@ export class SimpleUI {
       const { messages } = await this.#loop.run({
         model: this.model,
         ...(this.#model.api ? { api: this.#model.api } : {}),
+        ...(this.#model.submodel ? { submodel: this.#model.submodel } : {}),
         input,
         signal: abort.signal,
         ...(this.options.request ? { request: this.options.request } : {}),

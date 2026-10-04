@@ -203,13 +203,13 @@ test('runs an agent with its own model on it, counting its usage as the tool\'s'
   const advisor = defineAgent({ name: 'advisor', system: ({ model }) => `You advise, as ${model}.`, model: 'advisor' });
   const strong = fakeProvider(() => say('looks fine'));
   const resolved: string[] = [];
-  const models = async (ref: string) => {
+  const submodel = async (ref: string) => {
     resolved.push(ref);
     return { ref: 'big/claude', alias: ref, api: strong, model: 'claude' };
   };
   const parent = fakeProvider((request) => (request.messages.length === 2 ? call('subagent', { input: 'Check.' }) : say('done')));
   const events: { source: string; tool?: string | undefined; model: string }[] = [];
-  const loop = Loop(parent, { subagent: SubagentTool({ agents: [advisor], tools: () => ({}) }) }, { models });
+  const loop = Loop(parent, { subagent: SubagentTool({ agents: [advisor], tools: () => ({}) }) }, { submodel });
   loop.on('usage', ({ source, tool, model }) => events.push({ source, tool, model }));
   const result = await loop.run({
     model: 'small',
@@ -230,6 +230,20 @@ test('runs an agent with its own model on it, counting its usage as the tool\'s'
     { source: 'turn', tool: undefined, model: 'small' },
   ]);
   assert.deepEqual(result.usage, { input: 30, output: 3, cacheRead: 0, cacheWrite: 0 });
+});
+
+test("an agent with its own model fails when the caller's model has none", async () => {
+  const advisor = defineAgent({ name: 'advisor', system: 'You advise.', model: 'advisor' });
+  const parent = fakeProvider((request) => (request.messages.length === 2 ? call('subagent', { input: 'Check.' }) : say('done')));
+  const loop = Loop(parent, { subagent: SubagentTool({ agents: [advisor], tools: () => ({}) }) }, { submodel: async () => undefined });
+  const result = await loop.run({
+    model: 'big',
+    input: [
+      { role: 'system', content: 'You lead.' },
+      { role: 'user', content: 'Fix it.' },
+    ],
+  });
+  assert.match(String(result.messages.find((m) => m.role === 'tool')?.content), /Agent advisor runs on advisor, which this model has none of/);
 });
 
 test('an agent with its own model needs a loop that can set it up', async () => {

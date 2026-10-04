@@ -11,7 +11,7 @@ import {
   type ToolSpec,
   type Usage,
 } from './provider.ts';
-import type { ModelResolver } from './models.ts';
+import type { Submodel } from './models.ts';
 import { toProvider, type ApiClient } from './providers/index.ts';
 import { ToolInputError, type Tool, type Toolset } from './tool.ts';
 
@@ -35,8 +35,11 @@ export interface LoopOptions {
   endCriteria?: EndCriteria;
   /** Run every tool call in the model's order, one at a time. Off by default. */
   sequentialTools?: boolean;
-  /** Lets tools run other models (`ToolContext.models`), e.g. a subagent's own. */
-  models?: ModelResolver;
+  /**
+   * Lets tools set up other models as the loop's model refers to them
+   * (`ToolContext.submodel`), e.g. a subagent's own: the model's `submodel`.
+   */
+  submodel?: Submodel;
 }
 
 export interface RunOptions {
@@ -52,6 +55,8 @@ export interface RunOptions {
   request?: Record<string, unknown>;
   /** Provider for this run instead of the constructor's, e.g. after switching to another provider's model. */
   api?: ApiClient;
+  /** For this run instead of the constructor's, e.g. the `submodel` of the model switched to. */
+  submodel?: Submodel;
 }
 
 export interface RunResult {
@@ -113,7 +118,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   readonly toolset: Toolset;
   readonly endCriteria: EndCriteria;
   readonly sequentialTools: boolean;
-  readonly models: ModelResolver | undefined;
+  readonly submodel: Submodel | undefined;
   #pending: Message[] = [];
   #running = false;
 
@@ -123,7 +128,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     this.toolset = toolset;
     this.endCriteria = options.endCriteria ?? noToolCalls;
     this.sequentialTools = options.sequentialTools ?? false;
-    this.models = options.models;
+    this.submodel = options.submodel;
   }
 
   get running(): boolean {
@@ -149,7 +154,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     }
   }
 
-  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, reasoning, request, api: client }: RunOptions): Promise<RunResult> {
+  async #run({ model, input, toolset = this.toolset, endCriteria = this.endCriteria, signal, reasoning, request, api: client, submodel = this.submodel }: RunOptions): Promise<RunResult> {
     const api = client ? toProvider(client) : this.api;
     const messages: Message[] = [...input];
     const tools = toolSpecs(toolset);
@@ -185,7 +190,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         const skip = message.stop === 'refusal' || message.stop === 'max_tokens' ? message.stop : undefined;
         const results = skip
           ? message.tool_calls.map((call) => this.#skip(call, skip))
-          : await this.#invokeAll(message.tool_calls, byName, { api, model, signal, track, messages });
+          : await this.#invokeAll(message.tool_calls, byName, { api, model, submodel, signal, track, messages });
         for (const result of results) {
           messages.push(result);
           this.emit('message', result);
@@ -231,7 +236,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   async #invoke(
     call: ChatCompletionMessageFunctionToolCall,
     toolset: ReadonlyMap<string, Tool>,
-    { api, model, signal, track, messages }: InvokeContext,
+    { api, model, submodel, signal, track, messages }: InvokeContext,
   ): Promise<ToolMessage> {
     const { id } = call;
     const { name, arguments: raw } = call.function;
@@ -250,7 +255,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         signal,
         messages,
         relay: this.#relay(id),
-        ...(this.models ? { models: attributedModels(this.models, name, track) } : {}),
+        ...(submodel ? { submodel: attributedSubmodel(submodel, name, track) } : {}),
       });
     } catch (err) {
       if (signal?.aborted) throw err;
@@ -295,6 +300,7 @@ export function Loop(api: ApiClient, toolset: Toolset = {}, options: LoopOptions
 interface InvokeContext {
   api: Provider;
   model: string;
+  submodel: Submodel | undefined;
   signal: AbortSignal | undefined;
   track: Track;
   /** Tool results are added only after the whole turn's calls finish, so this doesn't change during them. */
@@ -326,11 +332,16 @@ function attributed(api: Provider, tool: string, track: Track): Provider {
   };
 }
 
-/** Models a tool sets up, with their usage reported as the tool's too. */
-function attributedModels(models: ModelResolver, tool: string, track: Track): ModelResolver {
+/** Models a tool sets up, with their usage reported as the tool's too; so are their own submodels', e.g. a subagent's subagent's. */
+function attributedSubmodel(submodel: Submodel, tool: string, track: Track): Submodel {
   return async (ref, variant) => {
-    const resolved = await models(ref, variant);
-    return { ...resolved, api: attributed(resolved.api, tool, track) };
+    const resolved = await submodel(ref, variant);
+    if (!resolved) return undefined;
+    return {
+      ...resolved,
+      api: attributed(resolved.api, tool, track),
+      ...(resolved.submodel ? { submodel: attributedSubmodel(resolved.submodel, tool, track) } : {}),
+    };
   };
 }
 
