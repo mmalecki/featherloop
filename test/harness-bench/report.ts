@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import type { Fetch } from './transcript.ts';
 import { join, resolve } from 'node:path';
 
 /**
@@ -54,6 +55,8 @@ export interface RunResult {
   tampered: string[];
   /** The conversation mentions the bench's cache, which holds the reference solutions: treat a pass with suspicion. */
   sawCache: boolean;
+  /** Calls that reached for the web: fetch and search tools, and URLs in shell commands. Absent from older results. */
+  fetches?: Fetch[];
   /** Distinct sampling settings the harness sent, the output limit apart. */
   params: Record<string, unknown>[];
   /** The largest output limit it asked for; none means the server's. */
@@ -106,6 +109,10 @@ export interface HarnessSummary {
   apiErrors: number;
   tamperedRuns: number;
   sawCacheRuns: number;
+  /** Per run; null when the results predate tracking. */
+  fetches: number | null;
+  solutionFetches: string[];
+  hosts: Record<string, number>;
   linesChanged: number;
   params: Record<string, unknown>[];
   maxOutput: number | null;
@@ -181,6 +188,12 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     apiErrors: total((run) => run.apiErrors),
     tamperedRuns: runs.filter((run) => run.tampered.length).length,
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
+    fetches: runs.some((run) => run.fetches) ? mean((run) => run.fetches?.length ?? 0) : null,
+    solutionFetches: runs.flatMap((run) => (run.fetches ?? []).filter((fetch) => fetch.solutionSource).map((fetch) => `${run.case}: ${fetch.target}`)),
+    hosts: runs.reduce<Record<string, number>>((hosts, run) => {
+      for (const fetch of run.fetches ?? []) hosts[fetch.host ?? 'search'] = (hosts[fetch.host ?? 'search'] ?? 0) + 1;
+      return hosts;
+    }, {}),
     linesChanged: mean((run) => run.linesAdded + run.linesRemoved),
     params: [...new Set(runs.flatMap((run) => run.params.map((params) => JSON.stringify(params))))].map((text) => JSON.parse(text)),
     maxOutput: runs.some((run) => run.maxOutput !== null) ? Math.max(...runs.map((run) => run.maxOutput ?? 0)) : null,
@@ -243,6 +256,8 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('API errors', (s) => String(s.apiErrors)),
     row('Runs that changed the tests', (s) => String(s.tamperedRuns)),
     row('Runs that reached the bench cache', (s) => String(s.sawCacheRuns)),
+    row('Web fetches / run', (s) => (s.fetches === null ? '–' : s.fetches.toFixed(2))),
+    row('Fetches from solution sources', (s) => (s.fetches === null ? '–' : String(s.solutionFetches.length))),
     row('Lines changed / run', (s) => s.linesChanged.toFixed(0)),
     '',
     '## Tools called, per run',
@@ -255,6 +270,20 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
             .map(([name, count]) => `${name} ${count.toFixed(1)}`)
             .join(', ') || 'none'
         }`,
+    ),
+    '',
+    '## Hosts fetched',
+    '',
+    ...summaries.map(
+      (s) =>
+        `- **${s.harness}**: ${
+          s.fetches === null
+            ? 'not tracked'
+            : Object.entries(s.hosts)
+                .sort(([, a], [, b]) => b - a)
+                .map(([host, n]) => `${host} ${n}`)
+                .join(', ') || 'none'
+        }${s.solutionFetches.length ? `. From solution sources: ${s.solutionFetches.join('; ')}` : ''}`,
     ),
     '',
     '## Sampling settings sent',

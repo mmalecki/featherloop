@@ -5,6 +5,7 @@ import { hideBin } from 'yargs/helpers';
 import { HARNESSES } from './harnesses.ts';
 import type { RequestRecord } from './proxy.ts';
 import type { RunResult } from './report.ts';
+import { lastReasoning, readTranscript, toolResults as transcriptResults, webFetches } from './transcript.ts';
 
 /**
  * Why runs failed, and how harnesses differ where they disagree: failure modes,
@@ -14,12 +15,18 @@ import type { RunResult } from './report.ts';
  *
  *   node test/harness-bench/analyze.ts results/<run>
  *   node test/harness-bench/analyze.ts A=results/<before> B=results/<after> -H featherloop
+ *   node test/harness-bench/analyze.ts results/<run> --failed-cases -H featherloop -H opencode-stock
  */
 
 const argv = await yargs(hideBin(process.argv))
   .usage('$0 [label=]dir...\n\nAnalyze bench results: failure modes, paired comparisons, reasoning, runaway responses.')
   .option('harness', { alias: 'H', type: 'array', string: true, describe: 'Only these harnesses' })
   .option('runaways', { type: 'boolean', default: true, describe: 'List the runaway responses (--no-runaways to skip)' })
+  .option('failed-cases', {
+    type: 'boolean',
+    default: false,
+    describe: 'Only print the cases any of the (chosen) harnesses failed, one per line: a hard set to run again',
+  })
   .demandCommand(1)
   .strictOptions()
   .parseAsync();
@@ -43,7 +50,6 @@ interface Run extends RunResult {
   reqs: RequestRecord[];
 }
 
-type Json = Record<string, any>;
 
 const sources = argv._.map(String).map((arg) => {
   const eq = arg.indexOf('=');
@@ -55,6 +61,13 @@ const runs = sources.flatMap(({ label, dir }, i) => load(dir, sources.length > 1
 const order = (run: Run) => HARNESSES.findIndex((harness) => harness.name === run.harness);
 const columns = [...new Set([...runs].sort((a, b) => a.label - b.label || order(a) - order(b)).map((run) => run.column))];
 const out: string[] = [];
+
+if (argv.failedCases) {
+  // API-error runs don't count: they failed for the server, not the harness.
+  const failed = new Set(runs.filter((run) => !run.apiErrors && !run.pass).map((run) => run.case));
+  console.log([...failed].join('\n'));
+  process.exit(0);
+}
 
 section('Failure modes', 'Runs by how they ended. API-error runs are left out of everything below; rerun them first.');
 const modes = new Map<string, Map<string, number>>();
@@ -183,6 +196,28 @@ table(
   }),
 );
 
+section(
+  'Web use',
+  'Fetches and searches, and URLs in shell commands. Solution sources are hosts where solutions to the cases are published: check what was fetched.',
+);
+table(
+  ['', 'fetches / run', 'runs with any', 'hosts', 'from solution sources'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column);
+    const fetches = own.map((run) => ({ run, fetches: webFetches(readTranscript(run.dir)) }));
+    const hosts = new Map<string, number>();
+    for (const { fetches: list } of fetches) for (const fetch of list) hosts.set(fetch.host ?? `search: ${fetch.target}`, (hosts.get(fetch.host ?? `search: ${fetch.target}`) ?? 0) + 1);
+    const suspicious = fetches.flatMap(({ run, fetches: list }) => list.filter((fetch) => fetch.solutionSource).map((fetch) => `${run.case}: ${fetch.target}`));
+    return [
+      column,
+      (fetches.reduce((n, { fetches: list }) => n + list.length, 0) / (own.length || 1)).toFixed(2),
+      String(fetches.filter(({ fetches: list }) => list.length).length),
+      [...hosts].sort(([, a], [, b]) => b - a).map(([host, n]) => `${host} ${n}`).join(', ') || '–',
+      suspicious.join('<br>') || '–',
+    ];
+  }),
+);
+
 if (argv.runaways) {
   section(
     'Runaway responses',
@@ -194,7 +229,7 @@ if (argv.runaways) {
       .filter((run) => classify(run) === 'timeout: runaway response')
       .map((run) => {
         const last = run.reqs.at(-1)!;
-        const reasoning = lastReasoning(run);
+        const reasoning = lastReasoning(readTranscript(run.dir));
         const previous = toolResults(run).at(-1);
         const after = previous === undefined ? 'the task' : TEST_FAILED.test(previous) ? 'failing tests' : TEST_RESULT.test(previous) ? 'passing tests' : 'another tool result';
         return [run.column, run.case, String(run.reqs.length), (last.ms / 60_000).toFixed(0), fmt(reasoning.length), pct(repetition(reasoning)), after];
@@ -235,31 +270,8 @@ function classify(run: Run): string {
   return 'stopped: tests failing';
 }
 
-function transcript(run: Run): Json | undefined {
-  const file = join(run.dir, 'transcript.json');
-  return existsSync(file) ? (JSON.parse(readFileSync(file, 'utf8')) as Json) : undefined;
-}
-
-/** Tool results in conversation order, from the last request: OpenAI tool messages, or Anthropic tool_result blocks. */
 function toolResults(run: Run): string[] {
-  const text = (content: unknown) => (typeof content === 'string' ? content : JSON.stringify(content ?? ''));
-  return (transcript(run)?.request?.messages ?? []).flatMap((message: Json) => {
-    if (message.role === 'tool') return [text(message.content)];
-    if (message.role === 'user' && Array.isArray(message.content)) {
-      return message.content.filter((block: Json) => block.type === 'tool_result').map((block: Json) => text(block.content));
-    }
-    return [];
-  });
-}
-
-/** The reasoning of the last response, as the proxy assembled it. */
-function lastReasoning(run: Run): string {
-  const response = transcript(run)?.response ?? {};
-  if (typeof response.reasoning === 'string') return response.reasoning;
-  const message = response.choices?.[0]?.message;
-  if (typeof message?.reasoning_content === 'string') return message.reasoning_content;
-  if (Array.isArray(response.content)) return response.content.filter((block: Json) => block.type === 'thinking').map((block: Json) => block.thinking).join('\n');
-  return '';
+  return transcriptResults(readTranscript(run.dir));
 }
 
 function repetition(text: string): number {

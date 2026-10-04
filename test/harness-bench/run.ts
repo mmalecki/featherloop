@@ -7,6 +7,7 @@ import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
 import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
 import { MeteringProxy } from './proxy.ts';
+import { readTranscript, webFetches } from './transcript.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
 const argv = await yargs(hideBin(process.argv))
@@ -245,6 +246,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     filesChanged: changed.files.map((file) => file.path),
     tampered: changed.tampered,
     sawCache: sawCache(dir),
+    fetches: webFetches(readTranscript(dir)),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
     ...(rerun ? { rerun: true } : {}),
