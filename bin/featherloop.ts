@@ -32,6 +32,7 @@ import {
   type Config,
   type ResolvedModel,
   sessionsDir,
+  type Submodel,
   type Toolset,
 } from '../src/index.ts';
 
@@ -101,7 +102,7 @@ const resumed = argv.resume === undefined ? undefined : await exitOnUserError(()
 // A resumed session stays on its model and variant, unless the flags pick them.
 const ref = await exitOnUserError(() => argv.model ?? resumed?.model?.ref ?? process.env.MODEL ?? registry.default ?? onlyModel());
 const variant = argv.model === undefined && argv.variant === undefined ? resumed?.model?.variant : argv.variant;
-const initial = await exitOnUserError(() => resolveModel(ref, variant));
+const initial = await exitOnUserError(() => userModel(ref, variant));
 const model = sessionModel(ref, variant);
 const session = resumed ?? Session.create({ model });
 // Flags switched a resumed session's model: the next resume should stay on it.
@@ -109,11 +110,11 @@ if (resumed && (argv.model !== undefined || argv.variant !== undefined)) resumed
 if (session.cwd !== process.cwd()) console.error(`Note: the session started in ${session.cwd}; tools now run in ${process.cwd()}`);
 if (advisor) {
   // Set it up now, so a missing alias or SDK shows before the session, not on the first call.
-  await exitOnUserError(() => {
-    if (argv.advisorModel === undefined && !registry.knows(advisorAgent.model!)) {
-      throw new ConfigError(`--advisor needs an alias "${advisorAgent.model}" in ${argv.config}, or --advisor-model`);
+  // Only for this model, though: one switched to with /model may have no advisor.
+  await exitOnUserError(async () => {
+    if (!(await initial.submodel!(advisorAgent.model!))) {
+      throw new ConfigError(`--advisor: ${ref} has no "${advisorAgent.model}" alias (or sets it to null) in ${argv.config}; set one, or pass --advisor-model`);
     }
-    return resolveModel(advisorAgent.model!, undefined);
   });
 }
 
@@ -143,7 +144,7 @@ const createLoop = () => {
   const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
   if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools, instructions });
   // The UI passes each run the current model's provider; this one is only the default.
-  return Loop(initial.api, generalAgent.toolset(available), { models: resolveModel });
+  return Loop(initial.api, generalAgent.toolset(available), { submodel: initial.submodel! });
 };
 
 // Read for each new conversation (`/c`) and subagent task, so edits apply from then on. The startup
@@ -157,7 +158,7 @@ let first = true;
 
 const ui = new SimpleUI(createLoop, {
   model: initial,
-  resolveModel,
+  resolveModel: userModel,
   session,
   // A resumed session keeps the system prompt it was saved with; `/c` builds a new one.
   system: () => {
@@ -176,17 +177,32 @@ else await ui.start();
 if (ui.session?.messages.some((message) => message.role !== 'system')) console.error(`Resume with: featherloop --resume ${ui.session.id}`);
 
 /**
- * A model or alias from the config, or a bare model id run where --flavor and
- * --base-url say. For the initial model, `/model` and agents' own models; a model
- * given to --advisor-model stands in for the advisor alias.
+ * The user's model, for the session and `/model`: as `resolveModel()` sets it up,
+ * but with the model given to --advisor-model as its advisor. Only its own: the
+ * advisor's advisor, if any, is the config's.
  */
-async function resolveModel(ref: string, variant?: string): Promise<ResolvedModel> {
-  if (ref === advisorAgent.model && argv.advisorModel) ref = argv.advisorModel;
-  if (registry.knows(ref)) return registry.resolve(ref, { variant });
+async function userModel(ref: string, variant?: string): Promise<ResolvedModel & { submodel: Submodel }> {
+  const resolved = await resolveModel(ref, variant);
+  const { advisorModel } = argv;
+  if (advisorModel === undefined) return resolved;
+  return { ...resolved, submodel: (name, variant) => (name === advisorAgent.model ? resolveModel(advisorModel, variant) : resolved.submodel(name, variant)) };
+}
+
+/**
+ * A model or alias from the config, or a bare model id run where --flavor and
+ * --base-url say. Its submodels, e.g. its advisor, are as the config has them.
+ */
+async function resolveModel(ref: string, variant?: string): Promise<ResolvedModel & { submodel: Submodel }> {
+  if (registry.knows(ref)) {
+    const resolved = await registry.resolve(ref, { variant });
+    return { ...resolved, submodel: resolved.submodel! };
+  }
   const { flavor } = argv;
   const baseURL = argv.baseUrl ?? (flavor === 'openai' ? (process.env.OPENAI_BASE_URL ?? 'http://127.0.0.1:9931/v1') : undefined);
   const flags: Config = { provider: { [flavor]: { flavor, ...(baseURL ? { options: { baseURL } } : {}), models: { [ref]: {} } } } };
-  return new ModelRegistry(flags).resolve(`${flavor}/${ref}`, { variant });
+  const resolved = await new ModelRegistry(flags).resolve(`${flavor}/${ref}`, { variant });
+  // A bare id has no aliases of its own, but the config's still apply.
+  return { ...resolved, submodel: (name, variant) => registry.submodel(name, { variant }) };
 }
 
 /** With no model named anywhere, the config's only model; with none or several, the user picks. */
