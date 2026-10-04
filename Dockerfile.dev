@@ -1,0 +1,23 @@
+# For a llama.cpp server on the host, add
+#   --add-host=host.docker.internal:host-gateway --base-url http://host.docker.internal:9931/v1
+
+# Build the package tarball, exactly as `npm publish` would ship it.
+FROM all-agents AS build
+RUN mkdir -p /home/work/src/featherloop
+WORKDIR /home/work/src/featherloop
+COPY --chown=work:work package.json package-lock.json ./
+RUN npm ci
+COPY --chown=work:work tsconfig.json tsconfig.build.json ./
+COPY --chown=work:work src ./src
+COPY --chown=work:work bin ./bin
+# `prepack` runs the build.
+RUN npm pack --pack-destination /tmp && mv /tmp/featherloop-*.tgz /tmp/featherloop.tgz
+
+RUN mkdir -p /home/work/
+WORKDIR /home/work/
+
+RUN npm install -g /tmp/featherloop.tgz @anthropic-ai/sdk@^0.131.0 \
+ && rm -rf /tmp/featherloop.tgz /home/work/src/featherloop
+
+ENV NODE_USE_ENV_PROXY=1
+ENTRYPOINT ["featherloop"]
