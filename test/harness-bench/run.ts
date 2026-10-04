@@ -32,6 +32,11 @@ const argv = await yargs(hideBin(process.argv))
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
+  .option('thinking', {
+    type: 'boolean',
+    default: true,
+    describe: "--no-thinking turns the model's thinking off for every harness, at the proxy (enable_thinking: false)",
+  })
   .option('rerun-api-errors', {
     type: 'string',
     describe:
@@ -46,7 +51,9 @@ const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
 const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? (rerun ? rerun.meta.upstream : model.upstream);
 const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
 // Reruns as the run they replace; results from before settings ran nanocode as shipped.
-const settings: Settings = rerun ? (rerun.meta.settings ?? {}) : { nanocodeMaxTokens: model.limit.output };
+const settings: Settings = rerun
+  ? (rerun.meta.settings ?? {})
+  : { nanocodeMaxTokens: model.limit.output, ...(argv.thinking ? {} : { thinking: false }) };
 const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
 const harnesses = HARNESSES.filter(
   (harness) => (!argv.harness?.length || argv.harness.includes(harness.name)) && (!rerun || rerun.harnesses.has(harness.name)),
@@ -103,7 +110,7 @@ writeFileSync(
   )}\n`,
 );
 
-const proxy = await MeteringProxy.start(upstream);
+const proxy = await MeteringProxy.start(upstream, settings.thinking === false ? { thinking: false } : {});
 
 interface Job {
   harness: Harness;

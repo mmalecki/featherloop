@@ -46,6 +46,8 @@ export interface HarnessContext {
 export interface Settings {
   /** nanocode's output limit, in place of the 8192 it ships with. */
   nanocodeMaxTokens?: number;
+  /** False: the proxy turns the model's thinking off on every request, whatever the harness asks for. */
+  thinking?: boolean;
 }
 
 export interface Invocation {

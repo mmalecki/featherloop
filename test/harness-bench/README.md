@@ -8,6 +8,7 @@ npm run bench -- -j 4                       # every harness on every case, 4 run
 npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each
 npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
+npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
 npm run bench -- --list                     # harnesses and cases
 npm run validate-cases                      # prove the grading, no model needed
 node test/harness-bench/report.ts test/harness-bench/results/<run>   # re-summarize
@@ -63,6 +64,12 @@ even with no terminal. nanocode asks for at most 8192 output tokens; the bench a
 the model's output limit instead, as the other harnesses' configs do. It's a request
 field the server stops at, which the model never sees: a larger model that reasons
 past 8192 tokens would otherwise end its run with a reply of nothing but thinking.
+
+`--no-thinking` turns the model's thinking off at the proxy: every request gets
+`chat_template_kwargs.enable_thinking: false`, which llama.cpp honours over a request's
+own `reasoning_effort` or Anthropic `thinking`. One switch for all harnesses, however
+each would set it, or not, and whatever they change to later. The requests' logs keep
+what the harness asked for, and mark the override.
 
 Each departure from a harness's own behaviour (this limit, opencode's title agent,
 websearch, featherloop's flags) is listed in the report, and recorded in `meta.json`,

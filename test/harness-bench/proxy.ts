@@ -18,7 +18,17 @@ import type { AddressInfo } from 'node:net';
  * with the response assembled as the server would have sent it whole: a long
  * non-streaming request sends nothing until it's done, and proxies on the way cut
  * it off (squid's `read_timeout` is 15 minutes). Only the transport changes.
+ *
+ * With `thinking: false`, every request asks the chat template for no thinking
+ * (`chat_template_kwargs.enable_thinking: false`, which llama.cpp honours over a
+ * request's `reasoning_effort` or `thinking`): one switch for every harness, however
+ * they would set it themselves, or not.
  */
+
+export interface ProxyOptions {
+  /** False to turn the model's thinking off on every request. */
+  thinking?: boolean;
+}
 
 /** Token counts for one request. `prompt` is all of it, cached or not: the context the model saw. */
 export interface Tokens {
@@ -42,6 +52,8 @@ export interface RequestRecord {
   stream: boolean;
   /** Not streamed by the harness, so streamed upstream and answered whole: see `MeteringProxy`. */
   restreamed: boolean;
+  /** What the proxy changed in the request, beyond streaming, e.g. `enable_thinking=false`. */
+  overrides?: string[];
   messages: number;
   tools: number;
   requestBytes: number;
@@ -109,11 +121,13 @@ const TOOL_MARKUP = /<tool_call>|<function=|<\|tool_call|"name"\s*:\s*"[^"]+"\s*
 
 export class MeteringProxy {
   readonly upstream: URL;
+  readonly options: ProxyOptions;
   #server: http.Server;
   #runs = new Map<string, Sink>();
   #port = 0;
 
-  private constructor(upstream: string) {
+  private constructor(upstream: string, options: ProxyOptions) {
+    this.options = options;
     // Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces.
     this.upstream = new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
     this.#server = http.createServer((req, res) => void this.#handle(req, res));
@@ -124,8 +138,8 @@ export class MeteringProxy {
   }
 
   /** Listens on a free port on 127.0.0.1; `upstream` includes `/v1`. */
-  static async start(upstream: string): Promise<MeteringProxy> {
-    const proxy = new MeteringProxy(upstream);
+  static async start(upstream: string, options: ProxyOptions = {}): Promise<MeteringProxy> {
+    const proxy = new MeteringProxy(upstream, options);
     await new Promise<void>((resolve) => proxy.#server.listen(0, '127.0.0.1', resolve));
     proxy.#port = (proxy.#server.address() as AddressInfo).port;
     return proxy;
@@ -167,9 +181,22 @@ export class MeteringProxy {
     const body = Buffer.concat(chunks);
     const { record, offered, json } = describeRequest(++sink.seq, path, body);
     record.restreamed = !record.stream && record.dialect !== 'other' && json !== undefined;
-    const sent = record.restreamed
-      ? Buffer.from(JSON.stringify({ ...json, stream: true, ...(record.dialect === 'openai' ? { stream_options: { include_usage: true } } : {}) }))
-      : body;
+    // `params` keeps what the harness asked for; this is what the model gets.
+    const forced: Json = {};
+    if (this.options.thinking === false && record.dialect !== 'other' && json !== undefined) {
+      forced.chat_template_kwargs = { ...(json.chat_template_kwargs as Json | undefined), enable_thinking: false };
+      record.overrides = ['enable_thinking=false'];
+    }
+    const sent =
+      record.restreamed || record.overrides
+        ? Buffer.from(
+            JSON.stringify({
+              ...json,
+              ...forced,
+              ...(record.restreamed ? { stream: true, ...(record.dialect === 'openai' ? { stream_options: { include_usage: true } } : {}) } : {}),
+            }),
+          )
+        : body;
     const response = new ResponseParser(record, offered);
     const target = new URL(path, this.upstream);
 

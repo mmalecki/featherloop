@@ -212,7 +212,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     '# Harness bench',
     '',
     `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
-    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.settings?.thinking === false ? 'Thinking off (set by the bench for every request). ' : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
     ...(results.some((result) => result.rerun)
       ? [`${results.filter((result) => result.rerun).length} runs were run again after API errors (see meta.json's reruns).`]
       : []),
