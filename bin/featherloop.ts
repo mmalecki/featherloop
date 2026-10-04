@@ -61,9 +61,14 @@ const argv = await yargs(hideBin(process.argv))
   .option('advisor', {
     type: 'boolean',
     default: false,
-    describe: "Add an advisor subagent for second opinions, on the config's advisor alias",
+    describe:
+      "Add an advisor subagent for second opinions, on the model's advisor alias (its own, else the config's). " +
+      'An advisor asks its own model\'s advisor in turn, if any',
   })
-  .option('advisor-model', { type: 'string', describe: 'Model for the advisor instead of the alias; implies --advisor' })
+  .option('advisor-model', {
+    type: 'string',
+    describe: "Model for the advisor instead of the alias; implies --advisor. Its own advisor is still the config's",
+  })
   .option('instructions', {
     type: 'boolean',
     default: true,

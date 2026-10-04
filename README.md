@@ -7,8 +7,8 @@ featherloop is an agent harness designed to bring big possibilities to tiny mode
 small amounts of memory and compute.
 
 Features:
-* advisor - let your model ask a higher-tier model for advice
-* tool result compaction - summarize some tool results to keep the context short
+* advisor - let your model ask a higher-tier model for advice, and that one ask a higher-tier one still
+* tool result compaction - summarize some tool results to keep the context short, with a smaller model if you like
 * extremely small harness size
 * compatible with Anthropic and OpenAI APIs; tested with llama.cpp
 * under 4k lines of code, 50 kB package size
