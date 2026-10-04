@@ -257,6 +257,11 @@ test('a timeout repeats like any other run', async () => {
   assert.equal(await run(), 'partial\n[timed out after 0.2s]\n[Same output as the previous run]');
 });
 
+test("a failure to compare output doesn't cost the result", async () => {
+  // The output file is gone by the time it's compared; the inline tail reads it through the open handle.
+  assert.equal(await repeating()('echo hi; rm "$TMPDIR"/featherloop-shell-*.log'), 'hi\n[exit code 0]');
+});
+
 test('notes no repeat of empty output', async () => {
   const run = repeating();
   await run('true');

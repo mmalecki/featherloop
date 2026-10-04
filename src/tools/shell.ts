@@ -225,7 +225,14 @@ class Repeats {
     if (window === 0) return undefined;
     // Timed out and killed alike: no "after 120s", which differs between bg and not.
     const ended = result.stopped ? 'stopped' : statusOf(result);
-    const { hash, empty } = await fingerprint(file, ended);
+    let fingerprinted: { hash: string; empty: boolean };
+    try {
+      fingerprinted = await fingerprint(file, ended);
+    } catch {
+      // Only a note: a missed one costs little, but the command's result must still get through.
+      return undefined;
+    }
+    const { hash, empty } = fingerprinted;
     const at = this.#runs.lastIndexOf(hash);
     const ago = this.#runs.length - at;
     this.#runs.push(hash);
