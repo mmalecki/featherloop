@@ -151,8 +151,9 @@ requeues. With no server up, the bench waits for one.
 When nothing's left to run and nothing's in flight, the bench prints `queue drained`: the
 servers can go. It never starts, stops or resizes a server; that's yours to do.
 
-`servers/gce-mig.sh <mig> <region> [port=9931]` lists a regional GCP managed instance
-group's RUNNING instances, `http://<external IP>:<port>/v1` each, with one `gcloud compute
+`servers/gce-mig.sh <mig> <region> [ports=9931]` lists a regional GCP managed instance
+group's RUNNING instances, `http://<external IP>:<port>/v1` for each instance and port
+(`9931,9932` for a llama-server per GPU on multi-GPU VMs), with one `gcloud compute
 instances list` filtered on the `created-by` metadata the group gives its instances. Spot
 VMs come back with new IPs; the next listing has them. It needs `gcloud` signed in as an
 account that can only look, e.g. a service account with `roles/compute.viewer`

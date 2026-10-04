@@ -46,6 +46,11 @@ describe('servers/gce-mig.sh', () => {
     assert.equal(result.stdout, 'http://34.1.1.1:8080/v1\n');
   });
 
+  test('lists each port of each instance, for a server per GPU', async () => {
+    const result = await mig(dir, ['llama-9b', 'us-central1', '9931,9932'], { output: '34.1.1.1\n34.2.2.2\n' });
+    assert.equal(result.stdout, 'http://34.1.1.1:9931/v1\nhttp://34.1.1.1:9932/v1\nhttp://34.2.2.2:9931/v1\nhttp://34.2.2.2:9932/v1\n');
+  });
+
   test('prints nothing for an empty group', async () => {
     const result = await mig(dir, ['llama-9b', 'us-central1'], { output: '' });
     assert.equal(result.status, 0, result.stderr);
