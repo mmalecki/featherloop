@@ -18,6 +18,13 @@ export interface AgentSpec {
    * leaves the choice to the config. Defaults to the caller's model.
    */
   model?: string;
+  /**
+   * Agents it may hand tasks to in turn, by name, of those its caller's subagent
+   * tool offers; none by default. Its rules must allow `subagent` too. One with a
+   * `model` is offered only when this agent's model has it, and it's not a model
+   * already working on the task: e.g. an advisor's advisor, if it has a stronger one.
+   */
+  agents?: string[];
 }
 
 export interface AgentContext {
@@ -57,6 +64,7 @@ export class Agent {
   readonly name: string;
   readonly description: string | undefined;
   readonly model: string | undefined;
+  readonly agents: readonly string[];
   readonly permissions: readonly PermissionRule[];
   readonly instructions: boolean;
   readonly #system: AgentSpec['system'];
@@ -72,7 +80,11 @@ export class Agent {
     }
     this.name = spec.name;
     this.description = spec.description;
+    if (spec.agents !== undefined && !(Array.isArray(spec.agents) && spec.agents.every((name) => typeof name === 'string' && name))) {
+      throw new Error(`Agent ${spec.name}: agents must be a list of agent names`);
+    }
     this.model = spec.model;
+    this.agents = [...(spec.agents ?? [])];
     this.permissions = [...(spec.permissions ?? [])];
     this.instructions = spec.instructions ?? true;
     this.#system = spec.system;
