@@ -333,8 +333,9 @@ export function abortedByBench(record: RequestRecord): boolean {
 
 /**
  * A request that failed for the infrastructure rather than the harness: a 5xx or
- * 429, or a connection that failed or dropped mid-response (a server crash shows as
- * an `aborted` stream). Other 4xx are the harness's doing, e.g. a request over the context.
+ * 429, a connection that failed or dropped mid-response (a server crash shows as
+ * an `aborted` stream), or an error event mid-stream. Other 4xx are the harness's
+ * doing, e.g. a request over the context, which llama.cpp turns down before streaming.
  */
 export function infrastructureError(record: RequestRecord): boolean {
   if (record.status >= 500 || record.status === 429) return true;
@@ -507,6 +508,12 @@ class ResponseParser {
     if (data === '[DONE]') return;
     const json = tryParse(data) as Json | undefined;
     if (!json) return;
+    // A server that fails mid-response says so in the stream, the status already 200:
+    // e.g. llama.cpp's "Context size has been exceeded" when slots share a full KV cache.
+    if (json.error) {
+      this.#record.error = `stream: ${typeof json.error === 'string' ? json.error : (json.error.message ?? JSON.stringify(json.error))}`;
+      return;
+    }
     if (this.#record.dialect === 'anthropic') this.#anthropicEvent(json);
     else this.#openaiChunk(json);
   }
