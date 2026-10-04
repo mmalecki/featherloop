@@ -11,7 +11,13 @@ npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --list                     # harnesses and cases
 npm run validate-cases                      # prove the grading, no model needed
 node test/harness-bench/report.ts test/harness-bench/results/<run>   # re-summarize
+npm run bench -- --rerun-api-errors test/harness-bench/results/<run> -j 4   # redo runs hit by API errors
 ```
+
+`--rerun-api-errors` runs again, in place, the runs of a results directory that hit API
+errors (a server restart, a proxy timeout), on its model, server and timeout. The old
+run's directory is kept beside the new one as `<case>-r<rep>.replaced`, `meta.json` lists
+the reruns, and the report counts the latest run of each.
 
 Results land in `results/<timestamp>/`: `summary.md` and `summary.json`, `results.jsonl`
 (a line per run), `meta.json` (versions, server, settings), `prompts/` and, per run,

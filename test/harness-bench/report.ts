@@ -58,6 +58,8 @@ export interface RunResult {
   params: Record<string, unknown>[];
   /** The largest output limit it asked for; none means the server's. */
   maxOutput: number | null;
+  /** Run again, replacing an earlier row for the same harness, case and rep (`--rerun-api-errors`). */
+  rerun?: boolean;
 }
 
 /** Harnesses name their tools differently; these are what they do. */
@@ -112,10 +114,13 @@ export interface HarnessSummary {
 export function summarize(dir: string): string {
   const file = join(dir, 'results.jsonl');
   if (!existsSync(file)) return `No runs finished in ${dir}\n`;
-  const results = readFileSync(file, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as RunResult);
+  // A rerun's row replaces the earlier one for the same run.
+  const rows = new Map<string, RunResult>();
+  for (const line of readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
+    const row = JSON.parse(line) as RunResult;
+    rows.set(`${row.harness}|${row.case}|${row.rep}`, row);
+  }
+  const results = [...rows.values()];
   const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as Record<string, any>;
   // In the order the bench defines them, not the order they finished in.
   const harnesses = [...new Set([...Object.keys(meta.harnesses ?? {}), ...results.map((result) => result.harness)])].filter((harness) =>
@@ -195,6 +200,9 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     '',
     `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
     `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    ...(results.some((result) => result.rerun)
+      ? [`${results.filter((result) => result.rerun).length} runs were run again after API errors (see meta.json's reruns).`]
+      : []),
     `Versions: ${Object.entries(meta.harnesses ?? {})
       .map(([name, info]) => `${name} ${(info as { version: string }).version}`)
       .join(', ')}.`,

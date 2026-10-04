@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
@@ -31,13 +31,23 @@ const argv = await yargs(hideBin(process.argv))
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
+  .option('rerun-api-errors', {
+    type: 'string',
+    describe:
+      "A results directory: run again the runs in it that hit API errors (e.g. a proxy's timeout), replacing them, on its model, server and timeout",
+  })
   .strictOptions()
   .parseAsync();
 
-const cases = loadCases(argv._.map(String), argv.set);
-const model = MODELS[argv.model]!;
-const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? model.upstream;
-const harnesses = HARNESSES.filter((harness) => !argv.harness?.length || argv.harness.includes(harness.name));
+const rerun = argv.rerunApiErrors === undefined ? undefined : rerunTargets(argv.rerunApiErrors);
+// Results from before models.json are all on the default model.
+const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
+const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? (rerun ? rerun.meta.upstream : model.upstream);
+const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
+const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
+const harnesses = HARNESSES.filter(
+  (harness) => (!argv.harness?.length || argv.harness.includes(harness.name)) && (!rerun || rerun.harnesses.has(harness.name)),
+);
 if (argv.list) {
   for (const harness of harnesses) console.log(`${harness.name}: ${harness.description}`);
   console.log(cases.map((c) => c.id).join('\n'));
@@ -46,16 +56,31 @@ if (argv.list) {
 
 ensureToolchains(cases);
 const versions = Object.fromEntries(harnesses.map((harness) => [harness.name, harness.prepare()]));
-const out = argv.out ?? join(import.meta.dirname, 'results', new Date().toISOString().replace(/[:.]/g, '-'));
+const out = rerun?.dir ?? argv.out ?? join(import.meta.dirname, 'results', new Date().toISOString().replace(/[:.]/g, '-'));
 mkdirSync(join(out, 'prompts'), { recursive: true });
 for (const c of cases) writeFileSync(join(out, 'prompts', `${caseName(c)}.md`), `${c.prompt}\n`);
 
 const server = await serverInfo(upstream);
+const started = new Date().toISOString();
 writeFileSync(
   join(out, 'meta.json'),
   `${JSON.stringify(
-    {
-      started: new Date().toISOString(),
+    rerun
+      ? {
+          ...rerun.meta,
+          reruns: [
+            ...(rerun.meta.reruns ?? []),
+            {
+              started,
+              why: 'API errors',
+              runs: [...rerun.keys],
+              harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name] }])),
+              server,
+            },
+          ],
+        }
+      : {
+      started,
       model: model.id,
       upstream,
       server,
@@ -63,7 +88,7 @@ writeFileSync(
       cases: cases.map((c) => c.id),
       reps: argv.reps,
       jobs: argv.jobs,
-      timeoutMinutes: argv.timeout,
+      timeoutMinutes: timeout,
       toolchains: toolchainVersions(),
     },
     null,
@@ -81,7 +106,16 @@ interface Job {
 
 // Case-major, harness-minor: at -j matching the harness count, each case's runs share the server at once.
 const jobs: Job[] = [];
-for (let rep = 1; rep <= argv.reps; rep++) for (const c of cases) for (const harness of harnesses) jobs.push({ harness, c, rep });
+if (rerun) {
+  for (const key of rerun.keys) {
+    const [name, id, rep] = key.split('|') as [string, string, string];
+    const harness = harnesses.find((harness) => harness.name === name);
+    const c = cases.find((c) => c.id === id);
+    if (harness && c) jobs.push({ harness, c, rep: Number(rep) });
+  }
+} else {
+  for (let rep = 1; rep <= argv.reps; rep++) for (const c of cases) for (const harness of harnesses) jobs.push({ harness, c, rep });
+}
 
 const live = new Set<number>();
 let interrupted = false;
@@ -92,7 +126,11 @@ process.on('SIGINT', () => {
   for (const pid of live) killGroup(pid);
 });
 
-console.error(`${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`);
+console.error(
+  rerun
+    ? `Running again ${jobs.length} runs that hit API errors, ${argv.jobs} at a time → ${out}`
+    : `${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`,
+);
 let done = 0;
 const queue = [...jobs];
 await Promise.all(
@@ -111,6 +149,8 @@ console.log(summarize(out));
 async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> {
   const id = `${harness.name}.${caseName(c)}.r${rep}`;
   const dir = join(out, 'runs', harness.name, `${caseName(c)}-r${rep}`);
+  // Kept beside, to see what went wrong.
+  if (rerun && existsSync(dir)) renameSync(dir, uniquePath(`${dir}.replaced`));
   mkdirSync(dir, { recursive: true });
   // Neutral: the model sees this path, and it shouldn't name a harness.
   const tmp = mkdtempSync(join(tmpdir(), 'bench-'));
@@ -130,7 +170,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   const result = await run(invocation.command, invocation.args, {
     cwd: workspace,
     env,
-    timeoutMs: argv.timeout * 60_000,
+    timeoutMs: timeout * 60_000,
     log: { stdout: join(dir, 'stdout.log'), stderr: join(dir, 'stderr.log') },
     onSpawn: (pid) => live.add(pid),
   });
@@ -201,6 +241,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     sawCache: sawCache(dir),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
+    ...(rerun ? { rerun: true } : {}),
   };
   writeFileSync(join(dir, 'result.json'), `${JSON.stringify(run_, null, 2)}\n`);
   return run_;
@@ -244,6 +285,33 @@ function sawCache(dir: string): boolean {
     const path = join(dir, name);
     return existsSync(path) && readFileSync(path, 'utf8').includes(POLYGLOT.dir);
   });
+}
+
+/**
+ * The runs in a results directory that hit API errors, by `harness|case|rep`: the
+ * latest row for each, as the report counts them.
+ */
+function rerunTargets(dir: string) {
+  const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as Record<string, any>;
+  const rows = new Map<string, RunResult>();
+  for (const line of readFileSync(join(dir, 'results.jsonl'), 'utf8').split('\n').filter(Boolean)) {
+    const row = JSON.parse(line) as RunResult;
+    rows.set(`${row.harness}|${row.case}|${row.rep}`, row);
+  }
+  const failed = [...rows].filter(([, row]) => row.apiErrors > 0);
+  return {
+    dir,
+    meta,
+    keys: new Set(failed.map(([key]) => key)),
+    cases: new Set(failed.map(([, row]) => row.case)),
+    harnesses: new Set(failed.map(([, row]) => row.harness)),
+  };
+}
+
+function uniquePath(path: string): string {
+  let candidate = path;
+  for (let n = 2; existsSync(candidate); n++) candidate = `${path}-${n}`;
+  return candidate;
 }
 
 function progress(result: RunResult): string {
