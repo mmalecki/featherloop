@@ -374,11 +374,12 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
 
 /**
  * The bench's environment for a harness, minus anything that would let it reach
- * past its run: keys (a config that misses the proxy fails instead of reaching a paid API), `MODEL` (featherloop and nanocode read it), opencode's
+ * past its run: keys (a config that misses the proxy fails instead of reaching a paid API), Google Cloud's credentials and
+ * config (for `--servers-cmd`), `MODEL` (featherloop and nanocode read it), opencode's
  * overrides, npm's script variables (`INIT_CWD` among them), and the user's XDG directories.
  */
 function isolatedEnv(tmp: string, toolPath: string[], { home, xdg, baseURL }: HarnessContext, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const strip = /^(OPENCODE_|ANTHROPIC_|OPENAI_|OPENROUTER_|PARALLEL_|CLAUDE|FEATHERLOOP|XDG_|npm_)|^(MODEL|INIT_CWD|OLDPWD)$/i;
+  const strip = /^(OPENCODE_|ANTHROPIC_|OPENAI_|OPENROUTER_|PARALLEL_|GOOGLE_|CLOUDSDK_|CLAUDE|FEATHERLOOP|XDG_|npm_)|^(MODEL|INIT_CWD|OLDPWD)$/i;
   const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !strip.test(name)));
   // The proxy is local: whatever proxy the environment sets, harnesses must reach it directly.
   const noProxy = [...new Set([...(process.env.NO_PROXY ?? process.env.no_proxy ?? '').split(',').filter(Boolean), '127.0.0.1', 'localhost'])].join(',');

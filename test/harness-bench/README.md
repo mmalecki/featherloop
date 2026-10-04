@@ -126,7 +126,7 @@ it). Sessions, databases, caches and the user's own instructions (`~/.config/*/A
 `~/.claude/CLAUDE.md`) don't carry over between runs or in from the user.
 
 The environment loses API keys (`OPENAI_*`, `ANTHROPIC_*`, `OPENROUTER_*`, `PARALLEL_*`),
-`OPENCODE_*`, `MODEL` (featherloop and nanocode read it), npm's script variables
+Google Cloud's credentials and config (`GOOGLE_*`, `CLOUDSDK_*`), `OPENCODE_*`, `MODEL` (featherloop and nanocode read it), npm's script variables
 (`INIT_CWD` among them) and `PWD`, which is set to the workspace: opencode trusts it
 over its real working directory. Harnesses run in their own process group, killed at the
 timeout and after exit, with anything they left running.
