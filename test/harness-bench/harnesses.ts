@@ -17,9 +17,13 @@ export interface Model {
   /** Its key in models.json: the name harnesses send, which a single-model llama-server ignores. */
   id: string;
   name: string;
+  /** The API it speaks, as featherloop names it: `openai` (Chat Completions; llama.cpp) or `anthropic` (Messages). */
+  flavor: 'openai' | 'anthropic';
   /** Its server, with /v1. */
   upstream: string;
   limit: { context: number; output: number };
+  /** Dollars per million tokens, for a priced API: cost per run in the report, and `--max-cost`. */
+  pricing?: { input: number; output: number; cacheWrite: number; cacheRead: number };
   /** featherloop's own model settings, e.g. variants. */
   featherloop?: Record<string, unknown>;
 }
@@ -89,6 +93,7 @@ const featherloop: Harness = {
     copyConfig('featherloop', dir);
     const file = join(dir, 'config.yaml');
     const config = parseDocument(readFileSync(file, 'utf8'));
+    config.setIn(['provider', 'bench', 'flavor'], model.flavor);
     config.setIn(['provider', 'bench', 'models', model.id], { limit: { output: model.limit.output }, ...model.featherloop });
     writeFileSync(file, config.toString());
     // `--` so no line of the prompt reads as a flag.
@@ -106,7 +111,11 @@ const opencode = (name: string, description: string, notes: string[]): Harness =
     const dir = join(xdg.config, 'opencode');
     copyConfig(name, dir);
     const file = join(dir, 'opencode.json');
-    const config = JSON.parse(readFileSync(file, 'utf8')) as { provider: { bench: { models: Record<string, unknown> } } };
+    const config = JSON.parse(readFileSync(file, 'utf8')) as {
+      provider: { bench: { npm: string; options: Record<string, string>; models: Record<string, unknown> } };
+    };
+    // The AI SDK package that speaks the model's API; the proxy supplies any key.
+    if (model.flavor === 'anthropic') config.provider.bench = { ...config.provider.bench, npm: '@ai-sdk/anthropic', options: { ...config.provider.bench.options, apiKey: 'bench' } };
     config.provider.bench.models[model.id] = { name: model.name, limit: model.limit };
     writeFileSync(file, `${JSON.stringify(config, null, 2)}\n`);
     // --standalone: a private server, not the user's background service. --auto: no permission prompts.

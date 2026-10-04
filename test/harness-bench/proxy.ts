@@ -28,6 +28,11 @@ import type { AddressInfo } from 'node:net';
 export interface ProxyOptions {
   /** False to turn the model's thinking off on every request. */
   thinking?: boolean;
+  /**
+   * The upstream's API key, sent as `x-api-key` in place of whatever the harness
+   * sends: keys stay with the bench, never in a harness's environment or config.
+   */
+  apiKey?: string;
 }
 
 /** Token counts for one request. `prompt` is all of it, cached or not: the context the model saw. */
@@ -35,6 +40,8 @@ export interface Tokens {
   prompt: number;
   cached: number;
   completion: number;
+  /** Prompt tokens written to a cache, where the API bills them apart (Anthropic). Part of `prompt`. */
+  cacheWrite?: number;
 }
 
 /** What one model request did, as one line of a run's `requests.jsonl`. */
@@ -204,6 +211,11 @@ export class MeteringProxy {
     for (const name of ['content-type', 'authorization', 'x-api-key', 'anthropic-version', 'anthropic-beta', 'accept']) {
       const value = req.headers[name];
       if (typeof value === 'string') headers[name] = value;
+    }
+    if (this.options.apiKey) {
+      delete headers.authorization;
+      headers['x-api-key'] = this.options.apiKey;
+      headers['anthropic-version'] ??= '2023-06-01';
     }
     headers['content-length'] = String(sent.length);
 
@@ -529,11 +541,13 @@ class ResponseParser {
       // Anthropic: input_tokens excludes cache reads; streams send input in message_start and output in message_delta.
       const previous = record.tokenSource === 'usage' ? record.tokens : null;
       const cached = usage.cache_read_input_tokens ?? previous?.cached ?? 0;
-      const input = usage.input_tokens ?? (previous ? previous.prompt - previous.cached : 0);
+      const cacheWrite = usage.cache_creation_input_tokens ?? previous?.cacheWrite ?? 0;
+      const input = usage.input_tokens ?? (previous ? previous.prompt - previous.cached - (previous.cacheWrite ?? 0) : 0);
       record.tokens = {
-        prompt: input + cached + (usage.cache_creation_input_tokens ?? 0),
+        prompt: input + cached + cacheWrite,
         cached,
         completion: usage.output_tokens ?? previous?.completion ?? 0,
+        ...(cacheWrite ? { cacheWrite } : {}),
       };
       record.tokenSource = 'usage';
     }

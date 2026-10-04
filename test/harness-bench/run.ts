@@ -1,12 +1,14 @@
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
 import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
-import { MeteringProxy } from './proxy.ts';
+import { hardcodedAnswers } from './guards.ts';
+import { MeteringProxy, type RequestRecord } from './proxy.ts';
 import { readTranscript, webFetches } from './transcript.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
@@ -32,6 +34,10 @@ const argv = await yargs(hideBin(process.argv))
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
+  .option('max-cost', {
+    type: 'number',
+    describe: "Dollars: start no more runs once the runs so far cost this much (priced models only; runs in flight finish)",
+  })
   .option('thinking', {
     type: 'boolean',
     default: true,
@@ -110,7 +116,17 @@ writeFileSync(
   )}\n`,
 );
 
-const proxy = await MeteringProxy.start(upstream, settings.thinking === false ? { thinking: false } : {});
+if (settings.thinking === false && model.flavor !== 'openai') {
+  throw new Error(`--no-thinking sets llama.cpp's chat template; ${model.id} speaks ${model.flavor}`);
+}
+// A hosted API's key stays here: the proxy adds it upstream, harnesses get none.
+const apiKey = model.flavor === 'anthropic' ? process.env.ANTHROPIC_API_KEY : undefined;
+if (model.flavor === 'anthropic' && !apiKey) throw new Error(`${model.id} needs ANTHROPIC_API_KEY (in .env)`);
+const proxy = await MeteringProxy.start(upstream, {
+  ...(settings.thinking === false ? { thinking: false } : {}),
+  ...(apiKey ? { apiKey } : {}),
+});
+let spent = 0;
 
 interface Job {
   harness: Harness;
@@ -149,10 +165,11 @@ let done = 0;
 const queue = [...jobs];
 await Promise.all(
   Array.from({ length: Math.max(1, Math.min(argv.jobs, jobs.length)) }, async () => {
-    for (let job = queue.shift(); job && !interrupted; job = queue.shift()) {
+    for (let job = queue.shift(); job && !interrupted && !overBudget(); job = queue.shift()) {
       const result = await runJob(job);
       if (!result) continue;
       appendFileSync(join(out, 'results.jsonl'), `${JSON.stringify(result)}\n`);
+      spent += result.costUsd ?? 0;
       console.error(`[${++done}/${jobs.length}] ${progress(result)}`);
     }
   }),
@@ -254,6 +271,8 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     tampered: changed.tampered,
     sawCache: sawCache(dir),
     fetches: webFetches(readTranscript(dir)),
+    hardcoded: hardcodedAnswers(changed.diff, c.solution, c.tests.map((name) => c.files.get(name)!)),
+    ...(model.pricing ? { costUsd: cost(records, model.pricing) } : {}),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
     ...(rerun ? { rerun: true } : {}),
@@ -323,6 +342,25 @@ function rerunTargets(dir: string) {
   };
 }
 
+/** What a run's requests cost, at the model's prices. Requests cut off before reporting tokens aren't counted. */
+function cost(records: RequestRecord[], pricing: NonNullable<typeof model.pricing>): number {
+  return records.reduce((sum, { tokens }) => {
+    if (!tokens) return sum;
+    const write = tokens.cacheWrite ?? 0;
+    const fresh = tokens.prompt - tokens.cached - write;
+    return sum + (fresh * pricing.input + write * pricing.cacheWrite + tokens.cached * pricing.cacheRead + tokens.completion * pricing.output) / 1e6;
+  }, 0);
+}
+
+/** Past `--max-cost`: no more runs start. Said once. */
+let budgetNoted = false;
+function overBudget(): boolean {
+  if (argv.maxCost === undefined || spent < argv.maxCost) return false;
+  if (!budgetNoted) console.error(`Spent $${spent.toFixed(2)}, past --max-cost $${argv.maxCost}: starting no more runs`);
+  budgetNoted = true;
+  return true;
+}
+
 function uniquePath(path: string): string {
   let candidate = path;
   for (let n = 2; existsSync(candidate); n++) candidate = `${path}-${n}`;
@@ -344,6 +382,15 @@ function progress(result: RunResult): string {
 
 /** The server's model, build and slots, from llama.cpp's `/props` and `/v1/models`; whatever answers. */
 async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
+  if (model.flavor === 'anthropic') {
+    // A hosted API: the Models API says the model is there, and what it's called.
+    const key = process.env.ANTHROPIC_API_KEY ?? '';
+    const info = (await getJson(`${baseURL.replace(/\/$/, '')}/models/${model.id}`, { 'x-api-key': key, 'anthropic-version': '2023-06-01' })) as
+      | { id: string; display_name?: string; max_input_tokens?: number; max_tokens?: number }
+      | undefined;
+    if (!info) throw new Error(`${model.id} isn't available at ${baseURL}`);
+    return { models: [{ id: info.id, meta: { name: info.display_name, context: info.max_input_tokens, output: info.max_tokens } }], build: 'hosted API' };
+  }
   const root = baseURL.replace(/\/v1\/?$/, '');
   const props = (await getJson(`${root}/props`)) as Record<string, any> | undefined;
   const models = (await getJson(`${baseURL.replace(/\/$/, '')}/models`)) as { data?: { id: string; meta?: unknown }[] } | undefined;
@@ -361,9 +408,9 @@ async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
   };
 }
 
-function getJson(url: string): Promise<unknown> {
+function getJson(url: string, headers: Record<string, string> = {}): Promise<unknown> {
   return new Promise((resolve) => {
-    const req = http.get(url, (res) => {
+    const req = (url.startsWith('https:') ? https : http).get(url, { headers }, (res) => {
       let body = '';
       res.on('data', (chunk: Buffer) => (body += chunk));
       res.on('end', () => {

@@ -57,6 +57,10 @@ export interface RunResult {
   sawCache: boolean;
   /** Calls that reached for the web: fetch and search tools, and URLs in shell commands. Absent from older results. */
   fetches?: Fetch[];
+  /** Test literals a short solution returns: maybe answers hardcoded from the visible tests (guards.ts). */
+  hardcoded?: string[];
+  /** Dollars, at the model's prices; priced models only. */
+  costUsd?: number;
   /** Distinct sampling settings the harness sent, the output limit apart. */
   params: Record<string, unknown>[];
   /** The largest output limit it asked for; none means the server's. */
@@ -111,6 +115,9 @@ export interface HarnessSummary {
   sawCacheRuns: number;
   /** Per run; null when the results predate tracking. */
   fetches: number | null;
+  hardcoded: string[];
+  /** Dollars, total; null for unpriced models. */
+  cost: number | null;
   solutionFetches: string[];
   hosts: Record<string, number>;
   linesChanged: number;
@@ -188,6 +195,8 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     apiErrors: total((run) => run.apiErrors),
     tamperedRuns: runs.filter((run) => run.tampered.length).length,
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
+    hardcoded: runs.filter((run) => run.hardcoded?.length).map((run) => `${run.case}: ${run.hardcoded!.join(', ')}`),
+    cost: runs.some((run) => run.costUsd !== undefined) ? total((run) => run.costUsd ?? 0) : null,
     fetches: runs.some((run) => run.fetches) ? mean((run) => run.fetches?.length ?? 0) : null,
     solutionFetches: runs.flatMap((run) => (run.fetches ?? []).filter((fetch) => fetch.solutionSource).map((fetch) => `${run.case}: ${fetch.target}`)),
     hosts: runs.reduce<Record<string, number>>((hosts, run) => {
@@ -211,7 +220,9 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
   const lines = [
     '# Harness bench',
     '',
-    `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
+    meta.server?.build === 'hosted API'
+      ? `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'}, hosted API.`
+      : `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
     `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.settings?.thinking === false ? 'Thinking off (set by the bench for every request). ' : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
     ...(results.some((result) => result.rerun)
       ? [`${results.filter((result) => result.rerun).length} runs were run again after API errors (see meta.json's reruns).`]
@@ -243,6 +254,13 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('↳ prompt (processed, not cached)', (s) => k(s.tokens.uncached)),
     row('↳ completion', (s) => k(s.tokens.completion)),
     row('Tokens / pass', (s) => (s.tokensPerPass === null ? '–' : k(s.tokensPerPass))),
+    ...(summaries.some((s) => s.cost !== null)
+      ? [
+          row('Cost / run', (s) => (s.cost === null ? '–' : `$${(s.cost / s.runs).toFixed(3)}`)),
+          row('Cost / pass', (s) => (s.cost === null || !s.passes ? '–' : `$${(s.cost / s.passes).toFixed(3)}`)),
+          row('Cost, all runs', (s) => (s.cost === null ? '–' : `$${s.cost.toFixed(2)}`)),
+        ]
+      : []),
     row('Output cut off uncounted, at least', (s) => k(s.uncountedOutput)),
     row('First prompt (system + tools + task)', (s) => (s.firstPrompt === null ? '–' : k(s.firstPrompt))),
     row('Peak context, median (max)', (s) => `${k(s.peakContext.median)} (${k(s.peakContext.max)})`),
@@ -258,6 +276,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('Runs that reached the bench cache', (s) => String(s.sawCacheRuns)),
     row('Web fetches / run', (s) => (s.fetches === null ? '–' : s.fetches.toFixed(2))),
     row('Fetches from solution sources', (s) => (s.fetches === null ? '–' : String(s.solutionFetches.length))),
+    row('Runs that may hardcode test answers', (s) => String(s.hardcoded.length)),
     row('Lines changed / run', (s) => s.linesChanged.toFixed(0)),
     '',
     '## Tools called, per run',
@@ -285,6 +304,16 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
                 .join(', ') || 'none'
         }${s.solutionFetches.length ? `. From solution sources: ${s.solutionFetches.join('; ')}` : ''}`,
     ),
+    ...(summaries.some((s) => s.hardcoded.length)
+      ? [
+          '',
+          '## Possibly hardcoded',
+          '',
+          'Short solutions returning literals from the tests. Look before trusting the pass.',
+          '',
+          ...summaries.filter((s) => s.hardcoded.length).map((s) => `- **${s.harness}**: ${s.hardcoded.join('; ')}`),
+        ]
+      : []),
     '',
     '## Sampling settings sent',
     '',

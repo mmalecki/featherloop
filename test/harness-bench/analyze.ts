@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
+import { loadCases } from './cases.ts';
+import { hardcodedAnswers } from './guards.ts';
 import { HARNESSES } from './harnesses.ts';
 import type { RequestRecord } from './proxy.ts';
 import type { RunResult } from './report.ts';
@@ -215,6 +217,19 @@ table(
       [...hosts].sort(([, a], [, b]) => b - a).map(([host, n]) => `${host} ${n}`).join(', ') || '–',
       suspicious.join('<br>') || '–',
     ];
+  }),
+);
+
+section('Possibly hardcoded', 'Short solutions returning literals from the tests (guards.ts): look before trusting the pass.');
+const cases = new Map(loadCases().map((c) => [c.id, c]));
+table(
+  ['column', 'case', 'passed', 'literals'],
+  clean.flatMap((run) => {
+    const c = cases.get(run.case);
+    const diff = join(run.dir, 'changes.diff');
+    if (!c || !existsSync(diff)) return [];
+    const hits = hardcodedAnswers(readFileSync(diff, 'utf8'), c.solution, c.tests.map((name) => c.files.get(name)!));
+    return hits.length ? [[run.column, run.case, run.pass ? 'yes' : 'no', hits.join(', ')]] : [];
   }),
 );
 

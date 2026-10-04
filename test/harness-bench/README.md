@@ -9,6 +9,7 @@ npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each
 npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
+npm run bench -- -m claude-haiku-4-5 --max-cost 20 -j 4   # a hosted model, with a spending limit
 npm run bench -- --list                     # harnesses and cases
 npm run validate-cases                      # prove the grading, no model needed
 node test/harness-bench/report.ts test/harness-bench/results/<run>   # re-summarize
@@ -64,6 +65,13 @@ even with no terminal. nanocode asks for at most 8192 output tokens; the bench a
 the model's output limit instead, as the other harnesses' configs do. It's a request
 field the server stops at, which the model never sees: a larger model that reasons
 past 8192 tokens would otherwise end its run with a reply of nothing but thinking.
+
+A model's `flavor` in `models.json` is the API it speaks, as featherloop names it:
+`openai` (Chat Completions, e.g. llama.cpp) or `anthropic` (Messages). An `anthropic`
+model gets each harness's Anthropic provider; the proxy sends `ANTHROPIC_API_KEY` (from
+`.env`) upstream itself, so no harness sees it. Priced models report dollars per run and
+per pass, with cache writes and reads at their own prices, and `--max-cost` stops
+starting runs once they've cost that much (runs in flight finish).
 
 `--no-thinking` turns the model's thinking off at the proxy: every request gets
 `chat_template_kwargs.enable_thinking: false`, which llama.cpp honours over a request's
@@ -136,7 +144,10 @@ is 15 minutes, and showed up as 504s). Only the transport changes.
   the limit**, **API errors**, **timeouts** and **crashes**.
 - **Sampling settings** each harness sent, against the server's defaults, since they
   differ between harnesses and move pass rates.
-- **Lines changed**, and runs that **changed the tests** or **reached the bench cache**.
+- **Lines changed**, and runs that **changed the tests**, **reached the bench cache**, or
+  **may hardcode test answers**: short solutions that return literals from the visible
+  tests (`guards.ts`). Flags to look at, not disqualifications.
+- **Cost** per run and per pass, for priced (hosted) models.
 
 ## Analysis
 
