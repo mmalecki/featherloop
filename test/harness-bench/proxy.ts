@@ -242,9 +242,15 @@ export class MeteringProxy {
         if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
       }
       if (!assemble) res.writeHead(record.status, out);
+      // An error's body says why: keep its start.
+      let errorBody = '';
       up.on('data', (chunk: Buffer) => {
         response.write(chunk);
         if (!assemble) res.write(chunk);
+        if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
+      });
+      up.on('end', () => {
+        if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
       });
       up.on('end', () => {
         response.end();

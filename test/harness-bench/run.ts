@@ -322,8 +322,10 @@ function sawCache(dir: string): boolean {
 }
 
 /**
- * The runs in a results directory that hit API errors, by `harness|case|rep`: the
- * latest row for each, as the report counts them.
+ * The runs in a results directory that hit API errors the infrastructure caused
+ * (5xx, 429, a dropped connection), by `harness|case|rep`: the latest row for each,
+ * as the report counts them. Not other 4xx: a request the API refused, say for
+ * exceeding the context, is the harness's doing, and stays a result.
  */
 function rerunTargets(dir: string) {
   const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as Record<string, any>;
@@ -332,7 +334,16 @@ function rerunTargets(dir: string) {
     const row = JSON.parse(line) as RunResult;
     rows.set(`${row.harness}|${row.case}|${row.rep}`, row);
   }
-  const failed = [...rows].filter(([, row]) => row.apiErrors > 0);
+  const infrastructure = (row: RunResult) => {
+    const file = join(dir, 'runs', row.harness, `${row.case.replace('/', '-')}-r${row.rep}`, 'requests.jsonl');
+    if (!existsSync(file)) return true;
+    return readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as RequestRecord)
+      .some((req) => req.status >= 500 || req.status === 429 || (req.status === 0 && req.error && !req.error.startsWith('aborted')));
+  };
+  const failed = [...rows].filter(([, row]) => row.apiErrors > 0 && infrastructure(row));
   return {
     dir,
     meta,
