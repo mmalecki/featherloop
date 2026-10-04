@@ -118,7 +118,7 @@ if (advisor) {
   // Only for this model, though: one switched to with /model may have no advisor.
   await exitOnUserError(async () => {
     if (!(await initial.submodel!(advisorAgent.model!))) {
-      throw new ConfigError(`--advisor needs an alias "${advisorAgent.model}" for ${ref} in ${argv.config}, or --advisor-model`);
+      throw new ConfigError(`--advisor: ${ref} has no "${advisorAgent.model}" alias (or sets it to null) in ${argv.config}; set one, or pass --advisor-model`);
     }
   });
 }

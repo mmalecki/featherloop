@@ -12,7 +12,7 @@ export interface CompactOptions {
    * alias (see `ToolContext.submodel`), else to the loop's model itself.
    */
   model?: string | undefined;
-  /** Defaults to `none`: shrinking text needs no thinking. */
+  /** Defaults to `none`: shrinking text needs no thinking. Overrides the effort of the compacting model's variant. */
   reasoning?: Reasoning | undefined;
   /** Extra provider-specific request fields. */
   request?: Record<string, unknown> | undefined;
