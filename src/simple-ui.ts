@@ -1,5 +1,5 @@
-import { createInterface, type Interface } from 'node:readline';
 import { styleText } from 'node:util';
+import { ChatInput } from './chat-input.ts';
 import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
 import type { ModelResolver, ResolvedModel } from './models.ts';
 import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
@@ -49,12 +49,13 @@ export interface SimpleUIOptions {
   output?: NodeJS.WriteStream;
 }
 
-const HELP = '/c clear · /model [name [variant]] · /usage · /q quit · Ctrl-C interrupt';
+const HELP = '/c clear · /model [name [variant]] · /usage · /q quit · Ctrl-C interrupt · Shift/Alt+Enter or Ctrl-J newline';
 
 /**
  * Minimal terminal chat. Takes a ready-made loop, or a factory that `/c` uses
- * to start over with fresh tool state. Lines typed while the agent is working
- * are queued into the running loop.
+ * to start over with fresh tool state. Messages typed while the agent is working
+ * are queued into the running loop. In a terminal, messages may span lines
+ * (see `ChatInput`), and the input stays below the agent's output.
  */
 export class SimpleUI {
   readonly options: SimpleUIOptions;
@@ -64,7 +65,7 @@ export class SimpleUI {
   /** Pending model switches, in order; runs wait for them. */
   #switching: Promise<unknown> = Promise.resolve();
   #out: NodeJS.WriteStream;
-  #rl: Interface | undefined;
+  #input: ChatInput | undefined;
   #history: Message[] = [];
   #session: Session | undefined;
   #abort: AbortController | undefined;
@@ -156,23 +157,31 @@ export class SimpleUI {
       this.#showLastTurn(session!.messages);
     } else if (session) this.#print(`${this.#style('dim', `Session ${session.id}`)}\n`);
 
-    const rl = (this.#rl = createInterface({ input: this.options.input ?? process.stdin, output: this.#out }));
-    rl.setPrompt(`${this.#promptMark()} `);
+    const input = (this.#input = new ChatInput({
+      input: this.options.input ?? process.stdin,
+      output: this.#out,
+      prompt: `${this.#promptMark()} `,
+    }));
 
     return new Promise((resolve) => {
-      rl.on('close', () => {
-        this.#rl = undefined;
+      input.on('close', () => {
+        this.#input = undefined;
         this.#abort?.abort();
         resolve();
       });
-      rl.on('SIGINT', () => (this.#abort ? this.#abort.abort() : rl.close()));
-      rl.on('line', (line) => void this.#onLine(line.trim()));
+      // Interrupts a run; otherwise clears what's typed, or with nothing typed, quits.
+      input.on('SIGINT', () => {
+        if (this.#abort) this.#abort.abort();
+        else if (input.line) input.clear();
+        else input.close();
+      });
+      input.on('line', (line) => void this.#onLine(line.trim()));
       this.#prompt();
     });
   }
 
   async #onLine(line: string): Promise<void> {
-    if (line === '/q' || line === 'exit') return void this.#rl?.close();
+    if (line === '/q' || line === 'exit') return void this.#input?.close();
     if (this.#abort) {
       if (line.startsWith('/')) {
         this.#print(this.#style('dim', '  ↳ commands run once the agent is idle (Ctrl-C to interrupt)'));
@@ -190,7 +199,7 @@ export class SimpleUI {
 
     this.#print(this.#separator());
     await this.ask(line);
-    if (!this.#rl) return;
+    if (!this.#input) return;
     this.#print('');
     this.#prompt();
   }
@@ -467,7 +476,7 @@ export class SimpleUI {
 
   #prompt(): void {
     this.#print(this.#separator());
-    this.#rl?.prompt();
+    this.#input?.prompt();
   }
 
   #separator(): string {
@@ -486,12 +495,14 @@ export class SimpleUI {
     return styleText(format, value, { stream: this.#out });
   }
 
+  /** In the REPL, above the input. */
   #write(value: string): void {
-    this.#out.write(value);
+    if (this.#input) this.#input.write(value);
+    else this.#out.write(value);
   }
 
   #print(value: string): void {
-    this.#out.write(`${value}\n`);
+    this.#write(`${value}\n`);
   }
 }
 
