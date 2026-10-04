@@ -39,6 +39,8 @@ test('kitty keys go back to legacy bytes, but Shift+Enter becomes Alt+Enter', ()
   assert.equal(legacyKeys('\x1b[1;9:2C'), '\x1b[1;9C');
   assert.equal(legacyKeys('\x1b[1;1:3D'), '');
   assert.equal(legacyKeys('\x1b[3;5:1~'), '\x1b[3;5~');
+  assert.equal(legacyKeys('\x1b[1:9D'), '\x1b[1D'); // alternates, no modifiers
+  assert.equal(legacyKeys('\x1b[1:2;9:1C'), '\x1b[1;9C');
 });
 
 test('the filter passes keys through and hands pastes to fold, whole', async () => {

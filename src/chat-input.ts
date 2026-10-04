@@ -386,17 +386,20 @@ const KITTY_KEY = /\x1b\[(\d+)(?::\d*)*(?:;(\d+)(?::\d+)?)?(?:;[\d:]*)?u/g;
 const KP_ENTER = 57414;
 
 /**
- * Arrows, Home/End, F1-F4 and the `~` keys with an event type, `CSI 1;modifiers:event D`,
- * as some terminals send them. Readline doesn't know the colon and types out the rest
- * (a Left arrow as "1D"), so it's dropped; key releases are dropped whole.
+ * Arrows, Home/End, F1-F4 and the `~` keys with colon sub-parameters: an event type,
+ * `CSI 1;modifiers:event D`, or alternates, `CSI 1:alternate D`, as some terminals send
+ * them. Readline doesn't know the colon and types out the rest (a Left arrow as "1D", or
+ * "9D"), so sub-parameters are dropped; key releases are dropped whole.
  */
-const KITTY_CSI = /\x1b\[(\d*)(?::\d*)*;(\d*)(?::(\d+))?(?:;[\d:]*)?([A-DFHPQS~])/g;
+const KITTY_CSI = /\x1b\[([\d:;]*:[\d:;]*)([A-DFHPQS~])/g;
 
 export function legacyKeys(data: string): string {
-  data = data.replace(KITTY_CSI, (sequence, number: string, modifiers: string, event: string | undefined, final: string) => {
-    if (!event && !sequence.includes(':')) return sequence;
+  data = data.replace(KITTY_CSI, (_sequence, params: string, final: string) => {
+    const [first = '', second = ''] = params.split(';');
+    const number = first.split(':')[0];
+    const [modifiers, event] = second.split(':');
     if (event === '3') return '';
-    return `\x1b[${number || '1'};${modifiers || '1'}${final}`;
+    return modifiers ? `\x1b[${number || '1'};${modifiers}${final}` : `\x1b[${number}${final}`;
   });
   return data.replace(KITTY_KEY, (_sequence, code: string, modifiers = '1') => {
     // The keypad's Enter is Enter; other private-use codes are keys with no legacy
