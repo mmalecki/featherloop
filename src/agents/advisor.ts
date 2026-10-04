@@ -8,7 +8,8 @@ import { defineAgent } from '../agent.ts';
 export const advisorAgent = defineAgent({
   name: 'advisor',
   description:
-    'A stronger model for a second opinion: before committing to an approach, when stuck, or before calling work done. ' +
+    'A stronger model for a second opinion: before committing to an approach, when stuck (the same tests failing twice in a row, ' +
+    'or a command\'s output saying "[Same output as …]"), or before calling work done. ' +
     'Send the plan or problem, with transcript: true so it sees the conversation. It reads code but changes nothing',
   model: 'advisor',
   agents: ['advisor'],
