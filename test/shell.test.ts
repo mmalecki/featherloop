@@ -197,3 +197,98 @@ test('an abort kills a bg command, and its work rejects', async () => {
   await assert.rejects(work, /stop/);
   assert.ok(Date.now() - before < 1_000);
 });
+
+/** A tool kept across commands, as a loop keeps it, so it can tell when output repeats. */
+function repeating(params: { repeatWindow?: number } = {}) {
+  const tool = ShellTool({
+    params: { cwd: { value: dir }, ...(params.repeatWindow !== undefined ? { repeatWindow: { value: params.repeatWindow } } : {}) },
+  });
+  return (command: string) => tool.invoke({ command }, ctx);
+}
+
+test('notes when the output is the same as the previous run', async () => {
+  const run = repeating();
+  assert.equal(await run('echo 6 passed, 4 failed; exit 1'), '6 passed, 4 failed\n[exit code 1]');
+  assert.equal(await run('echo 6 passed, 4 failed; exit 1'), '6 passed, 4 failed\n[exit code 1]\n[Same output as the previous run]');
+});
+
+test('counts back to the latest run with the same output', async () => {
+  const run = repeating();
+  await run('echo a');
+  await run('echo a');
+  await run('echo b');
+  assert.equal(await run('echo a'), 'a\n[exit code 0]\n[Same output as 2 runs ago]');
+});
+
+test('ignores durations, escape codes and trailing whitespace', async () => {
+  const run = repeating();
+  // $$ differs between runs.
+  const command = String.raw`printf "\033[32m1 passed in 0.$$s (0:00:00)\033[0m  \nTime: $$ ms\nok (1$$ ms)\n\n"`;
+  const first = await run(command);
+  const second = await run(command);
+  assert.notEqual(first.split('\n')[0], second.split('\n')[0]);
+  assert.match(second, /\[exit code 0\]\n\[Same output as the previous run\]$/);
+  assert.match(await run('printf "1 passed in 0.3s (0:00:00)\nTime: 1 ms\nok (2 ms)"'), /\n\[Same output as the previous run\]$/);
+});
+
+test("doesn't take different test counts or exit codes for the same output", async () => {
+  const run = repeating();
+  await run('echo 1 passed');
+  assert.equal(await run('echo 2 passed'), '2 passed\n[exit code 0]');
+  assert.equal(await run('echo 2 passed; exit 1'), '2 passed\n[exit code 1]');
+});
+
+test('compares the whole output, not just what fits inline', async () => {
+  const tool = ShellTool({ params: { cwd: { value: dir }, maxLength: { value: 0 } } });
+  const run = async (command: string) => {
+    const result = await tool.invoke({ command }, ctx);
+    await rm(/saved to (.+)\]/.exec(result)![1]!);
+    return result;
+  };
+  await run('echo a; echo end');
+  assert.doesNotMatch(await run('echo b; echo end'), /Same output/);
+  assert.match(await run('echo b; echo end'), /\[exit code 0\]\n\[Same output as the previous run\]$/);
+});
+
+test('a timeout repeats like any other run', async () => {
+  const tool = ShellTool({ params: { cwd: { value: dir }, timeoutMs: { value: 200 } } });
+  const run = () => tool.invoke({ command: 'echo partial; sleep 5' }, ctx);
+  await run();
+  assert.equal(await run(), 'partial\n[timed out after 0.2s]\n[Same output as the previous run]');
+});
+
+test('notes no repeat of empty output', async () => {
+  const run = repeating();
+  await run('true');
+  assert.equal(await run('true'), '[exit code 0]');
+});
+
+test('repeatWindow sets how far back to look, and 0 turns it off', async () => {
+  const off = repeating({ repeatWindow: 0 });
+  await off('echo a');
+  assert.equal(await off('echo a'), 'a\n[exit code 0]');
+
+  const two = repeating({ repeatWindow: 2 });
+  await two('echo a');
+  await two('echo b');
+  assert.match(await two('echo a'), /\[Same output as 2 runs ago\]$/);
+  await two('echo c');
+  await two('echo d');
+  assert.equal(await two('echo a'), 'a\n[exit code 0]');
+});
+
+test("tools don't share what they've run", async () => {
+  await repeating()('echo a');
+  assert.equal(await repeating()('echo a'), 'a\n[exit code 0]');
+});
+
+test('a bg report notes when its output repeats', async () => {
+  const tool = ShellTool({ params: { cwd: { value: dir } } });
+  await tool.invoke({ command: 'echo 1 failed; exit 1' }, ctx);
+  let work!: Promise<string>;
+  await tool.invoke({ command: 'echo 1 failed; exit 1', bg: true }, { ...ctx, background: (promise) => (work = promise) });
+  const report = await work;
+  const match = /^Background command `.+` failed after \d+s \[exit code 1\]; output: 1 lines in (.+), ending:\n1 failed\n\[Same output as the previous run\]$/.exec(report);
+  assert.ok(match, report);
+  await rm(match[1]!);
+});
