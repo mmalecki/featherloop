@@ -1,10 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { open, rm, type FileHandle } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { defineTool, ToolInputError } from '../tool.ts';
-import { spawnGroup } from './shared/process.ts';
+import { createInterface } from 'node:readline';
+import { defineTool, ToolInputError, type Tool, type ToolOptions } from '../tool.ts';
+import { spawnGroup, type GroupResult } from './shared/process.ts';
 
 export interface ShellParams {
   command: string;
@@ -17,95 +18,112 @@ export interface ShellParams {
   bgTimeoutMs: number;
   /** Longer output keeps only its end; the full output stays in a temporary file. */
   maxLength: number;
+  /** How many earlier runs to compare output with, to note repeats. 0 turns that off. */
+  repeatWindow: number;
   shell: string;
 }
 
 /**
  * Runs a shell command with full access to the machine, as the current user.
  * There is no sandbox: only give it to agents you'd let use your terminal.
+ *
+ * When a command's output is the same as an earlier run's, the result says so:
+ * small models don't notice they're going in circles, but follow a signal.
  */
-export const ShellTool = defineTool<ShellParams>({
-  description: 'Run a shell command and return its combined output and exit code.',
-  sequential: true,
-  params: {
-    command: {
-      schema: { type: 'string', description: 'Command to run' },
-      required: true,
-    },
-    bg: {
-      schema: { type: 'boolean', description: 'Run in the background: return at once, and get a message when it exits' },
-      default: false,
-    },
-    cwd: {
-      schema: { type: 'string' },
-      expose: false,
-    },
-    timeoutMs: {
-      schema: { type: 'integer', minimum: 1 },
-      default: 120_000,
-      expose: false,
-    },
-    bgTimeoutMs: {
-      schema: { type: 'integer', minimum: 1 },
-      default: 30 * 60_000,
-      expose: false,
-    },
-    maxLength: {
-      schema: {
-        type: 'integer',
-        minimum: 0,
-        description:
-          'Max characters of output to return. Longer output keeps its end, and the full output is saved to a file. ' +
-          'Use 0 to only save it to a file, then read or search the file.',
+export function ShellTool(options?: ToolOptions<ShellParams>): Tool {
+  // Per instance: each loop and subagent builds its own tools, so they don't share history.
+  const repeats = new Repeats();
+  return defineTool<ShellParams>({
+    description: 'Run a shell command and return its combined output and exit code.',
+    sequential: true,
+    params: {
+      command: {
+        schema: { type: 'string', description: 'Command to run' },
+        required: true,
       },
-      default: 20_000,
-      expose: false,
+      bg: {
+        schema: { type: 'boolean', description: 'Run in the background: return at once, and get a message when it exits' },
+        default: false,
+      },
+      cwd: {
+        schema: { type: 'string' },
+        expose: false,
+      },
+      timeoutMs: {
+        schema: { type: 'integer', minimum: 1 },
+        default: 120_000,
+        expose: false,
+      },
+      bgTimeoutMs: {
+        schema: { type: 'integer', minimum: 1 },
+        default: 30 * 60_000,
+        expose: false,
+      },
+      maxLength: {
+        schema: {
+          type: 'integer',
+          minimum: 0,
+          description:
+            'Max characters of output to return. Longer output keeps its end, and the full output is saved to a file. ' +
+            'Use 0 to only save it to a file, then read or search the file.',
+        },
+        default: 20_000,
+        expose: false,
+      },
+      repeatWindow: {
+        schema: { type: 'integer', minimum: 0 },
+        default: 20,
+        expose: false,
+      },
+      shell: {
+        schema: { type: 'string' },
+        default: '/bin/sh',
+        expose: false,
+      },
     },
-    shell: {
-      schema: { type: 'string' },
-      default: '/bin/sh',
-      expose: false,
-    },
-  },
 
-  async invoke({ command, bg, cwd, timeoutMs, bgTimeoutMs, maxLength, shell }, { signal, background }) {
-    if (bg) {
-      if (!background) throw new ToolInputError('bg needs an agent loop to report back to');
-      return startBackground(command, { cwd: cwd ?? process.cwd(), timeoutMs: bgTimeoutMs, shell, signal }, maxLength, background);
-    }
-    // stdout and stderr both go to this file, so the kernel keeps their writes in
-    // order, whatever the shell, and long output never has to fit in memory.
-    // Owner-only and created afresh: command output can contain secrets, and the
-    // temp directory is shared. There's no size limit yet: unlike a pipe, a file
-    // never makes the command wait, so runaway output fills the disk.
-    const file = join(tmpdir(), `featherloop-shell-${randomUUID()}.log`);
-    const handle = await open(file, 'ax+', 0o600);
-    let keep = false;
-    try {
-      const { status, lingering } = await run(command, handle.fd, { cwd: cwd ?? process.cwd(), timeoutMs, shell, signal });
-      const { size } = await handle.stat();
-      const out: string[] = [];
-      if (size > 0 && maxLength === 0) {
-        keep = true;
-        out.push(`[Output (${size} bytes) saved to ${file}]`);
-      } else if (size > 0) {
-        const { text, omitted } = await tail(handle, size, maxLength);
-        keep = omitted > 0;
-        if (omitted) out.push(`[… ${omitted} bytes omitted; full output saved to ${file} …]`);
-        if (text) out.push(text);
+    async invoke({ command, bg, cwd, timeoutMs, bgTimeoutMs, maxLength, repeatWindow, shell }, { signal, background }) {
+      if (bg) {
+        if (!background) throw new ToolInputError('bg needs an agent loop to report back to');
+        const check = (file: string, size: number, result: GroupResult) => repeats.check(file, size, result, repeatWindow);
+        return startBackground(command, { cwd: cwd ?? process.cwd(), timeoutMs: bgTimeoutMs, shell, signal }, maxLength, check, background);
       }
-      out.push(status);
-      if (lingering) {
-        keep = true;
-        out.push(`[Processes it started are still running; their output goes to ${file}]`);
+      // stdout and stderr both go to this file, so the kernel keeps their writes in
+      // order, whatever the shell, and long output never has to fit in memory.
+      // Owner-only and created afresh: command output can contain secrets, and the
+      // temp directory is shared. There's no size limit yet: unlike a pipe, a file
+      // never makes the command wait, so runaway output fills the disk.
+      const file = join(tmpdir(), `featherloop-shell-${randomUUID()}.log`);
+      const handle = await open(file, 'ax+', 0o600);
+      let keep = false;
+      try {
+        const result = await run(command, handle.fd, { cwd: cwd ?? process.cwd(), timeoutMs, shell, signal });
+        const { size } = await handle.stat();
+        const out: string[] = [];
+        if (size > 0 && maxLength === 0) {
+          keep = true;
+          out.push(`[Output (${size} bytes) saved to ${file}]`);
+        } else if (size > 0) {
+          const { text, omitted } = await tail(handle, size, maxLength);
+          keep = omitted > 0;
+          if (omitted) out.push(`[… ${omitted} bytes omitted; full output saved to ${file} …]`);
+          if (text) out.push(text);
+        }
+        out.push(statusOf(result));
+        const repeat = await repeats.check(file, size, result, repeatWindow);
+        if (repeat) out.push(repeat);
+        if (result.lingering) {
+          keep = true;
+          out.push(`[Processes it started are still running; their output goes to ${file}]`);
+        }
+        return out.join('\n');
+      } finally {
+        await handle.close();
+        if (!keep) await rm(file, { force: true });
       }
-      return out.join('\n');
-    } finally {
-      await handle.close();
-      if (!keep) await rm(file, { force: true });
-    }
-  },
-});
+    },
+  })(options);
+}
 
 /**
  * Starts a command and returns at once; `background` gets its report for when it
@@ -116,6 +134,7 @@ async function startBackground(
   command: string,
   options: RunOptions,
   maxLength: number,
+  check: (file: string, size: number, result: GroupResult) => Promise<string | undefined>,
   background: (work: Promise<string>) => void,
 ): Promise<string> {
   const file = join(tmpdir(), `featherloop-shell-${randomUUID()}.log`);
@@ -134,11 +153,12 @@ async function startBackground(
   background(
     (async () => {
       try {
-        const { code, exitSignal, stopped, lingering } = await done;
-        const status = stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${exitSignal}]`;
-        const after = `after ${Math.round((Date.now() - started) / 1000)}s ${status}`;
+        const result = await done;
+        const { code, lingering } = result;
+        const after = `after ${Math.round((Date.now() - started) / 1000)}s ${statusOf(result)}`;
         const { size } = await handle.stat();
-        const still = lingering ? `\n[Processes it started are still running; their output goes to ${file}]` : '';
+        const repeat = await check(file, size, result);
+        const still = (repeat ? `\n${repeat}` : '') + (lingering ? `\n[Processes it started are still running; their output goes to ${file}]` : '');
         if (size === 0 && !lingering) {
           await rm(file, { force: true });
           return `Background command ${name} ${code === 0 ? 'finished' : 'failed'} ${after}, with no output`;
@@ -182,19 +202,92 @@ interface RunOptions {
   signal: AbortSignal | undefined;
 }
 
-interface RunResult {
-  status: string;
-  /** Whether processes the command started, e.g. with `&`, outlived it. */
-  lingering: boolean;
-}
-
-async function run(command: string, output: number, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<RunResult> {
+async function run(command: string, output: number, { cwd, timeoutMs, shell, signal }: RunOptions): Promise<GroupResult> {
   // 'exit', not 'close': there are no pipes to drain, and processes the command
   // left running in the background don't hold the tool up.
   const { done } = spawnGroup(shell, ['-c', command], { cwd, stdio: ['ignore', output, output], timeoutMs, signal, until: 'exit' });
-  const { code, exitSignal, stopped, lingering } = await done;
-  const status = stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${exitSignal}]`;
-  return { status, lingering };
+  return done;
+}
+
+function statusOf({ code, exitSignal, stopped }: GroupResult): string {
+  return stopped ? `[${stopped}]` : code !== null ? `[exit code ${code}]` : `[killed by ${exitSignal}]`;
+}
+
+/**
+ * Remembers recent runs by a hash of their output and how they ended, never the
+ * output itself, to tell the model when a run repeats an earlier one.
+ */
+class Repeats {
+  #runs: string[] = [];
+
+  /** Records a run, and returns a note if one of the last `window` runs had the same output. */
+  async check(file: string, size: number, result: GroupResult, window: number): Promise<string | undefined> {
+    if (window === 0) return undefined;
+    // Timed out and killed alike: no "after 120s", which differs between bg and not.
+    const ended = result.stopped ? 'stopped' : statusOf(result);
+    let fingerprinted: { hash: string; empty: boolean };
+    try {
+      fingerprinted = await fingerprint(file, size, ended);
+    } catch {
+      // Only a note: a missed one costs little, but the command's result must still get through.
+      return undefined;
+    }
+    const { hash, empty } = fingerprinted;
+    const at = this.#runs.lastIndexOf(hash);
+    const ago = this.#runs.length - at;
+    this.#runs.push(hash);
+    this.#runs = this.#runs.slice(-window);
+    // A repeated `mkdir` or `touch` is harmless.
+    if (empty || at === -1) return undefined;
+    return ago === 1 ? '[Same output as the previous run]' : `[Same output as ${ago} runs ago]`;
+  }
+}
+
+/**
+ * Hashes a run's whole output, from its file, with what changes between identical
+ * runs normalised away. Line by line, so long output never has to fit in memory.
+ * Only its first `size` bytes, what the result was made from: processes the command
+ * left running may still be writing to it.
+ */
+async function fingerprint(file: string, size: number, ended: string): Promise<{ hash: string; empty: boolean }> {
+  const hash = createHash('sha256').update(`${ended}\n`);
+  let empty = true;
+  let blank = 0;
+  // `end` is inclusive, and there's no stream to read for an empty file.
+  const lines = size > 0 ? createInterface({ input: createReadStream(file, { end: size - 1 }), crlfDelay: Infinity }) : [];
+  for await (const raw of lines) {
+    const line = normalise(raw);
+    // Blank lines count only once something follows them: trailing ones are dropped.
+    if (!line) {
+      blank++;
+      continue;
+    }
+    hash.update(`${'\n'.repeat(blank)}${line}\n`);
+    blank = 0;
+    empty = false;
+  }
+  return { hash: hash.digest('hex'), empty };
+}
+
+// Conservative: a missed repeat costs little, a false one tells a model making
+// progress that it's stuck. So only escape codes and timings, never digits at large:
+// `6 passed, 4 failed` must still count.
+const ansi = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+const seconds = String.raw`\d+(?:\.\d+)? ?(?:ms|s)\b`;
+const durations = [
+  // pytest's `in 0.05s (0:00:00)`, unittest's `Ran 3 tests in 0.001s`.
+  new RegExp(String.raw`\bin ${seconds}(?: \(\d+:\d\d:\d\d\))?`, 'g'),
+  // jest's `Time: 1.234 s, estimated 2 s`.
+  new RegExp(String.raw`\bTime: +${seconds}(?:, estimated ${seconds})?`, 'g'),
+  // Per test: jest's `(12 ms)`, mocha's `(12ms)`, go's `(0.00s)`.
+  new RegExp(String.raw`\(${seconds}\)`, 'g'),
+  new RegExp(String.raw`\btook ${seconds}`, 'g'),
+];
+
+function normalise(line: string): string {
+  line = line.replace(ansi, '');
+  for (const duration of durations) line = line.replace(duration, (match) => match.replace(/\d+(?:\.\d+)?/g, 'N'));
+  return line.trimEnd();
 }
 
 /**
