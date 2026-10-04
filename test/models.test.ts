@@ -162,6 +162,28 @@ test('rejects aliases it could not resolve', () => {
   rejects({ advisor: { model: 'local/qwen', variant: 'low' } }, /^aliases\.advisor\.variant: local\/qwen has no variant low/);
   rejects({ advisor: { model: 'local/qwen', effort: 'high' } }, /^aliases\.advisor\.effort isn't supported/);
   rejects({ advisor: 1 }, /^aliases\.advisor must be a mapping/);
+  // Only a model can opt out of an alias.
+  rejects({ advisor: null }, /^aliases\.advisor must be a mapping/);
+});
+
+test("checks models' own aliases as the config's, and lets them opt out with null", () => {
+  const base = parseConfig(CONFIG);
+  const withAliases = (aliases: unknown) => {
+    const config = structuredClone(base);
+    (config.provider!.local!.models.qwen as Record<string, unknown>).aliases = aliases;
+    return checkConfig(config);
+  };
+  const rejects = (aliases: unknown, message: RegExp) =>
+    assert.throws(() => withAliases(aliases), (err) => err instanceof ConfigError && message.test(err.message));
+  assert.deepEqual(withAliases({ advisor: 'anthropic/claude-sonnet-5-5', compact: null }).provider!.local!.models.qwen!.aliases, {
+    advisor: 'anthropic/claude-sonnet-5-5',
+    compact: null,
+  });
+  rejects({ 'a/b': 'local/qwen' }, /^provider\.local\.models\.qwen\.aliases\.a\/b: alias names can't contain "\/"/);
+  rejects({ advisor: 'writer' }, /^provider\.local\.models\.qwen\.aliases\.advisor\.model names no configured model: writer/);
+  rejects({ advisor: { model: 'anthropic/claude-opus-5-5', variant: 'low' } }, /aliases\.advisor\.variant: anthropic\/claude-opus-5-5 has no variant low/);
+  rejects({ advisor: 1 }, /^provider\.local\.models\.qwen\.aliases\.advisor must be a mapping/);
+  rejects([], /^provider\.local\.models\.qwen\.aliases must be a mapping/);
 });
 
 test('splits references at the first slash, and knows only its providers', async () => {
