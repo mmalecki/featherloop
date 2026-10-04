@@ -231,6 +231,16 @@ test('ignores durations, escape codes and trailing whitespace', async () => {
   assert.match(await run('printf "1 passed in 0.3s (0:00:00)\nTime: 1 ms\nok (2 ms)"'), /\n\[Same output as the previous run\]$/);
 });
 
+test("ignores Python's object addresses", async () => {
+  const run = repeating();
+  // $$ differs between runs, like the address of an object.
+  const command = String.raw`printf "E   AssertionError: <pov.Tree object at 0x7f%x> != <pov.Tree object at 0x7e%x>\n" $$ $$`;
+  const first = await run(command);
+  const second = await run(command);
+  assert.notEqual(first.split('\n')[0], second.split('\n')[0]);
+  assert.match(second, /\[exit code 0\]\n\[Same output as the previous run\]$/);
+});
+
 test("doesn't take different test counts or exit codes for the same output", async () => {
   const run = repeating();
   await run('echo 1 passed');

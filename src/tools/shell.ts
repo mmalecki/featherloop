@@ -270,8 +270,8 @@ async function fingerprint(file: string, size: number, ended: string): Promise<{
 }
 
 // Conservative: a missed repeat costs little, a false one tells a model making
-// progress that it's stuck. So only escape codes and timings, never digits at large:
-// `6 passed, 4 failed` must still count.
+// progress that it's stuck. So only escape codes, timings and object addresses, never
+// digits at large: `6 passed, 4 failed` must still count.
 const ansi = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
 const seconds = String.raw`\d+(?:\.\d+)? ?(?:ms|s)\b`;
 const durations = [
@@ -283,10 +283,13 @@ const durations = [
   new RegExp(String.raw`\(${seconds}\)`, 'g'),
   new RegExp(String.raw`\btook ${seconds}`, 'g'),
 ];
+// Python's reprs in test failures, new each run: `<pov.Tree object at 0x7ef16deab1d0>`.
+const addresses = /\bat 0x[0-9a-f]+\b/g;
 
 function normalise(line: string): string {
   line = line.replace(ansi, '');
   for (const duration of durations) line = line.replace(duration, (match) => match.replace(/\d+(?:\.\d+)?/g, 'N'));
+  line = line.replace(addresses, 'at 0xN');
   return line.trimEnd();
 }
 
