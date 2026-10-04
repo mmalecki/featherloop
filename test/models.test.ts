@@ -186,6 +186,39 @@ test("checks models' own aliases as the config's, and lets them opt out with nul
   rejects([], /^provider\.local\.models\.qwen\.aliases must be a mapping/);
 });
 
+test("sets up submodels by the model's own alias, else the config's, else as a reference", async () => {
+  const config = parseConfig(`${CONFIG}
+aliases:
+  advisor: anthropic/claude-sonnet-5-5
+  compact: anthropic/claude-haiku-4-5
+`);
+  config.provider!.anthropic!.models['claude-sonnet-5-5']!.aliases = { advisor: { model: 'anthropic/claude-opus-5-5', variant: 'max' } };
+  config.provider!.anthropic!.models['claude-opus-5-5']!.aliases = { advisor: null, compact: null };
+  const registry = new ModelRegistry(checkConfig(config));
+
+  // The config's alias, for a model without its own; then each model's own, in a chain.
+  const qwen = await registry.resolve('local/qwen');
+  const sonnet = (await qwen.submodel!('advisor'))!;
+  assert.deepEqual([sonnet.ref, sonnet.alias, sonnet.variant], ['anthropic/claude-sonnet-5-5', 'advisor', 'high']);
+  const opus = (await sonnet.submodel!('advisor'))!;
+  assert.deepEqual([opus.ref, opus.alias, opus.variant], ['anthropic/claude-opus-5-5', 'advisor', 'max']);
+  assert.equal((opus.api as AnthropicProvider).options.effort, 'max');
+  // A variant asked for wins over the alias's.
+  assert.equal((await sonnet.submodel!('advisor', 'max'))!.variant, 'max');
+
+  // Opted out with null, or no alias at all.
+  assert.equal(await opus.submodel!('advisor'), undefined);
+  assert.equal(await opus.submodel!('compact'), undefined);
+  assert.equal(await qwen.submodel!('writer'), undefined);
+  // References are set up as they are, from any model.
+  assert.equal((await opus.submodel!('local/qwen'))!.ref, 'local/qwen');
+  await assert.rejects(opus.submodel!('local/llama'), /Unknown model "local\/llama"/);
+
+  // Without a model to start from, only the config's aliases.
+  assert.equal((await registry.submodel('compact'))!.ref, 'anthropic/claude-haiku-4-5');
+  assert.equal(await registry.submodel('writer'), undefined);
+});
+
 test('splits references at the first slash, and knows only its providers', async () => {
   const registry = new ModelRegistry(parseConfig(CONFIG));
   assert.deepEqual(registry.parseRef('local/Qwen/Qwen3.5-9B'), { provider: 'local', model: 'Qwen/Qwen3.5-9B' });

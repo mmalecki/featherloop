@@ -18,10 +18,19 @@ export interface ResolvedModel {
   /** The id the API knows the model by. */
   model: string;
   variant?: string;
+  /** Sets up other models as this one refers to them, e.g. its advisor. Absent for a model that knows no others. */
+  submodel?: Submodel;
 }
 
 /** Sets up a model by reference, e.g. a `ModelRegistry`'s `resolve()` or the CLI's, which also takes bare ids. */
 export type ModelResolver = (ref: string, variant?: string) => Promise<ResolvedModel>;
+
+/**
+ * Sets up a model as another refers to it: by that model's own alias, else the
+ * config's, else as `provider/model`. Undefined when the model opts out of the
+ * alias (`null`), or when there's no alias by that name.
+ */
+export type Submodel = (ref: string, variant?: string) => Promise<ResolvedModel | undefined>;
 
 /** The models a config's providers offer, referred to as `provider/model`. */
 export class ModelRegistry {
@@ -64,12 +73,7 @@ export class ModelRegistry {
    * the alias's, else the model's `default` if it has one.
    */
   async resolve(ref: string, { variant: asked }: { variant?: string | undefined } = {}): Promise<ResolvedModel> {
-    if (Object.hasOwn(this.#aliases, ref)) {
-      const value = this.#aliases[ref]!;
-      const { model, variant } = typeof value === 'string' ? { model: value } : value;
-      if (!this.parseRef(model)) throw new ConfigError(`Alias ${ref} names no configured model: ${model}`);
-      return { ...(await this.resolve(model, { variant: asked ?? variant })), alias: ref };
-    }
+    if (Object.hasOwn(this.#aliases, ref)) return this.#alias(ref, this.#aliases[ref]!, asked);
     const { parsed, config } = this.#model(ref);
     const variants = config.variants ?? {};
     let variant = asked ?? (Object.hasOwn(variants, 'default') ? 'default' : undefined);
@@ -105,7 +109,35 @@ export class ModelRegistry {
             ...(effort !== undefined ? { effort: effort as Effort } : {}),
             request: fields,
           });
-    return { ref, api, model: parsed.model, ...(variant !== undefined ? { variant } : {}) };
+    return {
+      ref,
+      api,
+      model: parsed.model,
+      ...(variant !== undefined ? { variant } : {}),
+      submodel: (name, variant) => this.submodel(name, { from: ref, variant }),
+    };
+  }
+
+  /**
+   * Sets up `ref` as the model `from` refers to it: by `from`'s own alias, else
+   * the config's, else as `provider/model`. Undefined when `from` sets the alias
+   * to `null`, or when neither has it. Without `from`, only the config's aliases.
+   */
+  async submodel(ref: string, { from, variant }: { from?: string | undefined; variant?: string | undefined } = {}): Promise<ResolvedModel | undefined> {
+    const own = from === undefined ? undefined : this.#model(from).config.aliases;
+    if (own && Object.hasOwn(own, ref)) {
+      const value = own[ref]!;
+      return value === null ? undefined : this.#alias(ref, value, variant);
+    }
+    // Alias names have no slash, so a name with one is a model reference.
+    return Object.hasOwn(this.#aliases, ref) || ref.includes('/') ? this.resolve(ref, { variant }) : undefined;
+  }
+
+  /** An alias's model, with the variant asked for, else the alias's. */
+  async #alias(name: string, value: string | AliasConfig, asked: string | undefined): Promise<ResolvedModel> {
+    const { model, variant } = typeof value === 'string' ? { model: value } : value;
+    if (!this.parseRef(model)) throw new ConfigError(`Alias ${name} names no configured model: ${model}`);
+    return { ...(await this.resolve(model, { variant: asked ?? variant })), alias: name };
   }
 
   #model(ref: string) {
