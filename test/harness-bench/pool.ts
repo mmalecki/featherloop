@@ -38,6 +38,8 @@ export interface Server {
   busy: number;
   /** Health checks failed in a row. */
   failures: number;
+  /** When its state last changed, as the pool counts (`#tick`): checks that started before say nothing of it now. */
+  changed: number;
   /** Why it isn't up. */
   why?: string;
   props?: Health['props'];
@@ -70,6 +72,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
   #checking = false;
   #listing = false;
   #suspects = new Set<Server>();
+  #ticks = 0;
 
   constructor(options: PoolOptions) {
     super();
@@ -112,7 +115,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
           known.listed = true;
           continue;
         }
-        const server: Server = { url, state: 'probing', listed: true, slots: 0, busy: 0, failures: 0 };
+        const server: Server = { url, state: 'probing', listed: true, slots: 0, busy: 0, failures: 0, changed: 0 };
         this.servers.set(url, server);
         fresh.push(server);
       }
@@ -167,9 +170,10 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
   async suspect(server: Server): Promise<void> {
     if (server.state !== 'up' || this.#suspects.has(server)) return;
     this.#suspects.add(server);
-    const health = await this.#options.probe(server.url).catch((err: unknown): Health => ({ ok: false, why: (err as Error).message }));
+    const at = this.#tick();
+    const health = await this.#probe(server);
     this.#suspects.delete(server);
-    if (server.state === 'up') this.#take(server, health, true);
+    if (server.state === 'up') this.#take(server, health, at, true);
     this.emit('change');
   }
 
@@ -184,19 +188,25 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
   }
 
   /**
-   * Checks servers at once, then takes what they said in list order. With no
-   * reference yet, the one most of the healthy serve is it (the first listed's, on a
-   * tie), not whichever answered first: one odd server can't set it for the rest.
+   * Checks servers at once, and takes what each says as it answers: one that doesn't
+   * answer doesn't hold up the rest. With no reference yet, it waits for all, and the
+   * one most of the healthy serve is it (the first listed's, on a tie), not whichever
+   * answered first: one odd server can't set it for the rest.
    */
   async #round(servers: Server[]): Promise<void> {
-    const healths = await Promise.all(
-      servers.map((server) =>
-        this.#options.probe(server.url).catch((err: unknown): Health => ({ ok: false, why: (err as Error).message })),
-      ),
+    const voting = !this.reference;
+    const results = await Promise.all(
+      servers.map(async (server) => {
+        const at = this.#tick();
+        const health = await this.#probe(server);
+        if (!voting) this.#take(server, health, at);
+        return { server, health, at };
+      }),
     );
+    if (!voting) return;
     if (!this.reference) {
       const votes = new Map<string, { reference: Reference; count: number }>();
-      for (const health of healths) {
+      for (const { health } of results) {
         if (!health.ok) continue;
         const found = reference(health);
         const key = JSON.stringify(found);
@@ -207,19 +217,33 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
       for (const vote of votes.values()) if (!best || vote.count > best.count) best = vote;
       if (best) this.reference = best.reference;
     }
-    servers.forEach((server, i) => this.#take(server, healths[i]!));
+    for (const { server, health, at } of results) this.#take(server, health, at);
   }
 
-  /** Takes what a check found; `suspect`: a run just failed on the server, so one failed check takes it out. */
-  #take(server: Server, health: Health, suspect = false): void {
-    // Forgotten meanwhile.
-    if (this.servers.get(server.url) !== server) return;
+  /** Orders checks and state changes: clocks can't, within a millisecond. */
+  #tick(): number {
+    return ++this.#ticks;
+  }
+
+  #probe(server: Server): Promise<Health> {
+    return this.#options.probe(server.url).catch((err: unknown): Health => ({ ok: false, why: (err as Error).message }));
+  }
+
+  /**
+   * Takes what a check that started `at` found, unless the server changed state
+   * since (a check from before it went down says nothing of it now). `suspect`: a
+   * run just failed on the server, so one failed check takes it out.
+   */
+  #take(server: Server, health: Health, at: number, suspect = false): void {
+    // Forgotten meanwhile, or stale.
+    if (this.servers.get(server.url) !== server || at < server.changed) return;
     const log = (line: string) => this.#options.log(`server ${server.url}: ${line}`);
     if (!health.ok) {
       server.failures++;
       const why = health.why ?? 'unhealthy';
       if (server.state === 'up' && (suspect || server.failures >= (this.#options.failures ?? 2))) {
         server.state = 'down';
+        server.changed = this.#tick();
         server.why = why;
         const checks = `${server.failures} failed check${server.failures === 1 ? '' : 's'}${suspect ? ' after a run failed on it' : ''}`;
         log(`down after ${checks} (${why})${server.busy ? `; requeueing its ${server.busy} runs` : ''}`);
@@ -236,6 +260,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     if (found.model !== expected.model || found.build !== expected.build) {
       const why = `serves ${found.model} (build ${found.build}), not the pool's ${expected.model} (build ${expected.build})`;
       if (server.state !== 'refused' || server.why !== why) log(`refused: ${why}`);
+      if (server.state !== 'refused') server.changed = this.#tick();
       server.state = 'refused';
       server.why = why;
       return;
@@ -244,6 +269,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     const jobs = this.#options.jobs ?? Infinity;
     server.slots = Math.max(1, Math.min(health.props?.slots ?? (Number.isFinite(jobs) ? jobs : 1), jobs));
     server.state = 'up';
+    server.changed = this.#tick();
     delete server.why;
     log(`joined, ${server.slots} run${server.slots === 1 ? '' : 's'} at once`);
     this.emit('join', server);

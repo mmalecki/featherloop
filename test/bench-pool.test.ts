@@ -4,8 +4,11 @@ import { LOST, ServerPool, WorkQueue, type Attempt, type Health } from './harnes
 
 const props = (slots: number, model = '/models/qwen.gguf', build = 'b1') => ({ modelPath: model, build, slots });
 
+/** A server's health, or a check the test answers when it likes. */
+type Check = Health | (() => Promise<Health>);
+
 /** A pool over a list and health the test changes; checks only when told. */
-function pool(servers: Record<string, Health>, options: { jobs?: number; reference?: { model: string; build: string } } = {}) {
+function pool(servers: Record<string, Check>, options: { jobs?: number; reference?: { model: string; build: string } } = {}) {
   const lines: string[] = [];
   let list: string[] | Error = Object.keys(servers);
   const p = new ServerPool({
@@ -14,7 +17,10 @@ function pool(servers: Record<string, Health>, options: { jobs?: number; referen
       return list;
     },
     listEvery: Infinity,
-    probe: async (url) => servers[url] ?? { ok: false, why: 'connection refused' },
+    probe: async (url) => {
+      const check = servers[url] ?? { ok: false, why: 'connection refused' };
+      return typeof check === 'function' ? check() : check;
+    },
     checkEvery: Infinity,
     log: (line) => lines.push(line),
     ...options,
@@ -79,7 +85,7 @@ describe('ServerPool and WorkQueue', () => {
   });
 
   test('a server joins when listed and healthy, and one no longer listed takes no new runs but finishes its own', async () => {
-    const servers: Record<string, Health> = { a: { ok: true, props: props(1) }, b: { ok: true, props: props(1) } };
+    const servers: Record<string, Check> = { a: { ok: true, props: props(1) }, b: { ok: true, props: props(1) } };
     const { pool: p, setList, lines } = pool(servers);
     setList(['a']);
     await p.start();
@@ -113,7 +119,7 @@ describe('ServerPool and WorkQueue', () => {
   });
 
   test("a server that fails two checks in a row leaves the pool; its runs go back on the front of the queue, to the others", async () => {
-    const servers: Record<string, Health> = { a: { ok: true, props: props(2) }, b: { ok: true, props: props(1) } };
+    const servers: Record<string, Check> = { a: { ok: true, props: props(2) }, b: { ok: true, props: props(1) } };
     const { pool: p, lines } = pool(servers);
     await p.start();
     const { q, running, end, requeues } = queue(p, ['1', '2', '3', '4']);
@@ -165,7 +171,7 @@ describe('ServerPool and WorkQueue', () => {
   });
 
   test('a server a run just failed on is checked at once, and out if it fails', async () => {
-    const servers: Record<string, Health> = { a: { ok: true, props: props(1) }, b: { ok: true, props: props(1) } };
+    const servers: Record<string, Check> = { a: { ok: true, props: props(1) }, b: { ok: true, props: props(1) } };
     const { pool: p, lines } = pool(servers);
     await p.start();
     const { q, running, end, requeues } = queue(p, ['1', '2', '3']);
@@ -181,6 +187,27 @@ describe('ServerPool and WorkQueue', () => {
     assert.deepEqual(on(running()), ['2@b'], 'nothing more on it');
     await end(running()[0]!);
     assert.deepEqual(on(running()), ['1@b']);
+  });
+
+  test('a check that started before a server went down says nothing of it now', async () => {
+    const servers: Record<string, Check> = { a: { ok: true, props: props(1) } };
+    const { pool: p } = pool(servers);
+    await p.start();
+    const { q, running, end } = queue(p, ['1', '2']);
+    q.pump();
+    // A scheduled check finds it well, but takes its time to say so (another server's doesn't answer)...
+    let answer!: (health: Health) => void;
+    servers.a = () => new Promise((resolve) => (answer = resolve));
+    const checking = p.check();
+    // ...while it dies, and a run on it fails.
+    servers.a = { ok: false, why: 'connect ECONNREFUSED' };
+    await end(running()[0]!, 'connect ECONNREFUSED');
+    await tick();
+    assert.equal(p.servers.get('a')!.state, 'down');
+    answer({ ok: true, props: props(1) });
+    await checking;
+    assert.equal(p.servers.get('a')!.state, 'down');
+    assert.deepEqual(running(), []);
   });
 
   test('a requeued run goes to another server than the one it failed on, if one has a free slot', async () => {
@@ -238,7 +265,7 @@ describe('ServerPool and WorkQueue', () => {
   });
 
   test('a server that is loading joins once it is healthy', async () => {
-    const servers: Record<string, Health> = { a: { ok: false, why: 'HTTP 503' } };
+    const servers: Record<string, Check> = { a: { ok: false, why: 'HTTP 503' } };
     const { pool: p } = pool(servers);
     await p.start();
     const { q, running, lines } = queue(p, ['1']);
