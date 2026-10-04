@@ -69,6 +69,8 @@ export interface Harness {
   setup(ctx: HarnessContext): Invocation;
   /** How it's set up, beyond the model and the proxy, for the report. */
   notes(settings: Settings): string[];
+  /** Whether it can run the model; all can, unless they say otherwise. */
+  supports?(model: Model): boolean;
 }
 
 const REPO = resolve(import.meta.dirname, '..', '..');
@@ -145,6 +147,34 @@ const nanocode: Harness = {
   ],
 };
 
+/**
+ * Claude Code, headless (`-p`), against the run's proxy: `ANTHROPIC_BASE_URL` and a
+ * dummy key the proxy replaces. Its background model is the model under test, so
+ * every call it makes is metered; telemetry, nonessential traffic and updates are off.
+ * Anthropic models only: it speaks the Messages API with Claude's features.
+ */
+const claudeCode: Harness = {
+  name: 'claude-code',
+  description: 'Claude Code, headless (-p), with permissions skipped',
+  supports: (model) => model.flavor === 'anthropic',
+  prepare: () => isolated((env) => execFileSync(claudeBin(), ['--version'], { encoding: 'utf8', env }).trim()),
+  setup: ({ baseURL, model, prompt }) => ({
+    command: claudeBin(),
+    args: ['-p', prompt, '--model', model.id, '--output-format', 'stream-json', '--verbose', '--dangerously-skip-permissions'],
+    env: {
+      // The SDK adds /v1 itself.
+      ANTHROPIC_BASE_URL: baseURL.replace(/\/v1\/?$/, ''),
+      ANTHROPIC_API_KEY: 'bench',
+      ANTHROPIC_SMALL_FAST_MODEL: model.id,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: model.id,
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      DISABLE_TELEMETRY: '1',
+      DISABLE_AUTOUPDATER: '1',
+    },
+  }),
+  notes: () => ['headless (-p), --dangerously-skip-permissions; its background model set to the model under test; telemetry and updates off'],
+};
+
 export const HARNESSES: Harness[] = [
   featherloop,
   opencode('opencode-stock', 'opencode with only the provider configured; config: harnesses/opencode-stock', [
@@ -155,7 +185,13 @@ export const HARNESSES: Harness[] = [
     'websearch off (it needs a key; the cases are offline)',
   ]),
   nanocode,
+  claudeCode,
 ];
+
+/** `CLAUDE_BIN`, or `claude` on the PATH. */
+function claudeBin(): string {
+  return process.env.CLAUDE_BIN || 'claude';
+}
 
 /** `OPENCODE_BIN`, or `opencode` on the PATH. */
 function opencodeBin(): string {

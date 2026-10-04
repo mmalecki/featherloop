@@ -286,7 +286,8 @@ export class MeteringProxy {
 
 function describeRequest(seq: number, path: string, body: Buffer): { record: RequestRecord; offered: Set<string>; json: Json | undefined } {
   const json = tryParse(body) as Record<string, any> | undefined;
-  const dialect = path.startsWith('chat/completions') ? 'openai' : path.startsWith('messages') ? 'anthropic' : 'other';
+  // Model requests only: `messages/count_tokens` and the like are 'other', passed through as they are.
+  const dialect = /^chat\/completions(\?|$)/.test(path) ? 'openai' : /^messages(\?|$)/.test(path) ? 'anthropic' : 'other';
   const params: Record<string, unknown> = {};
   for (const key of PARAMS) if (json && Object.hasOwn(json, key)) params[key] = json[key];
   const tools: Json[] = Array.isArray(json?.tools) ? json.tools : [];

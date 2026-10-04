@@ -37,6 +37,7 @@ Results land in `results/<timestamp>/`: `summary.md` and `summary.json`, `result
 | `opencode-stock` | `opencode run --standalone --auto`, provider only | `harnesses/opencode-stock/opencode.json` |
 | `opencode-custom` | the same, with the agents for smaller models | `harnesses/opencode-custom/` |
 | `nanocode` | [1rgs/nanocode](https://github.com/1rgs/nanocode) at `b009d3d`, unmodified | `harnesses/nanocode/driver.py` |
+| `claude-code` | Claude Code, headless (`claude -p`), permissions skipped; Anthropic models only | `harnesses.ts` |
 
 The configs are copies of the user's (`~/.config/featherloop`, `~/.config/opencode`),
 pointed at the bench. Both opencode configs turn off the title agent, which would
@@ -82,6 +83,14 @@ what the harness asked for, and mark the override.
 Each departure from a harness's own behaviour (this limit, opencode's title agent,
 websearch, featherloop's flags) is listed in the report, and recorded in `meta.json`,
 so reruns match the run they replace.
+
+Claude Code talks to the run's proxy (`ANTHROPIC_BASE_URL`, a dummy key the proxy
+replaces), with its background model set to the model under test, and telemetry,
+nonessential traffic and updates off. It runs only on `anthropic` models, so a run
+with all harnesses on a llama.cpp model leaves it out. On Haiku it turns extended
+thinking on (`budget_tokens: 31999`), which the other harnesses don't: compare with that
+in mind. Its first prompt is about 30k tokens (24 tools and a 27k-character system
+prompt).
 
 ## Isolation
 

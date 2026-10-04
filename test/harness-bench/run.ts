@@ -62,8 +62,13 @@ const settings: Settings = rerun
   : { nanocodeMaxTokens: model.limit.output, ...(argv.thinking ? {} : { thinking: false }) };
 const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
 const harnesses = HARNESSES.filter(
-  (harness) => (!argv.harness?.length || argv.harness.includes(harness.name)) && (!rerun || rerun.harnesses.has(harness.name)),
+  (harness) =>
+    (argv.harness?.length ? argv.harness.includes(harness.name) : (harness.supports?.(model) ?? true)) &&
+    (!rerun || rerun.harnesses.has(harness.name)),
 );
+for (const harness of harnesses) {
+  if (harness.supports && !harness.supports(model)) throw new Error(`${harness.name} can't run ${model.id} (${model.flavor})`);
+}
 if (argv.list) {
   for (const harness of harnesses) console.log(`${harness.name}: ${harness.description}`);
   console.log(cases.map((c) => c.id).join('\n'));
@@ -220,6 +225,8 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   else rmSync(tmp, { recursive: true, force: true });
 
   const records = meter.records;
+  // Model requests: not token counts and other side calls.
+  const requests = records.filter((record) => record.dialect !== 'other');
   const sum = (pick: (tokens: { prompt: number; cached: number; completion: number }) => number) =>
     records.reduce((total, record) => total + (record.tokens ? pick(record.tokens) : 0), 0);
   const tools: Record<string, number> = {};
@@ -245,7 +252,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     wallMs: result.ms,
     llmMs: records.reduce((total, record) => total + record.ms, 0),
     serverMs: records.reduce((total, record) => total + (record.serverMs ? record.serverMs.prompt + record.serverMs.predicted : 0), 0),
-    requests: records.length,
+    requests: requests.length,
     // Not the request cut off when the run ended: that's the timeout's.
     apiErrors: records.filter((record) => record.status >= 400 || (record.error && !record.error.startsWith('aborted'))).length,
     tokens: {
@@ -257,7 +264,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     uncounted: records.filter((record) => !record.tokens).length,
     uncountedOutput: records.reduce((total, record) => total + (record.tokens ? 0 : record.chunks), 0),
     peakContext: Math.max(0, ...records.map((record) => (record.tokens ? record.tokens.prompt + record.tokens.completion : 0))),
-    firstPrompt: records[0]?.tokens?.prompt ?? null,
+    firstPrompt: requests[0]?.tokens?.prompt ?? null,
     toolCalls: Object.values(tools).reduce((total, count) => total + count, 0),
     tools,
     categories,
