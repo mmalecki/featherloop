@@ -5,7 +5,7 @@ import { hideBin } from 'yargs/helpers';
 import { loadCases } from './cases.ts';
 import { hardcodedAnswers } from './guards.ts';
 import { HARNESSES } from './harnesses.ts';
-import type { RequestRecord } from './proxy.ts';
+import { abortedByBench, infrastructureError, type RequestRecord } from './proxy.ts';
 import type { RunResult } from './report.ts';
 import { lastReasoning, readTranscript, toolResults as transcriptResults, webFetches } from './transcript.ts';
 
@@ -84,7 +84,7 @@ table(
   [...modes].sort(([a], [b]) => a.localeCompare(b)).map(([mode, counts]) => [mode, ...columns.map((column) => String(counts.get(column) ?? 0))]),
 );
 
-const clean = runs.filter((run) => !run.apiErrors);
+const clean = runs.filter((run) => !run.apiErrors && !run.reqs.some(infrastructureError));
 
 section('Paired comparisons', 'Cases both ran cleanly, where exactly one passed: wins each way, and an exact two-sided sign test.');
 const outcomes = new Map<string, Map<string, boolean>>();
@@ -299,11 +299,12 @@ function load(dir: string, prefix: string, label: number): Run[] {
 }
 
 function classify(run: Run): string {
-  if (run.apiErrors) return 'API errors';
+  // From the requests: older rows missed streams a server crash cut off.
+  if (run.apiErrors || run.reqs.some(infrastructureError)) return 'API errors';
   if (run.pass) return run.status === 'timeout' ? 'passed, then timed out' : 'passed';
   const last = run.reqs.at(-1);
   if (run.status === 'timeout') {
-    if (last?.error?.startsWith('aborted') && (last.ms > RUNAWAY_MS || last.reasoningChars > RUNAWAY_CHARS)) return 'timeout: runaway response';
+    if (last && abortedByBench(last) && (last.ms > RUNAWAY_MS || last.reasoningChars > RUNAWAY_CHARS)) return 'timeout: runaway response';
     if (run.wallMs && run.llmMs / run.wallMs < 0.5) return 'timeout: mostly in tools';
     return 'timeout: iterating';
   }

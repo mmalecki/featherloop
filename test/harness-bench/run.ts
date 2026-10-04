@@ -8,7 +8,7 @@ import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
 import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
 import { hardcodedAnswers } from './guards.ts';
-import { MeteringProxy, type RequestRecord } from './proxy.ts';
+import { infrastructureError, MeteringProxy, type RequestRecord } from './proxy.ts';
 import { readTranscript, webFetches } from './transcript.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
@@ -303,7 +303,8 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     serverMs: records.reduce((total, record) => total + (record.serverMs ? record.serverMs.prompt + record.serverMs.predicted : 0), 0),
     requests: requests.length,
     // Not the request cut off when the run ended: that's the timeout's.
-    apiErrors: records.filter((record) => record.status >= 400 || (record.error && !record.error.startsWith('aborted'))).length,
+    // Any failed request but the bench's own aborts: 4xx included, whoever's doing they were.
+    apiErrors: records.filter((record) => record.status >= 400 || infrastructureError(record)).length,
     tokens: {
       prompt: sum((tokens) => tokens.prompt),
       cached: sum((tokens) => tokens.cached),
@@ -400,9 +401,10 @@ function rerunTargets(dir: string) {
       .split('\n')
       .filter(Boolean)
       .map((line) => JSON.parse(line) as RequestRecord)
-      .some((req) => req.status >= 500 || req.status === 429 || (req.status === 0 && req.error && !req.error.startsWith('aborted')));
+      .some(infrastructureError);
   };
-  const failed = [...rows].filter(([, row]) => row.apiErrors > 0 && infrastructure(row)).map(([key]) => key);
+  // Judged from the requests, not the row's count: older rows missed streams a crash cut off.
+  const failed = [...rows].filter(([, row]) => infrastructure(row)).map(([key]) => key);
   // An interrupted bench leaves runs it never started: every harness on every case, for every rep.
   const missing: string[] = [];
   for (let rep = 1; rep <= (meta.reps ?? 1); rep++) {

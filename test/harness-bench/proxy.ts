@@ -297,6 +297,25 @@ export class MeteringProxy {
   }
 }
 
+/** The bench's own aborts, when a run ends or its harness hangs up: not the server's doing. */
+const OWN_ABORT = /^aborted: (run ended|client disconnected)$/;
+
+/** A request the bench itself cut short. */
+export function abortedByBench(record: RequestRecord): boolean {
+  return OWN_ABORT.test(record.error ?? '');
+}
+
+/**
+ * A request that failed for the infrastructure rather than the harness: a 5xx or
+ * 429, or a connection that failed or dropped mid-response (a server crash shows as
+ * an `aborted` stream). Other 4xx are the harness's doing, e.g. a request over the context.
+ */
+export function infrastructureError(record: RequestRecord): boolean {
+  if (record.status >= 500 || record.status === 429) return true;
+  if (record.status >= 400) return false;
+  return Boolean(record.error) && !abortedByBench(record);
+}
+
 function describeRequest(seq: number, path: string, body: Buffer): { record: RequestRecord; offered: Set<string>; json: Json | undefined } {
   const json = tryParse(body) as Record<string, any> | undefined;
   // Model requests only: `messages/count_tokens` and the like are 'other', passed through as they are.
