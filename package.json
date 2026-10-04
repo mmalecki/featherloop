@@ -25,7 +25,7 @@
     "node": ">=24.1"
   },
   "scripts": {
-    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && chmod +x dist/bin/featherloop.js",
     "typecheck": "tsc --noEmit",
     "example:simple": "node --env-file-if-exists=.env examples/simple.ts",
     "example:web": "node --env-file-if-exists=.env examples/web.ts",
