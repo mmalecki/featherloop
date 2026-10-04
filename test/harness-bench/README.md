@@ -93,7 +93,11 @@ Only Python and JavaScript: the bench assumes no go, rust, java or cmake toolcha
 ## Metrics
 
 A metering proxy sits between every harness and the server; each run gets its own
-prefix on it. It parses both API dialects, streamed or not, as they pass.
+prefix on it. It parses both API dialects, streamed or not, as they pass. A request
+the harness doesn't stream (nanocode's) goes upstream streamed, and the harness gets
+the response assembled as the server sends it whole: a long non-streaming request is
+silent until it's done, and a proxy on the way may cut it off (squid's `read_timeout`
+is 15 minutes, and showed up as 504s). Only the transport changes.
 
 - **Passed**, with a Wilson 95% interval, and **tests passed** (partial credit).
 - **Wall clock**, and the share of it spent waiting on the model; the rest is the
