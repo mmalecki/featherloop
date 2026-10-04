@@ -1,12 +1,15 @@
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
+import https from 'node:https';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
-import { HARNESSES, type Harness, type HarnessContext } from './harnesses.ts';
-import { MeteringProxy } from './proxy.ts';
+import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
+import { hardcodedAnswers } from './guards.ts';
+import { infrastructureError, MeteringProxy, type RequestRecord } from './proxy.ts';
+import { readTranscript, webFetches } from './transcript.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
 const argv = await yargs(hideBin(process.argv))
@@ -22,21 +25,75 @@ const argv = await yargs(hideBin(process.argv))
   .option('jobs', { alias: 'j', type: 'number', default: 1, describe: 'Runs at once; the server has its own slot count, beyond which requests queue' })
   .option('reps', { alias: 'r', type: 'number', default: 1, describe: 'Runs of each harness on each case' })
   .option('timeout', { type: 'number', default: 20, describe: 'Minutes a run may take before its harness is killed' })
+  .option('model', { alias: 'm', type: 'string', choices: Object.keys(MODELS), default: 'qwen3.5-9b', describe: 'Model under test, from models.json' })
   .option('base-url', {
     type: 'string',
-    default: process.env.BENCH_UPSTREAM ?? 'http://34.61.203.44:9931/v1',
-    describe: 'The model server, with /v1 (env BENCH_UPSTREAM)',
+    describe: "The model server, with /v1 (env BENCH_UPSTREAM; default: the model's upstream in models.json)",
   })
-  .option('model', { type: 'string', default: 'qwen3.5-9b', describe: 'Model name sent where a harness has no config of its own (nanocode)' })
   .option('out', { type: 'string', describe: 'Results directory (default: results/<timestamp>)' })
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
+  .option('advisor', {
+    type: 'string',
+    choices: Object.keys(MODELS),
+    describe: 'A model from models.json to advise featherloop-advisor (and include that harness)',
+  })
+  .option('max-cost', {
+    type: 'number',
+    describe: "Dollars: start no more runs once the runs so far cost this much (priced models only; runs in flight finish)",
+  })
+  .option('max-output', {
+    type: 'number',
+    describe: 'Tokens a run may generate before it is ended, its harness killed as at the timeout: a budget of work, the same on any hardware (keep --timeout as a safety net)',
+  })
+  .option('reasoning-budget', {
+    type: 'number',
+    describe: "Caps the model's reasoning per response, for every harness, at the proxy (reasoning_budget_tokens; llama.cpp)",
+  })
+  .option('thinking', {
+    type: 'boolean',
+    default: true,
+    describe: "--no-thinking turns the model's thinking off for every harness, at the proxy (enable_thinking: false)",
+  })
+  .option('rerun-api-errors', {
+    type: 'string',
+    describe:
+      "A results directory: run again the runs in it that hit API errors (e.g. a proxy's timeout), replacing them, and any an interrupted bench never started, on its model, server and timeout",
+  })
   .strictOptions()
   .parseAsync();
 
-const cases = loadCases(argv._.map(String), argv.set);
-const harnesses = HARNESSES.filter((harness) => !argv.harness?.length || argv.harness.includes(harness.name));
+const rerun = argv.rerunApiErrors === undefined ? undefined : rerunTargets(argv.rerunApiErrors);
+// Results from before models.json are all on the default model.
+const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
+const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? (rerun ? rerun.meta.upstream : model.upstream);
+const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
+// Reruns as the run they replace; results from before settings ran nanocode as shipped.
+const settings: Settings = rerun
+  ? (rerun.meta.settings ?? {})
+  : {
+      nanocodeMaxTokens: model.limit.output,
+      ...(argv.thinking ? {} : { thinking: false }),
+      ...(argv.advisor ? { advisor: argv.advisor } : {}),
+      ...(argv.maxOutput ? { maxOutput: argv.maxOutput } : {}),
+      ...(argv.reasoningBudget ? { reasoningBudget: argv.reasoningBudget } : {}),
+    };
+const advisorModel = settings.advisor === undefined ? undefined : MODELS[settings.advisor];
+if (settings.advisor !== undefined && !advisorModel) throw new Error(`No model ${settings.advisor} in models.json`);
+const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
+const harnesses = HARNESSES.filter(
+  (harness) =>
+    (argv.harness?.length
+      ? argv.harness.includes(harness.name)
+      : (harness.byDefault ?? harness.supports)?.(model, settings) ?? true) &&
+    (!rerun || rerun.harnesses.has(harness.name)),
+);
+for (const harness of harnesses) {
+  if (harness.supports && !harness.supports(model, settings)) {
+    throw new Error(`${harness.name} can't run ${model.id} (${model.flavor})${settings.advisor ? '' : ' without --advisor'}`);
+  }
+}
 if (argv.list) {
   for (const harness of harnesses) console.log(`${harness.name}: ${harness.description}`);
   console.log(cases.map((c) => c.id).join('\n'));
@@ -45,23 +102,43 @@ if (argv.list) {
 
 ensureToolchains(cases);
 const versions = Object.fromEntries(harnesses.map((harness) => [harness.name, harness.prepare()]));
-const out = argv.out ?? join(import.meta.dirname, 'results', new Date().toISOString().replace(/[:.]/g, '-'));
+const out = rerun?.dir ?? argv.out ?? join(import.meta.dirname, 'results', new Date().toISOString().replace(/[:.]/g, '-'));
 mkdirSync(join(out, 'prompts'), { recursive: true });
 for (const c of cases) writeFileSync(join(out, 'prompts', `${caseName(c)}.md`), `${c.prompt}\n`);
 
-const server = await serverInfo(argv.baseUrl);
+const server = await serverInfo(upstream);
+const started = new Date().toISOString();
 writeFileSync(
   join(out, 'meta.json'),
   `${JSON.stringify(
-    {
-      started: new Date().toISOString(),
-      upstream: argv.baseUrl,
+    rerun
+      ? {
+          ...rerun.meta,
+          reruns: [
+            ...(rerun.meta.reruns ?? []),
+            {
+              started,
+              why: 'API errors',
+              runs: [...rerun.keys],
+              harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name] }])),
+              settings,
+              server,
+            },
+          ],
+        }
+      : {
+      started,
+      model: model.id,
+      upstream,
       server,
-      harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description }])),
+      harnesses: Object.fromEntries(
+        harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description, notes: harness.notes(settings) }]),
+      ),
+      settings,
       cases: cases.map((c) => c.id),
       reps: argv.reps,
       jobs: argv.jobs,
-      timeoutMinutes: argv.timeout,
+      timeoutMinutes: timeout,
       toolchains: toolchainVersions(),
     },
     null,
@@ -69,7 +146,30 @@ writeFileSync(
   )}\n`,
 );
 
-const proxy = await MeteringProxy.start(argv.baseUrl);
+if (settings.thinking === false && model.flavor !== 'openai') {
+  throw new Error(`--no-thinking sets llama.cpp's chat template; ${model.id} speaks ${model.flavor}`);
+}
+if (settings.reasoningBudget !== undefined && model.flavor !== 'openai') {
+  throw new Error(`--reasoning-budget is llama.cpp's; ${model.id} speaks ${model.flavor}`);
+}
+// A hosted API's key stays here: the proxy adds it upstream, harnesses get none.
+const keyFor = (m: typeof model) => {
+  if (m.flavor !== 'anthropic') return undefined;
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error(`${m.id} needs ANTHROPIC_API_KEY (in .env)`);
+  return process.env.ANTHROPIC_API_KEY;
+};
+const apiKey = keyFor(model);
+const proxy = await MeteringProxy.start(upstream, {
+  ...(settings.thinking === false ? { thinking: false } : {}),
+  ...(apiKey ? { apiKey } : {}),
+  // llama.cpp's chat templates take one system message, first.
+  ...(model.flavor === 'openai' ? { foldSystemMessages: true } : {}),
+  ...(settings.reasoningBudget !== undefined ? { reasoningBudget: settings.reasoningBudget } : {}),
+});
+// The advisor's own proxy: its calls are metered apart from the model's.
+const advisorKey = advisorModel && keyFor(advisorModel);
+const advisorProxy = advisorModel && (await MeteringProxy.start(advisorModel.upstream, advisorKey ? { apiKey: advisorKey } : {}));
+let spent = 0;
 
 interface Job {
   harness: Harness;
@@ -79,7 +179,16 @@ interface Job {
 
 // Case-major, harness-minor: at -j matching the harness count, each case's runs share the server at once.
 const jobs: Job[] = [];
-for (let rep = 1; rep <= argv.reps; rep++) for (const c of cases) for (const harness of harnesses) jobs.push({ harness, c, rep });
+if (rerun) {
+  for (const key of rerun.keys) {
+    const [name, id, rep] = key.split('|') as [string, string, string];
+    const harness = harnesses.find((harness) => harness.name === name);
+    const c = cases.find((c) => c.id === id);
+    if (harness && c) jobs.push({ harness, c, rep: Number(rep) });
+  }
+} else {
+  for (let rep = 1; rep <= argv.reps; rep++) for (const c of cases) for (const harness of harnesses) jobs.push({ harness, c, rep });
+}
 
 const live = new Set<number>();
 let interrupted = false;
@@ -90,25 +199,33 @@ process.on('SIGINT', () => {
   for (const pid of live) killGroup(pid);
 });
 
-console.error(`${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`);
+console.error(
+  rerun
+    ? `Running ${jobs.length} runs that hit infrastructure errors or never ran, ${argv.jobs} at a time → ${out}`
+    : `${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`,
+);
 let done = 0;
 const queue = [...jobs];
 await Promise.all(
   Array.from({ length: Math.max(1, Math.min(argv.jobs, jobs.length)) }, async () => {
-    for (let job = queue.shift(); job && !interrupted; job = queue.shift()) {
+    for (let job = queue.shift(); job && !interrupted && !overBudget(); job = queue.shift()) {
       const result = await runJob(job);
       if (!result) continue;
       appendFileSync(join(out, 'results.jsonl'), `${JSON.stringify(result)}\n`);
+      spent += result.costUsd ?? 0;
       console.error(`[${++done}/${jobs.length}] ${progress(result)}`);
     }
   }),
 );
 await proxy.stop();
+await advisorProxy?.stop();
 console.log(summarize(out));
 
 async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> {
   const id = `${harness.name}.${caseName(c)}.r${rep}`;
   const dir = join(out, 'runs', harness.name, `${caseName(c)}-r${rep}`);
+  // Kept beside, to see what went wrong.
+  if (rerun && existsSync(dir)) renameSync(dir, uniquePath(`${dir}.replaced`));
   mkdirSync(dir, { recursive: true });
   // Neutral: the model sees this path, and it shouldn't name a harness.
   const tmp = mkdtempSync(join(tmpdir(), 'bench-'));
@@ -121,19 +238,43 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   prepareWorkspace(c, workspace, toolchains.tools);
 
   const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'));
-  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model: argv.model };
+  const advisorMeter = advisorProxy?.open(`${id}.advisor`, join(dir, 'advisor-requests.jsonl'), join(dir, 'advisor-transcript.json'));
+  const ctx: HarnessContext = {
+    home,
+    xdg,
+    workspace,
+    prompt: c.prompt,
+    baseURL: meter.baseURL,
+    model,
+    settings,
+    ...(advisorModel && advisorMeter ? { advisor: { model: advisorModel, baseURL: advisorMeter.baseURL } } : {}),
+  };
   const invocation = harness.setup(ctx);
   const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
   const started = new Date();
+  // A budget of output, checked as it streams: past it, the run ends as at the timeout.
+  let overBudget = false;
+  let budgetCheck: NodeJS.Timeout | undefined;
   const result = await run(invocation.command, invocation.args, {
     cwd: workspace,
     env,
-    timeoutMs: argv.timeout * 60_000,
+    timeoutMs: timeout * 60_000,
     log: { stdout: join(dir, 'stdout.log'), stderr: join(dir, 'stderr.log') },
-    onSpawn: (pid) => live.add(pid),
+    onSpawn: (pid) => {
+      live.add(pid);
+      if (settings.maxOutput === undefined) return;
+      budgetCheck = setInterval(() => {
+        if (meter.generated() < settings.maxOutput!) return;
+        overBudget = true;
+        clearInterval(budgetCheck);
+        killGroup(pid);
+      }, 1000);
+    },
   });
+  clearInterval(budgetCheck);
   if (result.pid !== undefined) live.delete(result.pid);
   proxy.close(id);
+  advisorProxy?.close(`${id}.advisor`);
   if (interrupted) {
     rmSync(tmp, { recursive: true, force: true });
     return undefined;
@@ -147,6 +288,25 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   else rmSync(tmp, { recursive: true, force: true });
 
   const records = meter.records;
+  // Model requests: not token counts and other side calls.
+  const requests = records.filter((record) => record.dialect !== 'other');
+  // The advisor: how often the model asked (featherloop's subagent tool), and what the answers cost.
+  const advisorRecords = advisorMeter?.records.filter((record) => record.dialect !== 'other') ?? [];
+  const advised =
+    advisorModel && harness.name === 'featherloop-advisor'
+      ? {
+          model: advisorModel.id,
+          calls: requests.reduce((n, record) => n + record.toolCalls.filter((name) => name === 'subagent').length, 0),
+          requests: advisorRecords.length,
+          tokens: {
+            prompt: advisorRecords.reduce((n, record) => n + (record.tokens?.prompt ?? 0), 0),
+            cached: advisorRecords.reduce((n, record) => n + (record.tokens?.cached ?? 0), 0),
+            completion: advisorRecords.reduce((n, record) => n + (record.tokens?.completion ?? 0), 0),
+          },
+          firstCall: requests.findIndex((record) => record.toolCalls.includes('subagent')) + 1 || null,
+          ...(advisorModel.pricing ? { costUsd: cost(advisorRecords, advisorModel.pricing) } : {}),
+        }
+      : undefined;
   const sum = (pick: (tokens: { prompt: number; cached: number; completion: number }) => number) =>
     records.reduce((total, record) => total + (record.tokens ? pick(record.tokens) : 0), 0);
   const tools: Record<string, number> = {};
@@ -157,24 +317,25 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   }
   // The output limit apart: opencode recomputes it for every request.
   const limits = records.flatMap((record) => [record.params.max_tokens, record.params.max_completion_tokens]).filter((value) => typeof value === 'number');
-  const settings = records.map(({ params: { max_tokens, max_completion_tokens, ...rest } }) => JSON.stringify(rest));
-  const params = [...new Set(settings)].map((text) => JSON.parse(text) as Record<string, unknown>);
+  const sampling = records.map(({ params: { max_tokens, max_completion_tokens, ...rest } }) => JSON.stringify(rest));
+  const params = [...new Set(sampling)].map((text) => JSON.parse(text) as Record<string, unknown>);
   const run_: RunResult = {
     harness: harness.name,
     case: c.id,
     lang: c.lang,
     rep,
     started: started.toISOString(),
-    status: result.timedOut ? 'timeout' : result.exitCode !== 0 ? 'crash' : graded.pass ? 'pass' : 'fail',
+    status: overBudget ? 'budget' : result.timedOut ? 'timeout' : result.exitCode !== 0 ? 'crash' : graded.pass ? 'pass' : 'fail',
     pass: graded.pass,
     tests: { passed: graded.passed, total: graded.total },
     exitCode: result.exitCode,
     wallMs: result.ms,
     llmMs: records.reduce((total, record) => total + record.ms, 0),
     serverMs: records.reduce((total, record) => total + (record.serverMs ? record.serverMs.prompt + record.serverMs.predicted : 0), 0),
-    requests: records.length,
+    requests: requests.length,
     // Not the request cut off when the run ended: that's the timeout's.
-    apiErrors: records.filter((record) => record.status >= 400 || (record.error && !record.error.startsWith('aborted'))).length,
+    // Any failed request but the bench's own aborts: 4xx included, whoever's doing they were.
+    apiErrors: records.filter((record) => record.status >= 400 || infrastructureError(record)).length,
     tokens: {
       prompt: sum((tokens) => tokens.prompt),
       cached: sum((tokens) => tokens.cached),
@@ -182,8 +343,9 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
       completion: sum((tokens) => tokens.completion),
     },
     uncounted: records.filter((record) => !record.tokens).length,
+    uncountedOutput: records.reduce((total, record) => total + (record.tokens ? 0 : record.chunks), 0),
     peakContext: Math.max(0, ...records.map((record) => (record.tokens ? record.tokens.prompt + record.tokens.completion : 0))),
-    firstPrompt: records[0]?.tokens?.prompt ?? null,
+    firstPrompt: requests[0]?.tokens?.prompt ?? null,
     toolCalls: Object.values(tools).reduce((total, count) => total + count, 0),
     tools,
     categories,
@@ -196,8 +358,15 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     filesChanged: changed.files.map((file) => file.path),
     tampered: changed.tampered,
     sawCache: sawCache(dir),
+    fetches: webFetches(readTranscript(dir)),
+    hardcoded: hardcodedAnswers(changed.diff, c.solution, c.tests.map((name) => c.files.get(name)!)),
+    ...(advised ? { advisor: advised } : {}),
+    ...(model.pricing || advised?.costUsd !== undefined
+      ? { costUsd: (model.pricing ? cost(records, model.pricing) : 0) + (advised?.costUsd ?? 0) }
+      : {}),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
+    ...(rerun ? { rerun: true } : {}),
   };
   writeFileSync(join(dir, 'result.json'), `${JSON.stringify(run_, null, 2)}\n`);
   return run_;
@@ -243,6 +412,73 @@ function sawCache(dir: string): boolean {
   });
 }
 
+/**
+ * The runs in a results directory that hit API errors the infrastructure caused
+ * (5xx, 429, a dropped connection), by `harness|case|rep`: the latest row for each,
+ * as the report counts them. Not other 4xx: a request the API refused, say for
+ * exceeding the context, is the harness's doing, and stays a result.
+ */
+function rerunTargets(dir: string) {
+  const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as Record<string, any>;
+  const rows = new Map<string, RunResult>();
+  for (const line of readFileSync(join(dir, 'results.jsonl'), 'utf8').split('\n').filter(Boolean)) {
+    const row = JSON.parse(line) as RunResult;
+    rows.set(`${row.harness}|${row.case}|${row.rep}`, row);
+  }
+  const infrastructure = (row: RunResult) => {
+    const file = join(dir, 'runs', row.harness, `${row.case.replace('/', '-')}-r${row.rep}`, 'requests.jsonl');
+    if (!existsSync(file)) return true;
+    return readFileSync(file, 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as RequestRecord)
+      .some(infrastructureError);
+  };
+  // Judged from the requests, not the row's count: older rows missed streams a crash cut off.
+  const failed = [...rows].filter(([, row]) => infrastructure(row)).map(([key]) => key);
+  // An interrupted bench leaves runs it never started: every harness on every case, for every rep.
+  const missing: string[] = [];
+  for (let rep = 1; rep <= (meta.reps ?? 1); rep++) {
+    for (const id of meta.cases ?? []) for (const harness of Object.keys(meta.harnesses ?? {})) {
+      const key = `${harness}|${id}|${rep}`;
+      if (!rows.has(key)) missing.push(key);
+    }
+  }
+  const keys = [...failed, ...missing];
+  return {
+    dir,
+    meta,
+    keys: new Set(keys),
+    cases: new Set(keys.map((key) => key.split('|')[1]!)),
+    harnesses: new Set(keys.map((key) => key.split('|')[0]!)),
+  };
+}
+
+/** What a run's requests cost, at the model's prices. Requests cut off before reporting tokens aren't counted. */
+function cost(records: RequestRecord[], pricing: NonNullable<typeof model.pricing>): number {
+  return records.reduce((sum, { tokens }) => {
+    if (!tokens) return sum;
+    const write = tokens.cacheWrite ?? 0;
+    const fresh = tokens.prompt - tokens.cached - write;
+    return sum + (fresh * pricing.input + write * pricing.cacheWrite + tokens.cached * pricing.cacheRead + tokens.completion * pricing.output) / 1e6;
+  }, 0);
+}
+
+/** Past `--max-cost`: no more runs start. Said once. */
+let budgetNoted = false;
+function overBudget(): boolean {
+  if (argv.maxCost === undefined || spent < argv.maxCost) return false;
+  if (!budgetNoted) console.error(`Spent $${spent.toFixed(2)}, past --max-cost $${argv.maxCost}: starting no more runs`);
+  budgetNoted = true;
+  return true;
+}
+
+function uniquePath(path: string): string {
+  let candidate = path;
+  for (let n = 2; existsSync(candidate); n++) candidate = `${path}-${n}`;
+  return candidate;
+}
+
 function progress(result: RunResult): string {
   const tokens = result.tokens.prompt + result.tokens.completion;
   return [
@@ -258,6 +494,15 @@ function progress(result: RunResult): string {
 
 /** The server's model, build and slots, from llama.cpp's `/props` and `/v1/models`; whatever answers. */
 async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
+  if (model.flavor === 'anthropic') {
+    // A hosted API: the Models API says the model is there, and what it's called.
+    const key = process.env.ANTHROPIC_API_KEY ?? '';
+    const info = (await getJson(`${baseURL.replace(/\/$/, '')}/models/${model.id}`, { 'x-api-key': key, 'anthropic-version': '2023-06-01' })) as
+      | { id: string; display_name?: string; max_input_tokens?: number; max_tokens?: number }
+      | undefined;
+    if (!info) throw new Error(`${model.id} isn't available at ${baseURL}`);
+    return { models: [{ id: info.id, meta: { name: info.display_name, context: info.max_input_tokens, output: info.max_tokens } }], build: 'hosted API' };
+  }
   const root = baseURL.replace(/\/v1\/?$/, '');
   const props = (await getJson(`${root}/props`)) as Record<string, any> | undefined;
   const models = (await getJson(`${baseURL.replace(/\/$/, '')}/models`)) as { data?: { id: string; meta?: unknown }[] } | undefined;
@@ -275,9 +520,9 @@ async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
   };
 }
 
-function getJson(url: string): Promise<unknown> {
+function getJson(url: string, headers: Record<string, string> = {}): Promise<unknown> {
   return new Promise((resolve) => {
-    const req = http.get(url, (res) => {
+    const req = (url.startsWith('https:') ? https : http).get(url, { headers }, (res) => {
       let body = '';
       res.on('data', (chunk: Buffer) => (body += chunk));
       res.on('end', () => {

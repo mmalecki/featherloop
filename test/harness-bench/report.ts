@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import type { Fetch } from './transcript.ts';
 import { join, resolve } from 'node:path';
 
 /**
@@ -14,8 +15,11 @@ export interface RunResult {
   lang: string;
   rep: number;
   started: string;
-  /** `pass` and `fail` by the tests; `timeout` and `crash` when the harness didn't exit cleanly, whatever the tests say. */
-  status: 'pass' | 'fail' | 'timeout' | 'crash';
+  /**
+   * `pass` and `fail` by the tests; `timeout`, `budget` (`--max-output` spent) and
+   * `crash` when the harness didn't exit cleanly, whatever the tests say.
+   */
+  status: 'pass' | 'fail' | 'timeout' | 'budget' | 'crash';
   /** The tests, as shipped, pass on what the agent left; graded even after a timeout or crash. */
   pass: boolean;
   tests: { passed: number; total: number };
@@ -29,8 +33,10 @@ export interface RunResult {
   apiErrors: number;
   /** Summed over requests: every request's whole prompt, cached or not; `uncached` is what the server processed. */
   tokens: { prompt: number; cached: number; uncached: number; completion: number };
-  /** Requests whose tokens weren't reported (e.g. aborted). */
+  /** Requests whose tokens weren't reported (e.g. cut off at the timeout). */
   uncounted: number;
+  /** At least this much output in those requests, from streamed chunks; not in `tokens`. */
+  uncountedOutput: number;
   /** The most context any one request filled: prompt plus completion. */
   peakContext: number;
   /** The first request's prompt: the harness's system prompt and tools, plus the task, which is the same for all. */
@@ -52,10 +58,27 @@ export interface RunResult {
   tampered: string[];
   /** The conversation mentions the bench's cache, which holds the reference solutions: treat a pass with suspicion. */
   sawCache: boolean;
+  /** Calls that reached for the web: fetch and search tools, and URLs in shell commands. Absent from older results. */
+  fetches?: Fetch[];
+  /** Test literals a short solution returns: maybe answers hardcoded from the visible tests (guards.ts). */
+  hardcoded?: string[];
+  /** Dollars, at the model's prices, the advisor's included; priced models only. */
+  costUsd?: number;
+  /** featherloop-advisor: the advisor's model, how often it was asked, from which request, and what it took. */
+  advisor?: {
+    model: string;
+    calls: number;
+    firstCall: number | null;
+    requests: number;
+    tokens: { prompt: number; cached: number; completion: number };
+    costUsd?: number;
+  };
   /** Distinct sampling settings the harness sent, the output limit apart. */
   params: Record<string, unknown>[];
   /** The largest output limit it asked for; none means the server's. */
   maxOutput: number | null;
+  /** Run again, replacing an earlier row for the same harness, case and rep (`--rerun-api-errors`). */
+  rerun?: boolean;
 }
 
 /** Harnesses name their tools differently; these are what they do. */
@@ -82,6 +105,8 @@ export interface HarnessSummary {
   testsPassed: number;
   byLang: Record<string, { runs: number; passes: number }>;
   timeouts: number;
+  /** Runs ended for spending `--max-output`. */
+  budgets: number;
   crashes: number;
   wallSec: { median: number; mean: number; p90: number };
   /** Share of wall clock spent waiting on the model. */
@@ -89,6 +114,8 @@ export interface HarnessSummary {
   requests: number;
   tokens: { prompt: number; uncached: number; completion: number; total: number };
   tokensPerPass: number | null;
+  /** Output of requests cut off before reporting their tokens, at least; per run, not in `tokens`. */
+  uncountedOutput: number;
   peakContext: { median: number; max: number };
   firstPrompt: number | null;
   toolCalls: number;
@@ -100,6 +127,15 @@ export interface HarnessSummary {
   apiErrors: number;
   tamperedRuns: number;
   sawCacheRuns: number;
+  /** Per run; null when the results predate tracking. */
+  fetches: number | null;
+  hardcoded: string[];
+  /** Dollars, total; null for unpriced models. */
+  cost: number | null;
+  /** featherloop-advisor only: runs that asked, calls per run, the advisor's dollars. */
+  advisor: { runsCalling: number; calls: number; cost: number | null } | null;
+  solutionFetches: string[];
+  hosts: Record<string, number>;
   linesChanged: number;
   params: Record<string, unknown>[];
   maxOutput: number | null;
@@ -108,10 +144,13 @@ export interface HarnessSummary {
 export function summarize(dir: string): string {
   const file = join(dir, 'results.jsonl');
   if (!existsSync(file)) return `No runs finished in ${dir}\n`;
-  const results = readFileSync(file, 'utf8')
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as RunResult);
+  // A rerun's row replaces the earlier one for the same run.
+  const rows = new Map<string, RunResult>();
+  for (const line of readFileSync(file, 'utf8').split('\n').filter(Boolean)) {
+    const row = JSON.parse(line) as RunResult;
+    rows.set(`${row.harness}|${row.case}|${row.rep}`, row);
+  }
+  const results = [...rows.values()];
   const meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')) as Record<string, any>;
   // In the order the bench defines them, not the order they finished in.
   const harnesses = [...new Set([...Object.keys(meta.harnesses ?? {}), ...results.map((result) => result.harness)])].filter((harness) =>
@@ -148,6 +187,7 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     testsPassed: mean((run) => (run.tests.total ? run.tests.passed / run.tests.total : 0)),
     byLang,
     timeouts: runs.filter((run) => run.status === 'timeout').length,
+    budgets: runs.filter((run) => run.status === 'budget').length,
     crashes: runs.filter((run) => run.status === 'crash').length,
     wallSec: { median: quantile(wall, 0.5), mean: mean((run) => run.wallMs / 1000), p90: quantile(wall, 0.9) },
     llmShare: total((run) => run.llmMs) / total((run) => run.wallMs),
@@ -159,6 +199,8 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
       total: allTokens / runs.length,
     },
     tokensPerPass: passes ? allTokens / passes : null,
+    // Older results lack it.
+    uncountedOutput: mean((run) => run.uncountedOutput ?? 0),
     peakContext: { median: quantile(runs.map((run) => run.peakContext), 0.5), max: Math.max(...runs.map((run) => run.peakContext)) },
     firstPrompt: firstPrompts.length ? quantile(firstPrompts, 0.5) : null,
     toolCalls: mean((run) => run.toolCalls),
@@ -170,6 +212,21 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     apiErrors: total((run) => run.apiErrors),
     tamperedRuns: runs.filter((run) => run.tampered.length).length,
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
+    hardcoded: runs.filter((run) => run.hardcoded?.length).map((run) => `${run.case}: ${run.hardcoded!.join(', ')}`),
+    cost: runs.some((run) => run.costUsd !== undefined) ? total((run) => run.costUsd ?? 0) : null,
+    advisor: runs.some((run) => run.advisor)
+      ? {
+          runsCalling: runs.filter((run) => run.advisor?.calls).length,
+          calls: mean((run) => run.advisor?.calls ?? 0),
+          cost: runs.some((run) => run.advisor?.costUsd !== undefined) ? total((run) => run.advisor?.costUsd ?? 0) : null,
+        }
+      : null,
+    fetches: runs.some((run) => run.fetches) ? mean((run) => run.fetches?.length ?? 0) : null,
+    solutionFetches: runs.flatMap((run) => (run.fetches ?? []).filter((fetch) => fetch.solutionSource).map((fetch) => `${run.case}: ${fetch.target}`)),
+    hosts: runs.reduce<Record<string, number>>((hosts, run) => {
+      for (const fetch of run.fetches ?? []) hosts[fetch.host ?? 'search'] = (hosts[fetch.host ?? 'search'] ?? 0) + 1;
+      return hosts;
+    }, {}),
     linesChanged: mean((run) => run.linesAdded + run.linesRemoved),
     params: [...new Set(runs.flatMap((run) => run.params.map((params) => JSON.stringify(params))))].map((text) => JSON.parse(text)),
     maxOutput: runs.some((run) => run.maxOutput !== null) ? Math.max(...runs.map((run) => run.maxOutput ?? 0)) : null,
@@ -187,11 +244,23 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
   const lines = [
     '# Harness bench',
     '',
-    `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slots.`,
-    `${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    meta.server?.build === 'hosted API'
+      ? `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'}, hosted API.`
+      : `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
+    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.settings?.thinking === false ? 'Thinking off (set by the bench for every request). ' : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    ...(results.some((result) => result.rerun)
+      ? [`${results.filter((result) => result.rerun).length} runs were run again after API errors (see meta.json's reruns).`]
+      : []),
     `Versions: ${Object.entries(meta.harnesses ?? {})
       .map(([name, info]) => `${name} ${(info as { version: string }).version}`)
       .join(', ')}.`,
+    '',
+    '## Harnesses',
+    '',
+    ...Object.entries(meta.harnesses ?? {}).map(([name, info]) => {
+      const { version, description, notes } = info as { version: string; description: string; notes?: string[] };
+      return `- **${name}** ${version}: ${description}.${notes?.length ? ` ${notes.join('; ')}.` : ''}`;
+    }),
     '',
     '## Results',
     '',
@@ -201,6 +270,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     ...langs.map((lang) => row(`↳ ${lang}`, (s) => (s.byLang[lang] ? `${s.byLang[lang].passes}/${s.byLang[lang].runs}` : '–'))),
     row('Tests passed (partial credit)', (s) => pct(s.testsPassed)),
     row('Timeouts / crashes', (s) => `${s.timeouts} / ${s.crashes}`),
+    ...(summaries.some((s) => s.budgets) ? [row('Out of output budget', (s) => String(s.budgets))] : []),
     row('Wall clock, median (p90)', (s) => `${s.wallSec.median.toFixed(0)}s (${s.wallSec.p90.toFixed(0)}s)`),
     row('Share waiting on the model', (s) => pct(s.llmShare)),
     row('Model requests / run', (s) => s.requests.toFixed(1)),
@@ -209,6 +279,21 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('↳ prompt (processed, not cached)', (s) => k(s.tokens.uncached)),
     row('↳ completion', (s) => k(s.tokens.completion)),
     row('Tokens / pass', (s) => (s.tokensPerPass === null ? '–' : k(s.tokensPerPass))),
+    ...(summaries.some((s) => s.advisor)
+      ? [
+          row('Advisor calls / run', (s) => (s.advisor ? s.advisor.calls.toFixed(1) : '–')),
+          row('Runs that asked the advisor', (s) => (s.advisor ? `${s.advisor.runsCalling}/${s.runs}` : '–')),
+          row('Advisor cost, all runs', (s) => (s.advisor?.cost == null ? '–' : `$${s.advisor.cost.toFixed(2)}`)),
+        ]
+      : []),
+    ...(summaries.some((s) => s.cost !== null)
+      ? [
+          row('Cost / run', (s) => (s.cost === null ? '–' : `$${(s.cost / s.runs).toFixed(3)}`)),
+          row('Cost / pass', (s) => (s.cost === null || !s.passes ? '–' : `$${(s.cost / s.passes).toFixed(3)}`)),
+          row('Cost, all runs', (s) => (s.cost === null ? '–' : `$${s.cost.toFixed(2)}`)),
+        ]
+      : []),
+    row('Output cut off uncounted, at least', (s) => k(s.uncountedOutput)),
     row('First prompt (system + tools + task)', (s) => (s.firstPrompt === null ? '–' : k(s.firstPrompt))),
     row('Peak context, median (max)', (s) => `${k(s.peakContext.median)} (${k(s.peakContext.max)})`),
     row('Tool calls / run', (s) => s.toolCalls.toFixed(1)),
@@ -221,6 +306,9 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('API errors', (s) => String(s.apiErrors)),
     row('Runs that changed the tests', (s) => String(s.tamperedRuns)),
     row('Runs that reached the bench cache', (s) => String(s.sawCacheRuns)),
+    row('Web fetches / run', (s) => (s.fetches === null ? '–' : s.fetches.toFixed(2))),
+    row('Fetches from solution sources', (s) => (s.fetches === null ? '–' : String(s.solutionFetches.length))),
+    row('Runs that may hardcode test answers', (s) => String(s.hardcoded.length)),
     row('Lines changed / run', (s) => s.linesChanged.toFixed(0)),
     '',
     '## Tools called, per run',
@@ -235,6 +323,30 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
         }`,
     ),
     '',
+    '## Hosts fetched',
+    '',
+    ...summaries.map(
+      (s) =>
+        `- **${s.harness}**: ${
+          s.fetches === null
+            ? 'not tracked'
+            : Object.entries(s.hosts)
+                .sort(([, a], [, b]) => b - a)
+                .map(([host, n]) => `${host} ${n}`)
+                .join(', ') || 'none'
+        }${s.solutionFetches.length ? `. From solution sources: ${s.solutionFetches.join('; ')}` : ''}`,
+    ),
+    ...(summaries.some((s) => s.hardcoded.length)
+      ? [
+          '',
+          '## Possibly hardcoded',
+          '',
+          'Short solutions returning literals from the tests. Look before trusting the pass.',
+          '',
+          ...summaries.filter((s) => s.hardcoded.length).map((s) => `- **${s.harness}**: ${s.hardcoded.join('; ')}`),
+        ]
+      : []),
+    '',
     '## Sampling settings sent',
     '',
     `Server defaults: ${JSON.stringify(meta.server?.defaults ?? {})}`,
@@ -246,7 +358,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     '',
     '## By case',
     '',
-    'Passes out of reps; tests passed in brackets for runs that failed. ⏱ timed out, 💥 crashed (graded all the same).',
+    'Passes out of reps; tests passed in brackets for runs that failed. ⏱ timed out, 🪙 out of output budget, 💥 crashed (graded all the same).',
     '',
     `| case | ${columns.join(' | ')} |`,
     `|---|${columns.map(() => ':---:').join('|')}|`,
@@ -255,7 +367,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
         const runs = results.filter((result) => result.case === id && result.harness === harness);
         if (!runs.length) return '–';
         const passes = runs.filter((run) => run.pass).length;
-        const mark = (run: RunResult) => (run.status === 'timeout' ? '⏱' : run.status === 'crash' ? '💥' : '');
+        const mark = (run: RunResult) => (run.status === 'timeout' ? '⏱' : run.status === 'budget' ? '🪙' : run.status === 'crash' ? '💥' : '');
         const partial = runs.filter((run) => !run.pass).map((run) => `${run.tests.passed}/${run.tests.total}${mark(run)}`);
         // A pass that never stopped on its own still shows.
         const passed = runs.filter((run) => run.pass).map(mark).join('');

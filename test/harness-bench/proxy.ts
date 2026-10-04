@@ -13,13 +13,46 @@ import type { AddressInfo } from 'node:net';
  * `--use-env-proxy` and, unlike `fetch`, has no header or body timeouts: a long
  * prefill or a non-streaming request queued behind busy slots is the harness's to
  * time out, not ours.
+ *
+ * A request the harness doesn't stream is streamed upstream anyway, and answered
+ * with the response assembled as the server would have sent it whole: a long
+ * non-streaming request sends nothing until it's done, and proxies on the way cut
+ * it off (squid's `read_timeout` is 15 minutes). Only the transport changes.
+ *
+ * With `thinking: false`, every request asks the chat template for no thinking
+ * (`chat_template_kwargs.enable_thinking: false`, which llama.cpp honours over a
+ * request's `reasoning_effort` or `thinking`): one switch for every harness, however
+ * they would set it themselves, or not.
  */
+
+export interface ProxyOptions {
+  /** False to turn the model's thinking off on every request. */
+  thinking?: boolean;
+  /**
+   * The upstream's API key, sent as `x-api-key` in place of whatever the harness
+   * sends: keys stay with the bench, never in a harness's environment or config.
+   */
+  apiKey?: string;
+  /**
+   * Fold system messages that come mid-conversation into the user turn before
+   * them. For llama.cpp, whose chat templates (Qwen's among them) refuse a system
+   * message anywhere but first; Claude Code sends one after the first user message.
+   */
+  foldSystemMessages?: boolean;
+  /**
+   * Caps the model's reasoning per response (`reasoning_budget_tokens`, which llama.cpp
+   * honours: thinking ends at the budget and the answer follows), whatever the harness asks.
+   */
+  reasoningBudget?: number;
+}
 
 /** Token counts for one request. `prompt` is all of it, cached or not: the context the model saw. */
 export interface Tokens {
   prompt: number;
   cached: number;
   completion: number;
+  /** Prompt tokens written to a cache, where the API bills them apart (Anthropic). Part of `prompt`. */
+  cacheWrite?: number;
 }
 
 /** What one model request did, as one line of a run's `requests.jsonl`. */
@@ -35,12 +68,21 @@ export interface RequestRecord {
   /** Network failure, or the client hanging up mid-response. */
   error?: string;
   stream: boolean;
+  /** Not streamed by the harness, so streamed upstream and answered whole: see `MeteringProxy`. */
+  restreamed: boolean;
+  /** What the proxy changed in the request, beyond streaming, e.g. `enable_thinking=false`. */
+  overrides?: string[];
   messages: number;
   tools: number;
   requestBytes: number;
   /** Sampling and length fields the harness sent, e.g. `temperature`, `max_tokens`. */
   params: Record<string, unknown>;
   tokens: Tokens | null;
+  /**
+   * Streamed chunks carrying output: for a response cut off before it reported its
+   * tokens, a lower bound on what it generated (llama.cpp sends some tokens together).
+   */
+  chunks: number;
   /** Where `tokens` came from: the API's `usage`, or llama.cpp's `timings` when streams carry no usage. */
   tokenSource?: 'usage' | 'timings';
   /** Server-side model time, from llama.cpp's `timings`. */
@@ -61,6 +103,11 @@ export interface Meter {
   /** Includes `/v1`, as harness configs expect. */
   baseURL: string;
   records: RequestRecord[];
+  /**
+   * Output generated so far, live: finished requests' completion tokens, plus the
+   * streamed chunks of those in flight (a little under their tokens). For budgets.
+   */
+  generated(): number;
 }
 
 interface Sink {
@@ -72,6 +119,8 @@ interface Sink {
   seq: number;
   /** Responses still being proxied, to abort if the run ends first. */
   live: Set<() => void>;
+  /** Their records, to count their output as it streams. */
+  inflight: Set<RequestRecord>;
 }
 
 const PARAMS = [
@@ -97,11 +146,13 @@ const TOOL_MARKUP = /<tool_call>|<function=|<\|tool_call|"name"\s*:\s*"[^"]+"\s*
 
 export class MeteringProxy {
   readonly upstream: URL;
+  readonly options: ProxyOptions;
   #server: http.Server;
   #runs = new Map<string, Sink>();
   #port = 0;
 
-  private constructor(upstream: string) {
+  private constructor(upstream: string, options: ProxyOptions) {
+    this.options = options;
     // Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces.
     this.upstream = new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
     this.#server = http.createServer((req, res) => void this.#handle(req, res));
@@ -112,8 +163,8 @@ export class MeteringProxy {
   }
 
   /** Listens on a free port on 127.0.0.1; `upstream` includes `/v1`. */
-  static async start(upstream: string): Promise<MeteringProxy> {
-    const proxy = new MeteringProxy(upstream);
+  static async start(upstream: string, options: ProxyOptions = {}): Promise<MeteringProxy> {
+    const proxy = new MeteringProxy(upstream, options);
     await new Promise<void>((resolve) => proxy.#server.listen(0, '127.0.0.1', resolve));
     proxy.#port = (proxy.#server.address() as AddressInfo).port;
     return proxy;
@@ -122,9 +173,17 @@ export class MeteringProxy {
   /** Starts metering a run; `file` gets a line per request, `transcript` the last exchange. */
   open(run: string, file: string, transcript: string): Meter {
     if (!/^[\w.-]+$/.test(run)) throw new Error(`Bad run id: ${run}`);
-    const meter: Meter = { baseURL: `http://127.0.0.1:${this.#port}/${run}/v1`, records: [] };
+    const inflight = new Set<RequestRecord>();
+    const records: RequestRecord[] = [];
+    const meter: Meter = {
+      baseURL: `http://127.0.0.1:${this.#port}/${run}/v1`,
+      records,
+      generated: () =>
+        records.reduce((sum, record) => sum + (record.tokens?.completion ?? record.chunks), 0) +
+        [...inflight].reduce((sum, record) => sum + record.chunks, 0),
+    };
     writeFileSync(file, '');
-    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set() });
+    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set(), inflight });
     return meter;
   }
 
@@ -153,7 +212,35 @@ export class MeteringProxy {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const body = Buffer.concat(chunks);
-    const { record, offered } = describeRequest(++sink.seq, path, body);
+    const { record, offered, json } = describeRequest(++sink.seq, path, body);
+    record.restreamed = !record.stream && record.dialect !== 'other' && json !== undefined;
+    // `params` keeps what the harness asked for; this is what the model gets.
+    const forced: Json = {};
+    if (this.options.thinking === false && record.dialect !== 'other' && json !== undefined) {
+      forced.chat_template_kwargs = { ...(json.chat_template_kwargs as Json | undefined), enable_thinking: false };
+      record.overrides = ['enable_thinking=false'];
+    }
+    if (this.options.reasoningBudget !== undefined && record.dialect !== 'other' && json !== undefined) {
+      forced.reasoning_budget_tokens = this.options.reasoningBudget;
+      record.overrides = [...(record.overrides ?? []), `reasoning_budget_tokens=${this.options.reasoningBudget}`];
+    }
+    if (this.options.foldSystemMessages && record.dialect !== 'other' && Array.isArray(json?.messages)) {
+      const folded = foldSystem(json.messages as Json[], record.dialect);
+      if (folded) {
+        forced.messages = folded;
+        record.overrides = [...(record.overrides ?? []), 'system-message-folded'];
+      }
+    }
+    const sent =
+      record.restreamed || record.overrides
+        ? Buffer.from(
+            JSON.stringify({
+              ...json,
+              ...forced,
+              ...(record.restreamed ? { stream: true, ...(record.dialect === 'openai' ? { stream_options: { include_usage: true } } : {}) } : {}),
+            }),
+          )
+        : body;
     const response = new ResponseParser(record, offered);
     const target = new URL(path, this.upstream);
 
@@ -162,13 +249,19 @@ export class MeteringProxy {
       const value = req.headers[name];
       if (typeof value === 'string') headers[name] = value;
     }
-    headers['content-length'] = String(body.length);
+    if (this.options.apiKey) {
+      delete headers.authorization;
+      headers['x-api-key'] = this.options.apiKey;
+      headers['anthropic-version'] ??= '2023-06-01';
+    }
+    headers['content-length'] = String(sent.length);
 
     let finished = false;
     const finish = (error?: string) => {
       if (finished) return;
       finished = true;
       sink.live.delete(abort);
+      sink.inflight.delete(record);
       if (error) record.error = error;
       record.ms = Date.now() - record.start;
       response.end();
@@ -180,17 +273,27 @@ export class MeteringProxy {
     const client = target.protocol === 'https:' ? https : http;
     const upstream = client.request(target, { method: req.method, headers }, (up) => {
       record.status = up.statusCode ?? 0;
+      // Errors come back whole either way, and pass through as they are.
+      const assemble = record.restreamed && record.status === 200;
       const out: Record<string, string | string[]> = {};
       for (const [name, value] of Object.entries(up.headers)) {
         if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
       }
-      res.writeHead(record.status, out);
+      if (!assemble) res.writeHead(record.status, out);
+      // An error's body says why: keep its start.
+      let errorBody = '';
       up.on('data', (chunk: Buffer) => {
         response.write(chunk);
-        res.write(chunk);
+        if (!assemble) res.write(chunk);
+        if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
       });
       up.on('end', () => {
-        res.end();
+        if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
+      });
+      up.on('end', () => {
+        response.end();
+        if (assemble) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(response.assembled()));
+        else res.end();
         finish();
       });
       up.on('error', (err) => {
@@ -203,6 +306,7 @@ export class MeteringProxy {
       finish('aborted: run ended');
     };
     sink.live.add(abort);
+    sink.inflight.add(record);
     upstream.on('error', (err) => {
       if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
       else res.destroy();
@@ -215,13 +319,33 @@ export class MeteringProxy {
         finish('aborted: client disconnected');
       }
     });
-    upstream.end(body);
+    upstream.end(sent);
   }
 }
 
-function describeRequest(seq: number, path: string, body: Buffer): { record: RequestRecord; offered: Set<string> } {
+/** The bench's own aborts, when a run ends or its harness hangs up: not the server's doing. */
+const OWN_ABORT = /^aborted: (run ended|client disconnected)$/;
+
+/** A request the bench itself cut short. */
+export function abortedByBench(record: RequestRecord): boolean {
+  return OWN_ABORT.test(record.error ?? '');
+}
+
+/**
+ * A request that failed for the infrastructure rather than the harness: a 5xx or
+ * 429, or a connection that failed or dropped mid-response (a server crash shows as
+ * an `aborted` stream). Other 4xx are the harness's doing, e.g. a request over the context.
+ */
+export function infrastructureError(record: RequestRecord): boolean {
+  if (record.status >= 500 || record.status === 429) return true;
+  if (record.status >= 400) return false;
+  return Boolean(record.error) && !abortedByBench(record);
+}
+
+function describeRequest(seq: number, path: string, body: Buffer): { record: RequestRecord; offered: Set<string>; json: Json | undefined } {
   const json = tryParse(body) as Record<string, any> | undefined;
-  const dialect = path.startsWith('chat/completions') ? 'openai' : path.startsWith('messages') ? 'anthropic' : 'other';
+  // Model requests only: `messages/count_tokens` and the like are 'other', passed through as they are.
+  const dialect = /^chat\/completions(\?|$)/.test(path) ? 'openai' : /^messages(\?|$)/.test(path) ? 'anthropic' : 'other';
   const params: Record<string, unknown> = {};
   for (const key of PARAMS) if (json && Object.hasOwn(json, key)) params[key] = json[key];
   const tools: Json[] = Array.isArray(json?.tools) ? json.tools : [];
@@ -235,11 +359,13 @@ function describeRequest(seq: number, path: string, body: Buffer): { record: Req
     dialect,
     status: 0,
     stream: json?.stream === true,
+    restreamed: false,
     messages: Array.isArray(json?.messages) ? json.messages.length : 0,
     tools: tools.length,
     requestBytes: body.length,
     params,
     tokens: null,
+    chunks: 0,
     toolCalls: [],
     unknownTools: [],
     finish: null,
@@ -247,7 +373,29 @@ function describeRequest(seq: number, path: string, body: Buffer): { record: Req
     reasoningChars: 0,
     unparsedToolCall: false,
   };
-  return { record, offered };
+  return { record, offered, json };
+}
+
+/**
+ * Messages with any system message past the first folded into the user turn
+ * before it (or made a user turn, with none before it); undefined when there's
+ * nothing to fold. OpenAI requests keep a leading system message where it is.
+ */
+function foldSystem(messages: Json[], dialect: 'openai' | 'anthropic'): Json[] | undefined {
+  const blocks = (content: unknown): Json[] => (typeof content === 'string' ? [{ type: 'text', text: content }] : ((content as Json[]) ?? []));
+  const out: Json[] = [];
+  let changed = false;
+  messages.forEach((message, i) => {
+    if (message.role !== 'system' || (dialect === 'openai' && i === 0)) return void out.push(message);
+    changed = true;
+    const previous = out.at(-1);
+    if (previous?.role === 'user') {
+      out[out.length - 1] = { ...previous, content: [...blocks(previous.content), ...blocks(message.content)] };
+    } else {
+      out.push({ role: 'user', content: blocks(message.content) });
+    }
+  });
+  return changed ? out : undefined;
 }
 
 function tryParse(text: Buffer | string): unknown {
@@ -267,13 +415,19 @@ type Json = Record<string, any>;
 class ResponseParser {
   #record: RequestRecord;
   #offered: Set<string>;
+  #ended = false;
   #raw: Buffer[] = [];
   #pending = '';
   #content = '';
   #reasoning = '';
   /** Streamed tool calls by index: the name comes in the first delta, the arguments in pieces. */
-  #calls = new Map<number, { name: string; arguments: string }>();
+  #calls = new Map<number, { id?: string; name: string; arguments: string }>();
+  /** A whole response, as it came. */
   #message: unknown;
+  /** From a stream, to assemble the whole response: OpenAI's chunk fields, usage and timings. */
+  #openai: Json = {};
+  /** From a stream, to assemble the whole response: Anthropic's message and its content blocks. */
+  #anthropic: { message?: Json; blocks: Json[]; partial: Map<number, string> } = { blocks: [], partial: new Map() };
 
   constructor(record: RequestRecord, offered: Set<string>) {
     this.#record = record;
@@ -281,7 +435,7 @@ class ResponseParser {
   }
 
   write(chunk: Buffer): void {
-    if (!this.#record.stream) {
+    if (!this.#record.stream && !this.#record.restreamed) {
       this.#raw.push(chunk);
       return;
     }
@@ -295,7 +449,9 @@ class ResponseParser {
   }
 
   end(): void {
-    if (this.#record.stream) {
+    if (this.#ended) return;
+    this.#ended = true;
+    if (this.#record.stream || this.#record.restreamed) {
       if (this.#pending.trim().startsWith('data:')) this.#event(this.#pending.trim().slice(5).trim());
       this.#pending = '';
     } else {
@@ -311,9 +467,34 @@ class ResponseParser {
     record.unparsedToolCall = TOOL_MARKUP.test(this.#content);
   }
 
-  /** The response as one message, whichever way it came. */
+  /**
+   * The response as one message, whichever way it came; from a stream, as the
+   * server sends it whole (that's what a restreamed request's harness gets).
+   */
   assembled(): unknown {
     if (this.#message !== undefined) return this.#message;
+    if (this.#record.dialect === 'openai') {
+      const { meta = {}, usage, timings } = this.#openai;
+      const message: Json = { role: 'assistant', content: this.#content };
+      if (this.#reasoning) message.reasoning_content = this.#reasoning;
+      if (this.#calls.size) {
+        message.tool_calls = [...this.#calls.values()].map((call) => ({
+          type: 'function',
+          function: { name: call.name, arguments: call.arguments },
+          ...(call.id ? { id: call.id } : {}),
+        }));
+      }
+      return {
+        choices: [{ finish_reason: this.#record.finish, index: 0, message }],
+        ...meta,
+        object: 'chat.completion',
+        ...(usage ? { usage } : {}),
+        ...(timings ? { timings } : {}),
+      };
+    }
+    if (this.#record.dialect === 'anthropic' && this.#anthropic.message) {
+      return { ...this.#anthropic.message, content: this.#anthropic.blocks.filter(Boolean) };
+    }
     return {
       reasoning: this.#reasoning || undefined,
       content: this.#content,
@@ -332,16 +513,22 @@ class ResponseParser {
 
   #openaiChunk(chunk: Json): void {
     this.#usage(chunk.usage, chunk.timings);
+    const { id, created, model, system_fingerprint } = chunk;
+    this.#openai.meta ??= { created, model, system_fingerprint, id };
+    if (chunk.usage) this.#openai.usage = chunk.usage;
+    if (chunk.timings) this.#openai.timings = chunk.timings;
     const choice = chunk.choices?.[0];
     if (!choice) return;
     if (choice.finish_reason) this.#record.finish = choice.finish_reason;
     const delta = choice.delta ?? {};
+    if (delta.content || delta.reasoning_content || delta.reasoning || delta.tool_calls?.length) this.#record.chunks++;
     if (typeof delta.content === 'string') this.#content += delta.content;
     const reasoning = delta.reasoning_content ?? delta.reasoning;
     if (typeof reasoning === 'string') this.#reasoning += reasoning;
     for (const call of delta.tool_calls ?? []) {
       const index = typeof call.index === 'number' ? call.index : this.#calls.size;
       const known = this.#calls.get(index) ?? { name: '', arguments: '' };
+      if (call.id) known.id = call.id;
       if (call.function?.name) known.name += call.function.name;
       if (call.function?.arguments) known.arguments += call.function.arguments;
       this.#calls.set(index, known);
@@ -349,26 +536,46 @@ class ResponseParser {
   }
 
   #anthropicEvent(event: Json): void {
+    const whole = this.#anthropic;
+    const block = whole.blocks[event.index];
     switch (event.type) {
       case 'message_start':
         this.#usage(event.message?.usage);
+        whole.message = { ...event.message };
         break;
       case 'content_block_start':
         if (event.content_block?.type === 'tool_use') this.#calls.set(event.index, { name: event.content_block.name, arguments: '' });
+        whole.blocks[event.index] = { ...event.content_block };
         break;
       case 'content_block_delta': {
+        this.#record.chunks++;
         const delta = event.delta ?? {};
-        if (delta.type === 'text_delta') this.#content += delta.text;
-        else if (delta.type === 'thinking_delta') this.#reasoning += delta.thinking;
-        else if (delta.type === 'input_json_delta') {
+        if (delta.type === 'text_delta') {
+          this.#content += delta.text;
+          if (block) block.text = (block.text ?? '') + delta.text;
+        } else if (delta.type === 'thinking_delta') {
+          this.#reasoning += delta.thinking;
+          if (block) block.thinking = (block.thinking ?? '') + delta.thinking;
+        } else if (delta.type === 'signature_delta') {
+          if (block) block.signature = (block.signature ?? '') + delta.signature;
+        } else if (delta.type === 'input_json_delta') {
           const call = this.#calls.get(event.index);
           if (call) call.arguments += delta.partial_json;
+          whole.partial.set(event.index, (whole.partial.get(event.index) ?? '') + delta.partial_json);
         }
         break;
       }
+      case 'content_block_stop':
+        // Whole, a tool call's input is an object, not the JSON text it streams as.
+        if (block?.type === 'tool_use') block.input = (tryParse(whole.partial.get(event.index) ?? '') as Json | undefined) ?? {};
+        break;
       case 'message_delta':
         if (event.delta?.stop_reason) this.#record.finish = event.delta.stop_reason;
         this.#usage(event.usage);
+        if (whole.message) {
+          Object.assign(whole.message, event.delta ?? {});
+          whole.message.usage = { ...whole.message.usage, ...event.usage };
+        }
         break;
     }
   }
@@ -421,11 +628,13 @@ class ResponseParser {
       // Anthropic: input_tokens excludes cache reads; streams send input in message_start and output in message_delta.
       const previous = record.tokenSource === 'usage' ? record.tokens : null;
       const cached = usage.cache_read_input_tokens ?? previous?.cached ?? 0;
-      const input = usage.input_tokens ?? (previous ? previous.prompt - previous.cached : 0);
+      const cacheWrite = usage.cache_creation_input_tokens ?? previous?.cacheWrite ?? 0;
+      const input = usage.input_tokens ?? (previous ? previous.prompt - previous.cached - (previous.cacheWrite ?? 0) : 0);
       record.tokens = {
-        prompt: input + cached + (usage.cache_creation_input_tokens ?? 0),
+        prompt: input + cached + cacheWrite,
         cached,
         completion: usage.output_tokens ?? previous?.completion ?? 0,
+        ...(cacheWrite ? { cacheWrite } : {}),
       };
       record.tokenSource = 'usage';
     }
