@@ -4,8 +4,9 @@ Runs coding-agent harnesses on the same model, on the same tasks, and measures t
 the same way: from the wire.
 
 ```sh
-npm run bench -- -j 4                       # every harness on every case, 4 runs at a time
-npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each
+npm run bench                               # every harness on every case, as many at a time as the server has slots
+npm run bench -- -j 4 --set quick -r 3      # the quick set, 3 reps each, at most 4 at a time
+npm run bench -- --servers-cmd "test/harness-bench/servers/gce-mig.sh llama-9b us-central1" -r 3   # on a pool of servers, as they come and go
 npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
@@ -24,7 +25,9 @@ npm run bench:analyze -- A=results/<before> B=results/<after> -H featherloop   #
 `--rerun-api-errors` runs again, in place, the runs of a results directory that hit
 infrastructure errors (a server restart, a proxy timeout: 5xx, 429, a dropped connection,
 an error mid-stream such as llama.cpp's when its slots fill a shared KV cache), and any an
-interrupted bench never started, on its model, server and timeout. Other API
+interrupted bench never started, on its model, servers and timeout. The bench requeues such
+runs itself as they happen (see [Servers](#servers)); this is for those still failing at
+their last attempt, and benches cut short. Other API
 errors, say a request over the context, are the harness's doing and stay results. The old
 run's directory is kept beside the new one as `<case>-r<rep>.replaced`, `meta.json` lists
 the reruns, and the report counts the latest run of each.
@@ -59,7 +62,8 @@ cases are offline). featherloop runs without its advisor.
 server, display name, context and output limits, and featherloop's own settings
 (variants). For each run the bench adds the chosen model (`-m`, default `qwen3.5-9b`)
 to the copied configs and passes it to every harness, so all four run the same model
-with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server.
+with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server, and
+`--servers-cmd` at several (see [Servers](#servers)).
 
 A sampling setting gets a model of its own, on the same server: `qwen3.5-9b-presence`
 (`presence_penalty` 1.5, Qwen's setting against circular thinking) and `qwen3.5-9b-dry`
@@ -116,6 +120,48 @@ with all harnesses on a llama.cpp model leaves it out. On Haiku it turns extende
 thinking on (`budget_tokens: 31999`), which the other harnesses don't: compare with that
 in mind. Its first prompt is about 30k tokens (24 tools and a 27k-character system
 prompt).
+
+## Servers
+
+The bench runs on a pool of llama.cpp servers; `--base-url` is a pool of one.
+`--servers-cmd "<command>"` is a shell command that prints servers, a base URL with `/v1` a
+line, which the bench runs again every `--servers-every` seconds (60): servers join and
+leave as its output changes. A command that fails leaves the pool as it was.
+
+A server joins once `/health` answers 200 (llama.cpp answers 503 while it loads the model)
+and `/props` names the same model file and build as the rest: what most of the first
+servers serve or, for `--rerun-api-errors`, what the run it reruns did, so results stay
+comparable. Others are refused, and the bench says why. Each server takes as many runs at
+once as it has slots (`total_slots`), or `-j` if that's fewer: `-j` is per server. One
+queue feeds them all, in order, and whichever server has a free slot takes the next run.
+Result rows, and `meta.json`'s `servers`, say which server ran what.
+
+Every 10 seconds the bench checks each server's health. One that fails twice in a row (a
+preempted VM may not answer at all: a check waits 10 seconds) leaves the pool, and its runs
+are stopped and go back on the front of the queue; it joins again once it passes. One gone
+from the command's output takes no new runs, but finishes those it has. A run whose
+requests hit infrastructure errors (any, as `--rerun-api-errors` counts them, even if the
+harness got past them) goes back on the queue too, for another server if one is free, up
+to 3 attempts; the last stands, whatever it is. Its server is checked at once, and leaves
+at the first failed check: a dead server refuses connections fast enough to fail run
+after run. A requeued attempt isn't graded or counted: its directory is kept as
+`<case>-r<rep>.replaced`, with a `requeued.json` that says why, and `meta.json` lists the
+requeues. With no server up, the bench waits for one.
+
+When nothing's left to run and nothing's in flight, the bench prints `queue drained`: the
+servers can go. It never starts, stops or resizes a server; that's yours to do.
+
+`servers/gce-mig.sh <mig> <region> [port=9931]` lists a regional GCP managed instance
+group's RUNNING instances, `http://<external IP>:<port>/v1` each, with one `gcloud compute
+instances list` filtered on the `created-by` metadata the group gives its instances. Spot
+VMs come back with new IPs; the next listing has them. It needs `gcloud` signed in as an
+account that can only look, e.g. a service account with `roles/compute.viewer`
+(`gcloud auth activate-service-account --key-file=<key>.json`), and the project set
+(`gcloud config set project <id>`, or `CLOUDSDK_CORE_PROJECT`). Harnesses never see those
+credentials (see [Isolation](#isolation)).
+
+A hosted API is one server, taken as it is (no health checks), 1 run at a time unless `-j`
+says otherwise; `--servers-cmd` is for llama.cpp.
 
 ## Isolation
 
@@ -209,13 +255,14 @@ Both are recorded in `meta.json`, so reruns match.
 
 ## Caveats
 
-- Wall clock depends on load. Jobs are ordered case by case, harness by harness, so at
-  `-j` equal to the harness count (4) each case's runs share the server at once. Above
-  the server's slot count, requests queue, and that counts as model time.
+- Wall clock depends on load. Jobs are ordered case by case, harness by harness, so with
+  as many slots as harnesses (4) each case's runs share a server at once.
+- The pool checks its servers' model and build, not their hardware: a slower GPU gets less
+  done before the timeout. Make a pool's servers from one template.
 - The timeout and `-j` are coupled: busy slots share the GPU, so each run generates more
   slowly. Measured on short prompts: 59 tokens/s alone, 38 per stream with 4 at once
   (141 in all, 2.7× the throughput); long contexts slow it further. A run gets less done
-  before the timeout at `-j 4`, so compare harnesses only from runs at the same `-j`.
+  before the timeout at `-j 4`, so compare harnesses only from runs at the same `-j` (or slots).
 - nanocode catches every error and exits 0, so it never shows as crashed: its API
   failures show as failed runs.
 - The output limit decides how a reasoning loop ends. featherloop and opencode allow
@@ -224,8 +271,6 @@ Both are recorded in `meta.json`, so reruns match.
   that ran it at its own 8192). A request cut off by the timeout
   never reports its tokens: the report counts its streamed chunks instead, as a lower
   bound (llama.cpp sends some tokens together), outside the token totals.
-- Match `-j` to the server's slots: with one slot, requests queue and parallel runs only
-  wait on each other, eating into their timeouts.
 - Some exercises can be answered from memory (zebra-puzzle's tests check two names);
   they're kept, as every harness gets the same chance at them.
 - A 9B model varies a lot from run to run; use `-r 3` or more before reading much into
