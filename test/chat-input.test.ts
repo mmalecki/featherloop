@@ -35,12 +35,16 @@ test('kitty keys go back to legacy bytes, but Shift+Enter becomes Alt+Enter', ()
   // Not kitty's: arrows and other CSI sequences pass.
   assert.equal(legacyKeys('\x1b[A\x1b[1;5C'), '\x1b[A\x1b[1;5C');
   // Event types and alternates, which readline would type out ("1D"): dropped; releases too.
-  assert.equal(legacyKeys('\x1b[1;1:1D'), '\x1b[1;1D');
-  assert.equal(legacyKeys('\x1b[1;9:2C'), '\x1b[1;9C');
+  assert.equal(legacyKeys('\x1b[1;1:1D'), '\x1b[1D');
+  assert.equal(legacyKeys('\x1b[1;9:2C'), '\x1b[1C');
   assert.equal(legacyKeys('\x1b[1;1:3D'), '');
   assert.equal(legacyKeys('\x1b[3;5:1~'), '\x1b[3;5~');
+  // Num Lock (128) and Caps Lock (64) are in the modifiers; readline would type "29D".
+  assert.equal(legacyKeys('\x1b[1;129D\x1b[1;129C\x1b[1;129A\x1b[1;129B'), '\x1b[1D\x1b[1C\x1b[1A\x1b[1B');
+  assert.equal(legacyKeys('\x1b[1;133D'), '\x1b[1;5D'); // Ctrl+Left with Num Lock
+  assert.equal(legacyKeys('\x1b[1;193:2C'), '\x1b[1C');
   assert.equal(legacyKeys('\x1b[1:9D'), '\x1b[1D'); // alternates, no modifiers
-  assert.equal(legacyKeys('\x1b[1:2;9:1C'), '\x1b[1;9C');
+  assert.equal(legacyKeys('\x1b[1:2;9:1C'), '\x1b[1C');
 });
 
 test('the filter passes keys through and hands pastes to fold, whole', async () => {

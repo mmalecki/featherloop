@@ -386,12 +386,13 @@ const KITTY_KEY = /\x1b\[(\d+)(?::\d*)*(?:;(\d+)(?::\d+)?)?(?:;[\d:]*)?u/g;
 const KP_ENTER = 57414;
 
 /**
- * Arrows, Home/End, F1-F4 and the `~` keys with colon sub-parameters: an event type,
- * `CSI 1;modifiers:event D`, or alternates, `CSI 1:alternate D`, as some terminals send
- * them. Readline doesn't know the colon and types out the rest (a Left arrow as "1D", or
- * "9D"), so sub-parameters are dropped; key releases are dropped whole.
+ * Arrows, Home/End, F1-F4 and the `~` keys as kitty sends them: with colon sub-parameters
+ * (`CSI 1;modifiers:event D`, `CSI 1:alternate D`), or with Caps/Num Lock in the modifiers
+ * (Num Lock is 128: `CSI 1;129 D`). Readline reads one digit of modifiers and types out the
+ * rest (a Left arrow as "29D"), so what it can't use is dropped: sub-parameters and the
+ * lock and meta bits, leaving Shift, Alt and Ctrl. Key releases are dropped whole.
  */
-const KITTY_CSI = /\x1b\[([\d:;]*:[\d:;]*)([A-DFHPQS~])/g;
+const KITTY_CSI = /\x1b\[([\d:;]*)([A-DFHPQS~])/g;
 
 export function legacyKeys(data: string): string {
   data = data.replace(KITTY_CSI, (_sequence, params: string, final: string) => {
@@ -399,7 +400,8 @@ export function legacyKeys(data: string): string {
     const number = first.split(':')[0];
     const [modifiers, event] = second.split(':');
     if (event === '3') return '';
-    return modifiers ? `\x1b[${number || '1'};${modifiers}${final}` : `\x1b[${number}${final}`;
+    const bits = ((Number(modifiers) || 1) - 1) & 7;
+    return bits ? `\x1b[${number || '1'};${bits + 1}${final}` : `\x1b[${number}${final}`;
   });
   return data.replace(KITTY_KEY, (_sequence, code: string, modifiers = '1') => {
     // The keypad's Enter is Enter; other private-use codes are keys with no legacy
