@@ -33,7 +33,8 @@
     "test": "node --test \"test/**/*.test.ts\"",
     "prepack": "npm run build",
     "validate-cases": "node test/harness-bench/validate.ts",
-    "bench": "node --use-env-proxy --env-file-if-exists=.env test/harness-bench/run.ts"
+    "bench": "node --use-env-proxy --env-file-if-exists=.env test/harness-bench/run.ts",
+    "bench:analyze": "node test/harness-bench/analyze.ts"
   },
   "license": "MIT",
   "dependencies": {
