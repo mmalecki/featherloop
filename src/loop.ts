@@ -31,6 +31,9 @@ export type EndCriteria = (state: EndState) => boolean | Promise<boolean>;
 
 export const noToolCalls: EndCriteria = ({ message }) => !message.tool_calls?.length;
 
+/** Starts each event message: what tools' background work reports, so the model can tell it from the user. */
+export const EVENT_PREFIX = '[Event, not from the user]';
+
 export interface LoopOptions {
   endCriteria?: EndCriteria;
   /** Run every tool call in the model's order, one at a time. Off by default. */
@@ -104,6 +107,8 @@ export interface LoopEvents {
   usage: [usage: UsageEvent];
   /** A message was appended to the conversation (assistant, tool, or queued). */
   message: [message: Message];
+  /** The model is done, but background work isn't: the run waits for its events, or a queued message. */
+  waiting: [count: number];
   /** End criteria were met, or the model refused. */
   end: [result: RunResult];
 }
@@ -116,6 +121,10 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
   readonly models: ModelResolver | undefined;
   #pending: Message[] = [];
   #running = false;
+  /** Background work from tools (`ToolContext.background`) that hasn't reported yet. */
+  #background = new Set<Promise<void>>();
+  /** Ends a wait for an event or a queued message. */
+  #wake: (() => void) | undefined;
 
   constructor(api: ApiClient, toolset: Toolset = {}, options: LoopOptions = {}) {
     super();
@@ -137,6 +146,12 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
    */
   queue(message: Message | string): void {
     this.#pending.push(typeof message === 'string' ? { role: 'user', content: message } : message);
+    this.#wake?.();
+  }
+
+  /** Background work from tools that hasn't reported yet. */
+  get backgroundCount(): number {
+    return this.#background.size;
   }
 
   async run(options: RunOptions): Promise<RunResult> {
@@ -194,11 +209,52 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
 
       const done = message.stop === 'refusal' || (await endCriteria({ message, messages, turn }));
       if (done && (this.#pending.length === 0 || message.stop === 'refusal')) {
+        // Done, but for background work: its events, or a message queued meanwhile, start the next turn.
+        if (this.#background.size && message.stop !== 'refusal') {
+          this.emit('waiting', this.#background.size);
+          await this.#nextMessage(signal);
+          continue;
+        }
         const result = { message, messages, usage };
         this.emit('end', result);
         return result;
       }
     }
+  }
+
+  /** Resolves when a message is queued, or rejects when the run is aborted. */
+  #nextMessage(signal: AbortSignal | undefined): Promise<void> {
+    if (this.#pending.length) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        cleanup();
+        reject(signal!.reason);
+      };
+      const cleanup = () => {
+        this.#wake = undefined;
+        signal?.removeEventListener('abort', onAbort);
+      };
+      this.#wake = () => {
+        cleanup();
+        resolve();
+      };
+      if (signal?.aborted) return onAbort();
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /**
+   * Tracks a tool's background work; what it settles with is queued as an event.
+   * Not after an abort: the run that wanted it is over, and the work was stopped with it.
+   */
+  #track(work: Promise<string>, signal: AbortSignal | undefined): void {
+    const task: Promise<void> = work
+      .catch((err: unknown) => `Background work failed: ${err instanceof Error ? err.message : String(err)}`)
+      .then((text) => {
+        this.#background.delete(task);
+        if (!signal?.aborted) this.queue({ role: 'user', content: `${EVENT_PREFIX} ${text}` });
+      });
+    this.#background.add(task);
   }
 
   #drainQueue(messages: Message[]): void {
@@ -250,6 +306,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         signal,
         messages,
         relay: this.#relay(id),
+        background: (work) => this.#track(work, signal),
         ...(this.models ? { models: attributedModels(this.models, name, track) } : {}),
       });
     } catch (err) {

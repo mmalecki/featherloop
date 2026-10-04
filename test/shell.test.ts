@@ -113,3 +113,87 @@ test('rejects when aborted, and removes the output file', async () => {
   await assert.rejects(Promise.resolve(tool.invoke({ command: 'sleep 5' }, { ...ctx, signal: controller.signal })), /stop/);
   assert.deepEqual(await outputFiles(), []);
 });
+
+/** Runs a command with bg, and returns what it said at once and what it reports when it exits. */
+async function inBackground(
+  command: string,
+  params: { maxLength?: number; bgTimeoutMs?: number } = {},
+): Promise<{ started: string; report: string }> {
+  const tool = ShellTool({
+    params: {
+      cwd: { value: dir },
+      ...(params.maxLength !== undefined ? { maxLength: { value: params.maxLength } } : {}),
+      ...(params.bgTimeoutMs !== undefined ? { bgTimeoutMs: { value: params.bgTimeoutMs } } : {}),
+    },
+  });
+  let work: Promise<string> | undefined;
+  const started = await tool.invoke({ command, bg: true }, { ...ctx, background: (promise) => (work = promise) });
+  assert.ok(work, 'no background work handed over');
+  return { started, report: await work };
+}
+
+test('bg returns at once, and a success reports where its output is, not the output', async () => {
+  const before = Date.now();
+  const tool = ShellTool({ params: { cwd: { value: dir } } });
+  let work!: Promise<string>;
+  const started = await tool.invoke({ command: 'sleep 0.5; seq 1 3', bg: true }, { ...ctx, background: (promise) => (work = promise) });
+  assert.ok(Date.now() - before < 400, `took ${Date.now() - before}ms`);
+  assert.match(started, /^Started in the background as process group \d+\. A message will report when it exits\.$/);
+
+  const report = await work;
+  const match = /^Background command `sleep 0\.5; seq 1 3` finished after \d+s \[exit code 0\]; output: 3 lines in (.+)$/.exec(report);
+  assert.ok(match, report);
+  assert.equal(readFileSync(match[1]!, 'utf8'), '1\n2\n3\n');
+  await rm(match[1]!);
+});
+
+test('a bg failure brings the end of its output along', async () => {
+  const { report } = await inBackground('seq 1 100; echo broken >&2; exit 2', { maxLength: 20 });
+  const [first, ...rest] = report.split('\n');
+  const match = /^Background command `.+` failed after \d+s \[exit code 2\]; output: 101 lines in (.+), ending:$/.exec(first!);
+  assert.ok(match, report);
+  assert.equal(rest.at(-1), 'broken');
+  assert.ok(rest.join('\n').length <= 20, report);
+  await rm(match[1]!);
+});
+
+test('a bg command with no output leaves no file', async () => {
+  assert.match((await inBackground('true')).report, /^Background command `true` finished after \d+s \[exit code 0\], with no output$/);
+  assert.match((await inBackground('exit 1')).report, /^Background command `exit 1` failed after \d+s \[exit code 1\], with no output$/);
+  assert.deepEqual(await outputFiles(), []);
+});
+
+test('bg with maxLength 0 keeps even a failure out of the report', async () => {
+  const { report } = await inBackground('echo oops; exit 1', { maxLength: 0 });
+  const match = /^Background command `.+` failed after \d+s \[exit code 1\]; output: 1 lines in (.+)$/.exec(report);
+  assert.ok(match, report);
+  await rm(match[1]!);
+});
+
+test('bg has its own timeout, and a timeout is a failure', async () => {
+  const { report } = await inBackground('echo going; sleep 5', { bgTimeoutMs: 200 });
+  const match = /^Background command `.+` failed after \d+s \[timed out after 0\.2s\]; output: 1 lines in (.+), ending:\ngoing$/.exec(report);
+  assert.ok(match, report);
+  await rm(match[1]!);
+});
+
+test('bg names a long or multi-line command by the start of its first line', async () => {
+  const { report } = await inBackground(`true # ${'x'.repeat(100)}\ntrue`);
+  assert.match(report, /^Background command `true # x{73}…` finished/);
+});
+
+test('bg needs a loop to report back to', async () => {
+  const tool = ShellTool({ params: { cwd: { value: dir } } });
+  await assert.rejects(Promise.resolve(tool.invoke({ command: 'true', bg: true }, ctx)), /bg needs an agent loop/);
+});
+
+test('an abort kills a bg command, and its work rejects', async () => {
+  const controller = new AbortController();
+  const tool = ShellTool({ params: { cwd: { value: dir } } });
+  let work!: Promise<string>;
+  await tool.invoke({ command: 'sleep 5', bg: true }, { ...ctx, signal: controller.signal, background: (promise) => (work = promise) });
+  const before = Date.now();
+  controller.abort(new Error('stop'));
+  await assert.rejects(work, /stop/);
+  assert.ok(Date.now() - before < 1_000);
+});

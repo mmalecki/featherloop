@@ -1,0 +1,28 @@
+{
+  // The bench's copy of ~/.config/opencode, adjusted for smaller models: the agents
+  // in agents/ are verbatim copies (build.md replaces the default agent's prompt and
+  // turns off skill, task, todowrite and question). The provider is the bench's
+  // metering proxy, as in opencode-stock, and websearch is left out: it needs a
+  // Parallel key, and the cases are offline.
+  "$schema": "https://opencode.ai/config.json",
+  "model": "bench/qwen3.5-9b",
+  "provider": {
+    "bench": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "llama-server (bench)",
+      "options": {
+        "baseURL": "{env:BENCH_BASE_URL}"
+      },
+      "models": {
+        "qwen3.5-9b": {
+          "name": "Qwen3.5 9B",
+          "limit": {
+            "context": 262144,
+            "output": 262144
+          }
+        }
+      }
+    }
+  },
+  "agent": { "title": { "disable": true } }
+}

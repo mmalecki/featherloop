@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentLoop, type AssistantMessage } from '../src/loop.ts';
+import { AgentLoop, EVENT_PREFIX, type AssistantMessage } from '../src/loop.ts';
 import type { Provider, TurnRequest } from '../src/provider.ts';
 import type { Toolset } from '../src/tool.ts';
 
@@ -75,4 +75,115 @@ test("tool names the model sends are only the toolset's own, not Object's", asyn
     messages.filter((m) => m.role === 'tool').map((m) => m.content),
     ['Error: Unknown tool "constructor"', 'Error: Unknown tool "toString"'],
   );
+});
+
+/** A toolset with one tool, `later`, that hands the loop work and returns at once. */
+function backgroundTool(work: () => Promise<string>): Toolset {
+  return {
+    later: {
+      schema: () => ({ description: 'Start something', parameters: { type: 'object', properties: {} } }),
+      invoke: (_params, ctx) => {
+        ctx.background!(work());
+        return 'started';
+      },
+    },
+  };
+}
+
+const callLater: AssistantMessage = {
+  role: 'assistant',
+  content: null,
+  stop: 'tool_use',
+  tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'later', arguments: '{}' } }],
+};
+
+test('waits for background work, and gives the model its event before ending', async () => {
+  let finish!: (text: string) => void;
+  const api = fakeProvider([
+    callLater,
+    { role: 'assistant', content: 'Waiting for it.', stop: 'end' },
+    { role: 'assistant', content: 'It finished.', stop: 'end' },
+  ]);
+  const loop = new AgentLoop(api, backgroundTool(() => new Promise((resolve) => (finish = resolve))));
+  const waits: number[] = [];
+  loop.on('waiting', (count) => {
+    waits.push(count);
+    finish('the work is done');
+  });
+
+  const { message, messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+
+  assert.deepEqual(waits, [1]);
+  assert.equal(message.content, 'It finished.');
+  assert.deepEqual(messages.at(-2), { role: 'user', content: `${EVENT_PREFIX} the work is done` });
+  assert.equal(api.requests.length, 3);
+  assert.equal(loop.backgroundCount, 0);
+});
+
+test('an event that comes before the next turn is sent with it, without waiting', async () => {
+  const api = fakeProvider([
+    callLater,
+    { role: 'assistant', content: 'Thinking.', stop: 'end' },
+    { role: 'assistant', content: 'Done.', stop: 'end' },
+  ]);
+  const loop = new AgentLoop(api, backgroundTool(async () => 'quick'));
+  let waited = false;
+  loop.on('waiting', () => (waited = true));
+
+  const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+
+  // Settled before the second turn ended: queued, so no waiting.
+  assert.equal(waited, false);
+  assert.deepEqual(
+    messages.filter((m) => m.role === 'user').map((m) => m.content),
+    ['Go.', `${EVENT_PREFIX} quick`],
+  );
+});
+
+test('a message queued while waiting starts a turn; the run still waits for the work', async () => {
+  let finish!: (text: string) => void;
+  const api = fakeProvider([
+    callLater,
+    { role: 'assistant', content: 'Waiting.', stop: 'end' },
+    { role: 'assistant', content: 'Still waiting.', stop: 'end' },
+    { role: 'assistant', content: 'Done.', stop: 'end' },
+  ]);
+  const loop = new AgentLoop(api, backgroundTool(() => new Promise((resolve) => (finish = resolve))));
+  let waits = 0;
+  loop.on('waiting', () => {
+    if (++waits === 1) loop.queue('How is it going?');
+    else finish('done');
+  });
+
+  const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+
+  assert.equal(waits, 2);
+  assert.deepEqual(
+    messages.filter((m) => m.role === 'user').map((m) => m.content),
+    ['Go.', 'How is it going?', `${EVENT_PREFIX} done`],
+  );
+});
+
+test('failed background work is reported as an event', async () => {
+  const api = fakeProvider([callLater, { role: 'assistant', content: 'Hm.', stop: 'end' }, { role: 'assistant', content: 'Ok.', stop: 'end' }]);
+  const loop = new AgentLoop(api, backgroundTool(async () => Promise.reject(new Error('disk full'))));
+  const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.ok(messages.some((m) => m.content === `${EVENT_PREFIX} Background work failed: disk full`));
+});
+
+test('an abort ends a waiting run, and what the work reports after is dropped', async () => {
+  let finish!: (text: string) => void;
+  const api = fakeProvider([callLater, { role: 'assistant', content: 'Waiting.', stop: 'end' }]);
+  const loop = new AgentLoop(api, backgroundTool(() => new Promise((resolve) => (finish = resolve))));
+  const abort = new AbortController();
+  loop.on('waiting', () => abort.abort(new Error('stop')));
+
+  await assert.rejects(loop.run({ model: 'm', input: [{ role: 'user', content: 'Go.' }], signal: abort.signal }), /stop/);
+  finish('too late');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(loop.backgroundCount, 0);
+  // Nothing left queued for the next run.
+  const next = fakeProvider([{ role: 'assistant', content: 'Hi.', stop: 'end' }]);
+  const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Hello.' }], api: next });
+  assert.deepEqual(messages.map((m) => m.content), ['Hello.', 'Hi.']);
 });

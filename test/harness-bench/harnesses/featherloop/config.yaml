@@ -1,0 +1,18 @@
+# The bench's copy of ~/.config/featherloop/config.yaml: the qwen3.5-9b model as
+# configured there, on one provider, the bench's metering proxy (BENCH_BASE_URL).
+# No advisor: every harness runs the same model alone.
+model: bench/qwen3.5-9b
+provider:
+  bench:
+    flavor: openai
+    options:
+      baseURL: "{env:BENCH_BASE_URL}"
+      # llama.cpp takes any key; the bench keeps real ones out of the harnesses' environment.
+      apiKey: bench
+    models:
+      qwen3.5-9b:
+        limit:
+          output: 262144
+        variants:
+          no-thinking:
+            reasoningEffort: none

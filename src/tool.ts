@@ -34,6 +34,12 @@ export interface ToolContext {
    * this tool's, like `api`'s. Set by the loop when it was given `models`.
    */
   models?: ModelResolver;
+  /**
+   * Hands the loop work that goes on after the call returns, such as a background
+   * command. When it settles, its text reaches the model as an event message, and
+   * until then the run doesn't end. Set by the loop.
+   */
+  background?: (work: Promise<string>) => void;
 }
 
 export interface Tool<P = Record<string, unknown>> {

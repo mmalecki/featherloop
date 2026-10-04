@@ -1,6 +1,6 @@
 import { styleText } from 'node:util';
 import { ChatInput } from './chat-input.ts';
-import type { AgentLoop, Message, RunOptions, ToolCallEvent, ToolResultEvent, UsageEvent } from './loop.ts';
+import { EVENT_PREFIX, type AgentLoop, type Message, type RunOptions, type ToolCallEvent, type ToolResultEvent, type UsageEvent } from './loop.ts';
 import type { ModelResolver, ResolvedModel } from './models.ts';
 import { addUsage, emptyUsage, type Provider, type Usage } from './provider.ts';
 import { sessionModel, type Session } from './session.ts';
@@ -308,7 +308,18 @@ export class SimpleUI {
     // Only this UI's runs: they're what the history holds.
     if (!this.#abort) return;
     this.#save((session) => session.append(message));
-    if (message.role === 'user') this.#print(this.#style('dim', `  ↳ sent: ${preview(text(message.content), 60)}`));
+    if (message.role !== 'user') return;
+    const content = text(message.content);
+    if (content.startsWith(EVENT_PREFIX)) {
+      this.#endBlock();
+      this.#print(`${this.#style('green', '⏺ Event:')} ${preview(content.slice(EVENT_PREFIX.length).trim(), 100)}`);
+    } else {
+      this.#print(this.#style('dim', `  ↳ sent: ${preview(content, 60)}`));
+    }
+  };
+  #onWaiting = (count: number) => {
+    this.#endBlock();
+    this.#print(this.#style('dim', `  ↳ waiting for ${count} background command${count === 1 ? '' : 's'} (type to send a message, Ctrl-C to stop)`));
   };
 
   /**
@@ -335,7 +346,8 @@ export class SimpleUI {
       .on('tool_call', this.#onToolCall)
       .on('tool_result', this.#onToolResult)
       .on('usage', this.#onUsage)
-      .on('message', this.#onMessage);
+      .on('message', this.#onMessage)
+      .on('waiting', this.#onWaiting);
   }
 
   #detach(loop: AgentLoop): void {
@@ -346,7 +358,8 @@ export class SimpleUI {
       .off('tool_call', this.#onToolCall)
       .off('tool_result', this.#onToolResult)
       .off('usage', this.#onUsage)
-      .off('message', this.#onMessage);
+      .off('message', this.#onMessage)
+      .off('waiting', this.#onWaiting);
   }
 
   #reasoning(delta: string): void {
