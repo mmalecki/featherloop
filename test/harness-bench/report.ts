@@ -207,6 +207,13 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
       .map(([name, info]) => `${name} ${(info as { version: string }).version}`)
       .join(', ')}.`,
     '',
+    '## Harnesses',
+    '',
+    ...Object.entries(meta.harnesses ?? {}).map(([name, info]) => {
+      const { version, description, notes } = info as { version: string; description: string; notes?: string[] };
+      return `- **${name}** ${version}: ${description}.${notes?.length ? ` ${notes.join('; ')}.` : ''}`;
+    }),
+    '',
     '## Results',
     '',
     ...header,

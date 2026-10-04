@@ -39,6 +39,13 @@ export interface HarnessContext {
   /** The run's prefix on the metering proxy, with `/v1`; also in the environment as `BENCH_BASE_URL`, for configs. */
   baseURL: string;
   model: Model;
+  settings: Settings;
+}
+
+/** Where the bench departs from a harness's own behaviour, by choice; recorded in meta.json, so reruns match. */
+export interface Settings {
+  /** nanocode's output limit, in place of the 8192 it ships with. */
+  nanocodeMaxTokens?: number;
 }
 
 export interface Invocation {
@@ -54,6 +61,8 @@ export interface Harness {
   prepare(): string;
   /** Puts its config into the run's home and says how to run it. */
   setup(ctx: HarnessContext): Invocation;
+  /** How it's set up, beyond the model and the proxy, for the report. */
+  notes(settings: Settings): string[];
 }
 
 const REPO = resolve(import.meta.dirname, '..', '..');
@@ -83,11 +92,13 @@ const featherloop: Harness = {
     // `--` so no line of the prompt reads as a flag.
     return { command: process.execPath, args: [join(REPO, 'bin', 'featherloop.ts'), '--shell', '--model', `bench/${model.id}`, '--', prompt] };
   },
+  notes: () => ['--shell; no advisor, no subagent'],
 };
 
-const opencode = (name: string, description: string): Harness => ({
+const opencode = (name: string, description: string, notes: string[]): Harness => ({
   name,
   description,
+  notes: () => notes,
   prepare: () => isolated((env) => execFileSync(opencodeBin(), ['--version'], { encoding: 'utf8', env }).trim()),
   setup: ({ xdg, prompt, model }) => {
     const dir = join(xdg.config, 'opencode');
@@ -108,17 +119,30 @@ const nanocode: Harness = {
     ensureRepo(NANOCODE.repo, NANOCODE.commit, NANOCODE.dir);
     return NANOCODE.commit.slice(0, 7);
   },
-  setup: ({ model, prompt }) => ({
+  setup: ({ model, prompt, settings }) => ({
     command: 'python3',
     args: [join(CONFIGS, 'nanocode', 'driver.py')],
-    env: { NANOCODE: join(NANOCODE.dir, 'nanocode.py'), BENCH_MODEL: model.id, BENCH_PROMPT: prompt },
+    env: {
+      NANOCODE: join(NANOCODE.dir, 'nanocode.py'),
+      BENCH_MODEL: model.id,
+      BENCH_PROMPT: prompt,
+      ...(settings.nanocodeMaxTokens ? { BENCH_MAX_TOKENS: String(settings.nanocodeMaxTokens) } : {}),
+    },
   }),
+  notes: ({ nanocodeMaxTokens }) => [
+    nanocodeMaxTokens ? `max_tokens ${nanocodeMaxTokens} (the model's output limit) in place of its 8192` : 'max_tokens 8192, as shipped',
+  ],
 };
 
 export const HARNESSES: Harness[] = [
   featherloop,
-  opencode('opencode-stock', 'opencode with only the provider configured (and title generation off); config: harnesses/opencode-stock'),
-  opencode('opencode-custom', "opencode with the user's agents for smaller models; config: harnesses/opencode-custom"),
+  opencode('opencode-stock', 'opencode with only the provider configured; config: harnesses/opencode-stock', [
+    'title agent off (it takes a server slot per run)',
+  ]),
+  opencode('opencode-custom', "opencode with the user's agents for smaller models; config: harnesses/opencode-custom", [
+    'title agent off (it takes a server slot per run)',
+    'websearch off (it needs a key; the cases are offline)',
+  ]),
   nanocode,
 ];
 

@@ -5,7 +5,7 @@ import { delimiter, join } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
-import { HARNESSES, MODELS, type Harness, type HarnessContext } from './harnesses.ts';
+import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
 import { MeteringProxy } from './proxy.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
@@ -44,6 +44,8 @@ const rerun = argv.rerunApiErrors === undefined ? undefined : rerunTargets(argv.
 const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
 const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? (rerun ? rerun.meta.upstream : model.upstream);
 const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
+// Reruns as the run they replace; results from before settings ran nanocode as shipped.
+const settings: Settings = rerun ? (rerun.meta.settings ?? {}) : { nanocodeMaxTokens: model.limit.output };
 const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
 const harnesses = HARNESSES.filter(
   (harness) => (!argv.harness?.length || argv.harness.includes(harness.name)) && (!rerun || rerun.harnesses.has(harness.name)),
@@ -75,6 +77,7 @@ writeFileSync(
               why: 'API errors',
               runs: [...rerun.keys],
               harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name] }])),
+              settings,
               server,
             },
           ],
@@ -84,7 +87,10 @@ writeFileSync(
       model: model.id,
       upstream,
       server,
-      harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description }])),
+      harnesses: Object.fromEntries(
+        harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description, notes: harness.notes(settings) }]),
+      ),
+      settings,
       cases: cases.map((c) => c.id),
       reps: argv.reps,
       jobs: argv.jobs,
@@ -163,7 +169,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   prepareWorkspace(c, workspace, toolchains.tools);
 
   const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'));
-  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model };
+  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model, settings };
   const invocation = harness.setup(ctx);
   const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
   const started = new Date();
@@ -199,8 +205,8 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   }
   // The output limit apart: opencode recomputes it for every request.
   const limits = records.flatMap((record) => [record.params.max_tokens, record.params.max_completion_tokens]).filter((value) => typeof value === 'number');
-  const settings = records.map(({ params: { max_tokens, max_completion_tokens, ...rest } }) => JSON.stringify(rest));
-  const params = [...new Set(settings)].map((text) => JSON.parse(text) as Record<string, unknown>);
+  const sampling = records.map(({ params: { max_tokens, max_completion_tokens, ...rest } }) => JSON.stringify(rest));
+  const params = [...new Set(sampling)].map((text) => JSON.parse(text) as Record<string, unknown>);
   const run_: RunResult = {
     harness: harness.name,
     case: c.id,

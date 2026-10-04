@@ -57,7 +57,14 @@ Two benches on one server share its slots.
 nanocode is an interactive REPL against a hard-coded Anthropic endpoint. The driver
 imports it as it is and patches its endpoint (llama.cpp serves the Messages API too),
 its `input()` (the task, then end of input) and `os.get_terminal_size`, which it calls
-even with no terminal. It sends `max_tokens: 8192`, as shipped.
+even with no terminal. nanocode asks for at most 8192 output tokens; the bench asks for
+the model's output limit instead, as the other harnesses' configs do. It's a request
+field the server stops at, which the model never sees: a larger model that reasons
+past 8192 tokens would otherwise end its run with a reply of nothing but thinking.
+
+Each departure from a harness's own behaviour (this limit, opencode's title agent,
+websearch, featherloop's flags) is listed in the report, and recorded in `meta.json`,
+so reruns match the run they replace.
 
 ## Isolation
 
@@ -135,7 +142,8 @@ is 15 minutes, and showed up as 504s). Only the transport changes.
   failures show as failed runs.
 - The output limit decides how a reasoning loop ends. featherloop and opencode allow
   262k output tokens (the user's configs), so a model that keeps reconsidering can
-  generate until the timeout; nanocode stops at 8192. A request cut off by the timeout
+  generate until the timeout (as can nanocode, given the same limit; results from before
+  that ran it at its own 8192). A request cut off by the timeout
   never reports its tokens: the report counts its streamed chunks instead, as a lower
   bound (llama.cpp sends some tokens together), outside the token totals.
 - Match `-j` to the server's slots: with one slot, requests queue and parallel runs only
