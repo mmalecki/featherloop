@@ -85,7 +85,7 @@ export function ShellTool(options?: ToolOptions<ShellParams>): Tool {
     async invoke({ command, bg, cwd, timeoutMs, bgTimeoutMs, maxLength, repeatWindow, shell }, { signal, background }) {
       if (bg) {
         if (!background) throw new ToolInputError('bg needs an agent loop to report back to');
-        const check = (file: string, result: GroupResult) => repeats.check(file, result, repeatWindow);
+        const check = (file: string, size: number, result: GroupResult) => repeats.check(file, size, result, repeatWindow);
         return startBackground(command, { cwd: cwd ?? process.cwd(), timeoutMs: bgTimeoutMs, shell, signal }, maxLength, check, background);
       }
       // stdout and stderr both go to this file, so the kernel keeps their writes in
@@ -110,7 +110,7 @@ export function ShellTool(options?: ToolOptions<ShellParams>): Tool {
           if (text) out.push(text);
         }
         out.push(statusOf(result));
-        const repeat = await repeats.check(file, result, repeatWindow);
+        const repeat = await repeats.check(file, size, result, repeatWindow);
         if (repeat) out.push(repeat);
         if (result.lingering) {
           keep = true;
@@ -134,7 +134,7 @@ async function startBackground(
   command: string,
   options: RunOptions,
   maxLength: number,
-  check: (file: string, result: GroupResult) => Promise<string | undefined>,
+  check: (file: string, size: number, result: GroupResult) => Promise<string | undefined>,
   background: (work: Promise<string>) => void,
 ): Promise<string> {
   const file = join(tmpdir(), `featherloop-shell-${randomUUID()}.log`);
@@ -157,7 +157,7 @@ async function startBackground(
         const { code, lingering } = result;
         const after = `after ${Math.round((Date.now() - started) / 1000)}s ${statusOf(result)}`;
         const { size } = await handle.stat();
-        const repeat = await check(file, result);
+        const repeat = await check(file, size, result);
         const still = (repeat ? `\n${repeat}` : '') + (lingering ? `\n[Processes it started are still running; their output goes to ${file}]` : '');
         if (size === 0 && !lingering) {
           await rm(file, { force: true });
@@ -221,13 +221,13 @@ class Repeats {
   #runs: string[] = [];
 
   /** Records a run, and returns a note if one of the last `window` runs had the same output. */
-  async check(file: string, result: GroupResult, window: number): Promise<string | undefined> {
+  async check(file: string, size: number, result: GroupResult, window: number): Promise<string | undefined> {
     if (window === 0) return undefined;
     // Timed out and killed alike: no "after 120s", which differs between bg and not.
     const ended = result.stopped ? 'stopped' : statusOf(result);
     let fingerprinted: { hash: string; empty: boolean };
     try {
-      fingerprinted = await fingerprint(file, ended);
+      fingerprinted = await fingerprint(file, size, ended);
     } catch {
       // Only a note: a missed one costs little, but the command's result must still get through.
       return undefined;
@@ -246,12 +246,16 @@ class Repeats {
 /**
  * Hashes a run's whole output, from its file, with what changes between identical
  * runs normalised away. Line by line, so long output never has to fit in memory.
+ * Only its first `size` bytes, what the result was made from: processes the command
+ * left running may still be writing to it.
  */
-async function fingerprint(file: string, ended: string): Promise<{ hash: string; empty: boolean }> {
+async function fingerprint(file: string, size: number, ended: string): Promise<{ hash: string; empty: boolean }> {
   const hash = createHash('sha256').update(`${ended}\n`);
   let empty = true;
   let blank = 0;
-  for await (const raw of createInterface({ input: createReadStream(file), crlfDelay: Infinity })) {
+  // `end` is inclusive, and there's no stream to read for an empty file.
+  const lines = size > 0 ? createInterface({ input: createReadStream(file, { end: size - 1 }), crlfDelay: Infinity }) : [];
+  for await (const raw of lines) {
     const line = normalise(raw);
     // Blank lines count only once something follows them: trailing ones are dropped.
     if (!line) {
