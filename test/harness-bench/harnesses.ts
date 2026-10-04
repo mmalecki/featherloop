@@ -198,7 +198,10 @@ const claudeCode: Harness = {
       DISABLE_AUTOUPDATER: '1',
     },
   }),
-  notes: () => ['headless (-p), --dangerously-skip-permissions; its background model set to the model under test; telemetry and updates off'],
+  notes: () => [
+    'headless (-p), --dangerously-skip-permissions; its background model set to the model under test; telemetry and updates off; ' +
+      'on llama.cpp, its mid-conversation system messages are folded into the user turn before them (the chat template takes one, first)',
+  ],
 };
 
 export const HARNESSES: Harness[] = [

@@ -93,6 +93,11 @@ Results say how often the model asked (`advisor.calls`), from which request, and
 advice cost, which counts towards `--max-cost`; `bench:analyze` compares the runs that asked
 with those that didn't. Run featherloop beside it for the same cases with and without.
 
+On llama.cpp, the proxy folds a system message that comes mid-conversation into the
+user turn before it (and marks the request): llama.cpp's chat templates, Qwen's among
+them, take one system message, first, and Claude Code sends one after the first user
+message. Nothing else changes; harnesses that don't send them are untouched.
+
 Claude Code talks to the run's proxy (`ANTHROPIC_BASE_URL`, a dummy key the proxy
 replaces), with its background model set to the model under test, and telemetry,
 nonessential traffic and updates off. It runs only on `anthropic` models, so a run

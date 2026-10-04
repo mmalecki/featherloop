@@ -145,6 +145,8 @@ const apiKey = keyFor(model);
 const proxy = await MeteringProxy.start(upstream, {
   ...(settings.thinking === false ? { thinking: false } : {}),
   ...(apiKey ? { apiKey } : {}),
+  // llama.cpp's chat templates take one system message, first.
+  ...(model.flavor === 'openai' ? { foldSystemMessages: true } : {}),
 });
 // The advisor's own proxy: its calls are metered apart from the model's.
 const advisorKey = advisorModel && keyFor(advisorModel);

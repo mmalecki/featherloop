@@ -33,6 +33,12 @@ export interface ProxyOptions {
    * sends: keys stay with the bench, never in a harness's environment or config.
    */
   apiKey?: string;
+  /**
+   * Fold system messages that come mid-conversation into the user turn before
+   * them. For llama.cpp, whose chat templates (Qwen's among them) refuse a system
+   * message anywhere but first; Claude Code sends one after the first user message.
+   */
+  foldSystemMessages?: boolean;
 }
 
 /** Token counts for one request. `prompt` is all of it, cached or not: the context the model saw. */
@@ -194,6 +200,13 @@ export class MeteringProxy {
       forced.chat_template_kwargs = { ...(json.chat_template_kwargs as Json | undefined), enable_thinking: false };
       record.overrides = ['enable_thinking=false'];
     }
+    if (this.options.foldSystemMessages && record.dialect !== 'other' && Array.isArray(json?.messages)) {
+      const folded = foldSystem(json.messages as Json[], record.dialect);
+      if (folded) {
+        forced.messages = folded;
+        record.overrides = [...(record.overrides ?? []), 'system-message-folded'];
+      }
+    }
     const sent =
       record.restreamed || record.overrides
         ? Buffer.from(
@@ -316,6 +329,28 @@ function describeRequest(seq: number, path: string, body: Buffer): { record: Req
     unparsedToolCall: false,
   };
   return { record, offered, json };
+}
+
+/**
+ * Messages with any system message past the first folded into the user turn
+ * before it (or made a user turn, with none before it); undefined when there's
+ * nothing to fold. OpenAI requests keep a leading system message where it is.
+ */
+function foldSystem(messages: Json[], dialect: 'openai' | 'anthropic'): Json[] | undefined {
+  const blocks = (content: unknown): Json[] => (typeof content === 'string' ? [{ type: 'text', text: content }] : ((content as Json[]) ?? []));
+  const out: Json[] = [];
+  let changed = false;
+  messages.forEach((message, i) => {
+    if (message.role !== 'system' || (dialect === 'openai' && i === 0)) return void out.push(message);
+    changed = true;
+    const previous = out.at(-1);
+    if (previous?.role === 'user') {
+      out[out.length - 1] = { ...previous, content: [...blocks(previous.content), ...blocks(message.content)] };
+    } else {
+      out.push({ role: 'user', content: blocks(message.content) });
+    }
+  });
+  return changed ? out : undefined;
 }
 
 function tryParse(text: Buffer | string): unknown {
