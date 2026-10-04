@@ -1,7 +1,7 @@
 # The bench's copy of ~/.config/featherloop/config.yaml, on one provider, the
 # bench's metering proxy (BENCH_BASE_URL). The bench adds the model under test,
-# from models.json, as the user's config has it. No advisor: every harness runs
-# the same model alone.
+# from models.json, as the user's config has it, and featherloop-advisor an
+# `advisor` provider and alias for the --advisor model.
 provider:
   bench:
     flavor: openai
