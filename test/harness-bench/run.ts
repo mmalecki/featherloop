@@ -1,14 +1,17 @@
+import { execFile } from 'node:child_process';
+import { once } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { tmpdir } from 'node:os';
-import { delimiter, join } from 'node:path';
+import { basename, delimiter, join } from 'node:path';
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { caseName, changes, ensureToolchains, grade, killGroup, linkToolchains, loadCases, SETS, POLYGLOT, prepareWorkspace, run, toolchainVersions, type Case } from './cases.ts';
 import { HARNESSES, MODELS, type Harness, type HarnessContext, type Settings } from './harnesses.ts';
 import { hardcodedAnswers } from './guards.ts';
-import { infrastructureError, MeteringProxy, type RequestRecord } from './proxy.ts';
+import { ServerPool, WorkQueue, type Attempt, type Health, type Server } from './pool.ts';
+import { infrastructureError, MeteringProxy, SERVER_LOST, type RequestRecord } from './proxy.ts';
 import { readTranscript, webFetches } from './transcript.ts';
 import { summarize, toolCategory, type RunResult } from './report.ts';
 
@@ -22,7 +25,11 @@ const argv = await yargs(hideBin(process.argv))
     choices: HARNESSES.map((harness) => harness.name),
     describe: 'Harnesses to run (default: all)',
   })
-  .option('jobs', { alias: 'j', type: 'number', default: 1, describe: 'Runs at once; the server has its own slot count, beyond which requests queue' })
+  .option('jobs', {
+    alias: 'j',
+    type: 'number',
+    describe: "Runs at once on each server (default: its slots, from llama.cpp's /props; 1 on a hosted API)",
+  })
   .option('reps', { alias: 'r', type: 'number', default: 1, describe: 'Runs of each harness on each case' })
   .option('timeout', { type: 'number', default: 20, describe: 'Minutes a run may take before its harness is killed' })
   .option('model', { alias: 'm', type: 'string', choices: Object.keys(MODELS), default: 'qwen3.5-9b', describe: 'Model under test, from models.json' })
@@ -30,6 +37,13 @@ const argv = await yargs(hideBin(process.argv))
     type: 'string',
     describe: "The model server, with /v1 (env BENCH_UPSTREAM; default: the model's upstream in models.json)",
   })
+  .option('servers-cmd', {
+    type: 'string',
+    conflicts: 'base-url',
+    describe:
+      'A shell command that prints model servers, a base URL with /v1 a line (e.g. test/harness-bench/servers/gce-mig.sh): run again every --servers-every seconds, servers join and leave as its output changes',
+  })
+  .option('servers-every', { type: 'number', default: 60, describe: 'Seconds between runs of --servers-cmd' })
   .option('out', { type: 'string', describe: 'Results directory (default: results/<timestamp>)' })
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
@@ -64,10 +78,20 @@ const argv = await yargs(hideBin(process.argv))
   .strictOptions()
   .parseAsync();
 
+/** Attempts at a run whose server failed it, the first included: its last result stands. */
+const ATTEMPTS = 3;
+/** How often the pool checks its servers' health, and how long a check may take: two failed in a row and a server is out. */
+const HEALTH_EVERY_MS = 10_000;
+const PROBE_TIMEOUT_MS = 10_000;
+
 const rerun = argv.rerunApiErrors === undefined ? undefined : rerunTargets(argv.rerunApiErrors);
 // Results from before models.json are all on the default model.
 const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
-const upstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM ?? (rerun ? rerun.meta.upstream : model.upstream);
+// One server, or a command that lists them; a rerun's, unless told otherwise.
+const explicitUpstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM;
+const serversCmd: string | undefined = argv.serversCmd ?? (explicitUpstream === undefined ? rerun?.meta.serversCmd : undefined);
+const upstream: string | undefined = serversCmd === undefined ? (explicitUpstream ?? (rerun ? rerun.meta.upstream : model.upstream)) : undefined;
+if (serversCmd !== undefined && model.flavor !== 'openai') throw new Error(`--servers-cmd lists llama.cpp servers; ${model.id} speaks ${model.flavor}`);
 const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
 // Reruns as the run they replace; results from before settings ran nanocode as shipped.
 const settings: Settings = rerun
@@ -106,46 +130,6 @@ const out = rerun?.dir ?? argv.out ?? join(import.meta.dirname, 'results', new D
 mkdirSync(join(out, 'prompts'), { recursive: true });
 for (const c of cases) writeFileSync(join(out, 'prompts', `${caseName(c)}.md`), `${c.prompt}\n`);
 
-const server = await serverInfo(upstream);
-const started = new Date().toISOString();
-writeFileSync(
-  join(out, 'meta.json'),
-  `${JSON.stringify(
-    rerun
-      ? {
-          ...rerun.meta,
-          reruns: [
-            ...(rerun.meta.reruns ?? []),
-            {
-              started,
-              why: 'API errors',
-              runs: [...rerun.keys],
-              harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name] }])),
-              settings,
-              server,
-            },
-          ],
-        }
-      : {
-      started,
-      model: model.id,
-      upstream,
-      server,
-      harnesses: Object.fromEntries(
-        harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description, notes: harness.notes(settings) }]),
-      ),
-      settings,
-      cases: cases.map((c) => c.id),
-      reps: argv.reps,
-      jobs: argv.jobs,
-      timeoutMinutes: timeout,
-      toolchains: toolchainVersions(),
-    },
-    null,
-    2,
-  )}\n`,
-);
-
 if (settings.thinking === false && model.flavor !== 'openai') {
   throw new Error(`--no-thinking sets llama.cpp's chat template; ${model.id} speaks ${model.flavor}`);
 }
@@ -159,17 +143,6 @@ const keyFor = (m: typeof model) => {
   return process.env.ANTHROPIC_API_KEY;
 };
 const apiKey = keyFor(model);
-const proxy = await MeteringProxy.start(upstream, {
-  ...(settings.thinking === false ? { thinking: false } : {}),
-  ...(apiKey ? { apiKey } : {}),
-  // llama.cpp's chat templates take one system message, first.
-  ...(model.flavor === 'openai' ? { foldSystemMessages: true } : {}),
-  ...(settings.reasoningBudget !== undefined ? { reasoningBudget: settings.reasoningBudget } : {}),
-});
-// The advisor's own proxy: its calls are metered apart from the model's.
-const advisorKey = advisorModel && keyFor(advisorModel);
-const advisorProxy = advisorModel && (await MeteringProxy.start(advisorModel.upstream, advisorKey ? { apiKey: advisorKey } : {}));
-let spent = 0;
 
 interface Job {
   harness: Harness;
@@ -177,7 +150,7 @@ interface Job {
   rep: number;
 }
 
-// Case-major, harness-minor: at -j matching the harness count, each case's runs share the server at once.
+// Case-major, harness-minor: with as many slots as harnesses, each case's runs share a server at once.
 const jobs: Job[] = [];
 if (rerun) {
   for (const key of rerun.keys) {
@@ -192,40 +165,132 @@ if (rerun) {
 
 const live = new Set<number>();
 let interrupted = false;
+let queue: WorkQueue<Job> | undefined;
 process.on('SIGINT', () => {
-  if (interrupted) process.exit(130);
+  // Nothing runs before the queue does.
+  if (interrupted || !queue) process.exit(130);
   interrupted = true;
   console.error('\nInterrupted: stopping runs in flight; Ctrl-C again to quit now');
   for (const pid of live) killGroup(pid);
+  queue.pump();
 });
 
+// The servers: llama.cpp's join once healthy and on the reference model and build, a rerun's
+// those of the run it reruns; a hosted API is taken as it is.
+const hosted = model.flavor !== 'openai';
+const pool = new ServerPool({
+  list: serversCmd === undefined ? async () => [upstream!] : () => listServers(serversCmd),
+  listEvery: serversCmd === undefined ? Infinity : argv.serversEvery * 1000,
+  probe: hosted ? async () => ({ ok: true }) : probe,
+  checkEvery: hosted ? Infinity : HEALTH_EVERY_MS,
+  ...(argv.jobs !== undefined ? { jobs: argv.jobs } : hosted ? { jobs: 1 } : {}),
+  ...(rerun?.meta.server?.modelPath ? { reference: { model: basename(rerun.meta.server.modelPath), build: rerun.meta.server.build ?? null } } : {}),
+  log: (line) => console.error(line),
+});
+await pool.start();
+if (!pool.up().length) {
+  console.error(`Waiting for a server${serversCmd === undefined ? '' : ` from ${serversCmd}`}`);
+  await once(pool, 'join');
+}
+const first = pool.up()[0]!;
+
+const started = new Date().toISOString();
+// What this bench (or rerun) ran on: the first server's model and build, which the others match; each server as it joined; the runs requeued.
+const record: Record<string, any> = {
+  started,
+  ...(serversCmd === undefined ? { upstream } : { serversCmd }),
+  server: await serverInfo(first.url),
+  servers: [] as { url: string; joined: string; slots: number }[],
+  requeues: [] as { run: string; attempt: number; server: string; why: string; at: string }[],
+};
+const meta = rerun
+  ? { ...rerun.meta, reruns: [...(rerun.meta.reruns ?? []), record] }
+  : Object.assign(record, {
+      model: model.id,
+      harnesses: Object.fromEntries(
+        harnesses.map((harness) => [harness.name, { version: versions[harness.name], description: harness.description, notes: harness.notes(settings) }]),
+      ),
+      settings,
+      cases: cases.map((c) => c.id),
+      reps: argv.reps,
+      // A cap per server; none means each server's slots.
+      jobs: argv.jobs ?? null,
+      timeoutMinutes: timeout,
+      toolchains: toolchainVersions(),
+    });
+if (rerun) {
+  Object.assign(record, {
+    why: 'API errors',
+    runs: [...rerun.keys],
+    harnesses: Object.fromEntries(harnesses.map((harness) => [harness.name, { version: versions[harness.name] }])),
+    settings,
+    jobs: argv.jobs ?? null,
+  });
+}
+// The record is meta, or its latest rerun: write meta again as it changes.
+const saveMeta = () => writeFileSync(join(out, 'meta.json'), `${JSON.stringify(meta, null, 2)}\n`);
+const joined = (server: Server) => {
+  if (record.servers.some((known: { url: string }) => known.url === server.url)) return;
+  record.servers.push({ url: server.url, joined: new Date().toISOString(), slots: server.slots });
+  saveMeta();
+};
+for (const server of pool.up()) joined(server);
+pool.on('join', joined);
+saveMeta();
+
+// Every run names its server; this one is only the default.
+const proxy = await MeteringProxy.start(first.url, {
+  ...(settings.thinking === false ? { thinking: false } : {}),
+  ...(apiKey ? { apiKey } : {}),
+  // llama.cpp's chat templates take one system message, first.
+  ...(model.flavor === 'openai' ? { foldSystemMessages: true } : {}),
+  ...(settings.reasoningBudget !== undefined ? { reasoningBudget: settings.reasoningBudget } : {}),
+});
+// The advisor's own proxy: its calls are metered apart from the model's.
+const advisorKey = advisorModel && keyFor(advisorModel);
+const advisorProxy = advisorModel && (await MeteringProxy.start(advisorModel.upstream, advisorKey ? { apiKey: advisorKey } : {}));
+let spent = 0;
+
+const perServer = argv.jobs === undefined ? (hosted ? '1 at a time' : 'as many at a time as each server has slots') : `up to ${argv.jobs} at a time per server`;
 console.error(
   rerun
-    ? `Running ${jobs.length} runs that hit infrastructure errors or never ran, ${argv.jobs} at a time → ${out}`
-    : `${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${argv.jobs} at a time → ${out}`,
+    ? `Running ${jobs.length} runs that hit infrastructure errors or never ran, ${perServer} → ${out}`
+    : `${jobs.length} runs (${harnesses.length} harnesses × ${cases.length} cases × ${argv.reps}), ${perServer} → ${out}`,
 );
 let done = 0;
-const queue = [...jobs];
-await Promise.all(
-  Array.from({ length: Math.max(1, Math.min(argv.jobs, jobs.length)) }, async () => {
-    for (let job = queue.shift(); job && !interrupted && !overBudget(); job = queue.shift()) {
-      const result = await runJob(job);
-      if (!result) continue;
-      appendFileSync(join(out, 'results.jsonl'), `${JSON.stringify(result)}\n`);
-      spent += result.costUsd ?? 0;
-      console.error(`[${++done}/${jobs.length}] ${progress(result)}`);
-    }
-  }),
-);
+queue = new WorkQueue(pool, jobs, {
+  attempts: ATTEMPTS,
+  run: runJob,
+  canStart: () => !interrupted && !overBudget(),
+  requeued: ({ job, attempt, server }, why) => {
+    const id = `${job.harness.name}|${job.c.id}|${job.rep}`;
+    record.requeues.push({ run: id, attempt, server: server.url, why, at: new Date().toISOString() });
+    saveMeta();
+    console.error(`requeued ${job.harness.name} ${job.c.id} r${job.rep} after attempt ${attempt} on ${server.url}: ${why}`);
+  },
+  log: (line) => console.error(line),
+});
+queue.pump();
+const { left } = await queue.done;
+pool.stop();
 await proxy.stop();
 await advisorProxy?.stop();
+if (interrupted) console.error(`Interrupted, ${left} runs not started: --rerun-api-errors ${out} runs what's missing`);
+else if (left) console.error(`Stopped, ${left} runs not started`);
+// The servers can go: nothing left to run.
+else console.error(`queue drained: ${done} of ${jobs.length} runs done, none in flight`);
 console.log(summarize(out));
 
-async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> {
+/**
+ * Runs a harness on a case, on a server, and records the result; or, when the
+ * infrastructure failed it (errors from the server, or the server lost from the
+ * pool) and it isn't the last attempt, says why it should run again, ungraded and unrecorded.
+ */
+async function runJob({ job: { harness, c, rep }, attempt, final, server, signal }: Attempt<Job>): Promise<string | undefined> {
   const id = `${harness.name}.${caseName(c)}.r${rep}`;
   const dir = join(out, 'runs', harness.name, `${caseName(c)}-r${rep}`);
-  // Kept beside, to see what went wrong.
-  if (rerun && existsSync(dir)) renameSync(dir, uniquePath(`${dir}.replaced`));
+  // An earlier attempt, or the run a rerun replaces: kept beside, to see what went wrong.
+  if (existsSync(dir)) renameSync(dir, uniquePath(`${dir}.replaced`));
   mkdirSync(dir, { recursive: true });
   // Neutral: the model sees this path, and it shouldn't name a harness.
   const tmp = mkdtempSync(join(tmpdir(), 'bench-'));
@@ -237,7 +302,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   const toolchains = linkToolchains(tmp);
   prepareWorkspace(c, workspace, toolchains.tools);
 
-  const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'));
+  const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'), server.url);
   const advisorMeter = advisorProxy?.open(`${id}.advisor`, join(dir, 'advisor-requests.jsonl'), join(dir, 'advisor-transcript.json'));
   const ctx: HarnessContext = {
     home,
@@ -255,22 +320,32 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   // A budget of output, checked as it streams: past it, the run ends as at the timeout.
   let overBudget = false;
   let budgetCheck: NodeJS.Timeout | undefined;
+  // Its server left the pool: end the run, its requests in flight marked as the infrastructure's failure.
+  let pid: number | undefined;
+  const lose = () => {
+    proxy.close(id, SERVER_LOST);
+    killGroup(pid);
+  };
+  signal.addEventListener('abort', lose, { once: true });
   const result = await run(invocation.command, invocation.args, {
     cwd: workspace,
     env,
     timeoutMs: timeout * 60_000,
     log: { stdout: join(dir, 'stdout.log'), stderr: join(dir, 'stderr.log') },
-    onSpawn: (pid) => {
-      live.add(pid);
+    onSpawn: (spawned) => {
+      pid = spawned;
+      live.add(spawned);
+      if (signal.aborted) lose();
       if (settings.maxOutput === undefined) return;
       budgetCheck = setInterval(() => {
         if (meter.generated() < settings.maxOutput!) return;
         overBudget = true;
         clearInterval(budgetCheck);
-        killGroup(pid);
+        killGroup(spawned);
       }, 1000);
     },
   });
+  signal.removeEventListener('abort', lose);
   clearInterval(budgetCheck);
   if (result.pid !== undefined) live.delete(result.pid);
   proxy.close(id);
@@ -278,6 +353,15 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   if (interrupted) {
     rmSync(tmp, { recursive: true, force: true });
     return undefined;
+  }
+  const failed = meter.records.find(infrastructureError);
+  const again = signal.aborted ? `${SERVER_LOST} (${server.why ?? 'failed its health checks'})` : failed ? `infrastructure error: ${failed.error ?? `HTTP ${failed.status}`}` : undefined;
+  if (again !== undefined && !final) {
+    rmSync(tmp, { recursive: true, force: true });
+    // What it cost counts all the same.
+    if (model.pricing) spent += cost(meter.records, model.pricing);
+    writeFileSync(join(dir, 'requeued.json'), `${JSON.stringify({ attempt, server: server.url, why: again }, null, 2)}\n`);
+    return again;
   }
 
   const changed = changes(c, workspace);
@@ -366,10 +450,15 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
       : {}),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
+    server: server.url,
+    ...(attempt > 1 ? { attempt } : {}),
     ...(rerun ? { rerun: true } : {}),
   };
   writeFileSync(join(dir, 'result.json'), `${JSON.stringify(run_, null, 2)}\n`);
-  return run_;
+  appendFileSync(join(out, 'results.jsonl'), `${JSON.stringify(run_)}\n`);
+  spent += run_.costUsd ?? 0;
+  console.error(`[${++done}/${jobs.length}] ${progress(run_)}`);
+  return undefined;
 }
 
 /**
@@ -483,12 +572,13 @@ function uniquePath(path: string): string {
 function progress(result: RunResult): string {
   const tokens = result.tokens.prompt + result.tokens.completion;
   return [
-    `${result.harness} ${result.case} r${result.rep}: ${result.status}`,
+    `${result.harness} ${result.case} r${result.rep}${result.attempt ? ` (attempt ${result.attempt})` : ''}: ${result.status}`,
     `${result.tests.passed}/${result.tests.total} tests`,
     `${(result.wallMs / 1000).toFixed(0)}s`,
     `${result.requests} req`,
     `${(tokens / 1000).toFixed(1)}k tok`,
     `${result.toolCalls} tool calls`,
+    ...(result.server ? [`on ${new URL(result.server).host}`] : []),
     ...(result.sawCache ? ['REACHED THE BENCH CACHE'] : []),
   ].join(', ');
 }
@@ -521,20 +611,62 @@ async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
   };
 }
 
-function getJson(url: string, headers: Record<string, string> = {}): Promise<unknown> {
+/** Runs `--servers-cmd`: its output's lines are the servers. Fails, and the pool keeps its last list, if the command does. */
+function listServers(command: string): Promise<string[]> {
+  return new Promise((resolve, reject) => {
+    // The bench's own environment: the command may need credentials harnesses never get.
+    execFile('sh', ['-c', command], { timeout: 120_000, maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(`${command}: ${stderr.trim() || err.message}`));
+      else resolve(stdout.split('\n'));
+    });
+  });
+}
+
+/**
+ * A llama.cpp server's health: `/health` answers 200 once the model is loaded (503
+ * while loading), and `/props` says what it serves and how many slots it has. A
+ * preempted VM may not answer at all, hence the timeout.
+ */
+async function probe(url: string): Promise<Health> {
+  const root = url.replace(/\/v1\/?$/, '');
+  const health = await get(`${root}/health`, {}, PROBE_TIMEOUT_MS);
+  if (health.status !== 200) return { ok: false, why: `/health: ${health.error ?? `HTTP ${health.status}`}` };
+  const props = await get(`${root}/props`, {}, PROBE_TIMEOUT_MS);
+  const json = props.status === 200 ? (tryParse(props.body) as Record<string, any> | undefined) : undefined;
+  if (!json) return { ok: false, why: `/props: ${props.error ?? `HTTP ${props.status}`}` };
+  return { ok: true, props: { modelPath: json.model_path, build: json.build_info, slots: json.total_slots } };
+}
+
+async function getJson(url: string, headers: Record<string, string> = {}): Promise<unknown> {
+  const res = await get(url, headers, 30_000);
+  return res.status === 200 ? tryParse(res.body) : undefined;
+}
+
+/** A GET, whole: its status and body, or why there's none (status 0), within `timeoutMs`. */
+function get(url: string, headers: Record<string, string>, timeoutMs: number): Promise<{ status: number; body: string; error?: string }> {
   return new Promise((resolve) => {
     const req = (url.startsWith('https:') ? https : http).get(url, { headers }, (res) => {
       let body = '';
       res.on('data', (chunk: Buffer) => (body += chunk));
       res.on('end', () => {
-        try {
-          resolve(res.statusCode === 200 ? JSON.parse(body) : undefined);
-        } catch {
-          resolve(undefined);
-        }
+        clearTimeout(timer);
+        resolve({ status: res.statusCode ?? 0, body });
       });
+      res.on('error', (err) => req.destroy(err));
     });
-    req.setTimeout(30_000, () => req.destroy());
-    req.on('error', () => resolve(undefined));
+    // Connecting included: a VM that's gone may never answer.
+    const timer = setTimeout(() => req.destroy(new Error(`no answer in ${timeoutMs / 1000}s`)), timeoutMs);
+    req.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ status: 0, body: '', error: err.message });
+    });
   });
+}
+
+function tryParse(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
 }
