@@ -56,7 +56,7 @@ export interface PoolOptions {
   failures?: number;
   /** A cap on each server's runs at once (`-j`). */
   jobs?: number;
-  /** What servers must match; by default, whatever the first to join serves. */
+  /** What servers must match; by default, what most of the first healthy ones serve. */
   reference?: Reference;
   log: (line: string) => void;
 }
@@ -69,6 +69,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
   #timers: NodeJS.Timeout[] = [];
   #checking = false;
   #listing = false;
+  #suspects = new Set<Server>();
 
   constructor(options: PoolOptions) {
     super();
@@ -121,7 +122,7 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
         this.#options.log(`server ${server.url}: no longer listed${server.busy ? `, finishing its ${server.busy} runs` : ''}`);
         this.release(server);
       }
-      await Promise.all(fresh.map((server) => this.#check(server)));
+      await this.#round(fresh);
       this.emit('change');
     } finally {
       this.#listing = false;
@@ -133,22 +134,43 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     if (this.#checking) return;
     this.#checking = true;
     try {
-      await Promise.all([...this.servers.values()].map((server) => this.#check(server)));
+      await this.#round([...this.servers.values()]);
       this.emit('change');
     } finally {
       this.#checking = false;
     }
   }
 
-  /** The up server with the most free slots, if any has one; of those, the least busy. */
-  free(): Server | undefined {
+  /**
+   * The up server with the most free slots, if any has one; of those, the least busy.
+   * Not `avoid` (where a run last failed), unless no other has a free slot; none being checked after a run failed on it.
+   */
+  free(avoid?: Server): Server | undefined {
     let best: Server | undefined;
     for (const server of this.servers.values()) {
-      if (server.state !== 'up' || !server.listed || server.busy >= server.slots) continue;
+      if (server.state !== 'up' || !server.listed || server.busy >= server.slots || this.#suspects.has(server)) continue;
+      if (best && (best === avoid) !== (server === avoid)) {
+        if (server !== avoid) best = server;
+        continue;
+      }
       const free = server.slots - server.busy;
       if (!best || free > best.slots - best.busy || (free === best.slots - best.busy && server.busy < best.busy)) best = server;
     }
     return best;
+  }
+
+  /**
+   * A run on the server just hit infrastructure errors: checks it now, and if it
+   * fails, it's out at once rather than after the usual run of checks, so it can't
+   * fail one run after another (a server that's gone refuses connections in no time).
+   */
+  async suspect(server: Server): Promise<void> {
+    if (server.state !== 'up' || this.#suspects.has(server)) return;
+    this.#suspects.add(server);
+    const health = await this.#options.probe(server.url).catch((err: unknown): Health => ({ ok: false, why: (err as Error).message }));
+    this.#suspects.delete(server);
+    if (server.state === 'up') this.#take(server, health, true);
+    this.emit('change');
   }
 
   /** Servers up and listed: those that take runs. */
@@ -161,23 +183,46 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     if (!server.listed && server.busy === 0 && this.servers.get(server.url) === server) this.servers.delete(server.url);
   }
 
-  async #check(server: Server): Promise<void> {
-    let health: Health;
-    try {
-      health = await this.#options.probe(server.url);
-    } catch (err) {
-      health = { ok: false, why: (err as Error).message };
+  /**
+   * Checks servers at once, then takes what they said in list order. With no
+   * reference yet, the one most of the healthy serve is it (the first listed's, on a
+   * tie), not whichever answered first: one odd server can't set it for the rest.
+   */
+  async #round(servers: Server[]): Promise<void> {
+    const healths = await Promise.all(
+      servers.map((server) =>
+        this.#options.probe(server.url).catch((err: unknown): Health => ({ ok: false, why: (err as Error).message })),
+      ),
+    );
+    if (!this.reference) {
+      const votes = new Map<string, { reference: Reference; count: number }>();
+      for (const health of healths) {
+        if (!health.ok) continue;
+        const found = reference(health);
+        const key = JSON.stringify(found);
+        votes.set(key, { reference: found, count: (votes.get(key)?.count ?? 0) + 1 });
+      }
+      // Insertion order: the first listed wins a tie.
+      let best: { reference: Reference; count: number } | undefined;
+      for (const vote of votes.values()) if (!best || vote.count > best.count) best = vote;
+      if (best) this.reference = best.reference;
     }
+    servers.forEach((server, i) => this.#take(server, healths[i]!));
+  }
+
+  /** Takes what a check found; `suspect`: a run just failed on the server, so one failed check takes it out. */
+  #take(server: Server, health: Health, suspect = false): void {
     // Forgotten meanwhile.
     if (this.servers.get(server.url) !== server) return;
     const log = (line: string) => this.#options.log(`server ${server.url}: ${line}`);
     if (!health.ok) {
       server.failures++;
       const why = health.why ?? 'unhealthy';
-      if (server.state === 'up' && server.failures >= (this.#options.failures ?? 2)) {
+      if (server.state === 'up' && (suspect || server.failures >= (this.#options.failures ?? 2))) {
         server.state = 'down';
         server.why = why;
-        log(`down after ${server.failures} failed checks (${why})${server.busy ? `; requeueing its ${server.busy} runs` : ''}`);
+        const checks = `${server.failures} failed check${server.failures === 1 ? '' : 's'}${suspect ? ' after a run failed on it' : ''}`;
+        log(`down after ${checks} (${why})${server.busy ? `; requeueing its ${server.busy} runs` : ''}`);
         this.emit('lost', server);
       } else if (server.state !== 'up' && server.why !== why) {
         server.why = why;
@@ -186,13 +231,10 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
       return;
     }
     server.failures = 0;
-    const found: Reference = {
-      model: health.props?.modelPath ? basename(health.props.modelPath) : null,
-      build: health.props?.build ?? null,
-    };
-    const reference = (this.reference ??= found);
-    if (found.model !== reference.model || found.build !== reference.build) {
-      const why = `serves ${found.model} (build ${found.build}), not the pool's ${reference.model} (build ${reference.build})`;
+    const found = reference(health);
+    const expected = (this.reference ??= found);
+    if (found.model !== expected.model || found.build !== expected.build) {
+      const why = `serves ${found.model} (build ${found.build}), not the pool's ${expected.model} (build ${expected.build})`;
       if (server.state !== 'refused' || server.why !== why) log(`refused: ${why}`);
       server.state = 'refused';
       server.why = why;
@@ -206,6 +248,11 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     log(`joined, ${server.slots} run${server.slots === 1 ? '' : 's'} at once`);
     this.emit('join', server);
   }
+}
+
+/** What a healthy server serves: its model file, wherever it is, and build. */
+function reference(health: Health): Reference {
+  return { model: health.props?.modelPath ? basename(health.props.modelPath) : null, build: health.props?.build ?? null };
 }
 
 /** One go at a job, on a server. */
@@ -241,7 +288,8 @@ export const LOST = 'server lost';
  * `attempts`; when its server leaves the pool, its attempt is aborted first.
  */
 export class WorkQueue<J> {
-  readonly pending: { job: J; attempt: number }[];
+  /** `last`: the server its last attempt failed on. */
+  readonly pending: { job: J; attempt: number; last?: Server }[];
   readonly running = new Set<{ job: J; attempt: number; server: Server; controller: AbortController }>();
   /** Resolves once nothing runs and nothing more will start: with how many jobs never ran. */
   readonly done: Promise<{ left: number }>;
@@ -267,7 +315,7 @@ export class WorkQueue<J> {
     if (this.#settled) return;
     const canStart = this.#options.canStart ?? (() => true);
     while (this.pending.length && canStart()) {
-      const server = this.#pool.free();
+      const server = this.#pool.free(this.pending[0]!.last);
       if (!server) break;
       this.#start(this.pending.shift()!, server);
     }
@@ -287,7 +335,7 @@ export class WorkQueue<J> {
 
   #start(item: { job: J; attempt: number }, server: Server): void {
     const controller = new AbortController();
-    const entry = { ...item, server, controller };
+    const entry = { job: item.job, attempt: item.attempt, server, controller };
     this.running.add(entry);
     server.busy++;
     const attempt: Attempt<J> = {
@@ -299,13 +347,15 @@ export class WorkQueue<J> {
     };
     const finish = (again: string | undefined) => {
       this.running.delete(entry);
-      server.busy--;
-      this.#pool.release(server);
       if (again !== undefined && !attempt.final) {
-        this.pending.unshift({ job: item.job, attempt: item.attempt + 1 });
+        this.pending.unshift({ job: item.job, attempt: item.attempt + 1, last: server });
         this.#emptySaid = false;
         this.#options.requeued?.(attempt, again);
       }
+      server.busy--;
+      this.#pool.release(server);
+      // Failed by the infrastructure: the server takes no more runs until a check says it's there.
+      if (again !== undefined) void this.#pool.suspect(server);
       this.pump();
     };
     this.#options.run(attempt).then(finish, (err: unknown) => {

@@ -164,7 +164,39 @@ describe('ServerPool and WorkQueue', () => {
     assert.deepEqual(await q.done, { left: 0 });
   });
 
-  test("servers on another model or build are refused; the reference is the first to join's, or given", async () => {
+  test('a server a run just failed on is checked at once, and out if it fails', async () => {
+    const servers: Record<string, Health> = { a: { ok: true, props: props(1) }, b: { ok: true, props: props(1) } };
+    const { pool: p, lines } = pool(servers);
+    await p.start();
+    const { q, running, end, requeues } = queue(p, ['1', '2', '3']);
+    q.pump();
+    assert.deepEqual(on(running()), ['1@a', '2@b']);
+    // Killed: it refuses connections, so its runs fail in no time.
+    servers.a = { ok: false, why: 'connect ECONNREFUSED' };
+    await end(running()[0]!, 'connect ECONNREFUSED');
+    await tick();
+    assert.equal(p.servers.get('a')!.state, 'down');
+    assert.ok(lines.includes('server a: down after 1 failed check after a run failed on it (connect ECONNREFUSED)'));
+    assert.deepEqual(requeues, [['1', 1, 'connect ECONNREFUSED']]);
+    assert.deepEqual(on(running()), ['2@b'], 'nothing more on it');
+    await end(running()[0]!);
+    assert.deepEqual(on(running()), ['1@b']);
+  });
+
+  test('a requeued run goes to another server than the one it failed on, if one has a free slot', async () => {
+    const { pool: p } = pool({ a: { ok: true, props: props(2) }, b: { ok: true, props: props(2) } });
+    await p.start();
+    const { q, running, end } = queue(p, ['1', '2', '3']);
+    q.pump();
+    assert.deepEqual(on(running()), ['1@a', '2@b', '3@a']);
+    // A stream error on a healthy server: it stays, but the run tries elsewhere.
+    await end(running()[0]!, 'stream: Context size has been exceeded');
+    await tick();
+    assert.equal(p.servers.get('a')!.state, 'up');
+    assert.deepEqual(on(running()), ['2@b', '3@a', '1@b']);
+  });
+
+  test("servers on another model or build are refused; the reference is what most of the first healthy serve, or given", async () => {
     const { pool: p, lines } = pool({
       a: { ok: true, props: props(1) },
       b: { ok: true, props: props(1, '/other/qwen.gguf') },
@@ -183,6 +215,19 @@ describe('ServerPool and WorkQueue', () => {
     // Said once.
     await p.check();
     assert.equal(lines.filter((line) => line.startsWith('server c: refused')).length, 1);
+
+    // However quick the odd one is to answer.
+    const { pool: outvoted } = pool({
+      c: { ok: true, props: props(1, '/models/llama.gguf') },
+      a: { ok: true, props: props(1) },
+      b: { ok: true, props: props(1) },
+    });
+    await outvoted.start();
+    assert.deepEqual(outvoted.reference, { model: 'qwen.gguf', build: 'b1' });
+    assert.deepEqual(
+      outvoted.up().map((server) => server.url),
+      ['a', 'b'],
+    );
 
     const { pool: given } = pool({ a: { ok: true, props: props(1) }, c: { ok: true, props: props(1, '/models/llama.gguf') } }, { reference: { model: 'llama.gguf', build: 'b1' } });
     await given.start();
