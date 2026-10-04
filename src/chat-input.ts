@@ -385,7 +385,19 @@ function partialMarker(data: string, marker: string): number {
 const KITTY_KEY = /\x1b\[(\d+)(?::\d*)*(?:;(\d+)(?::\d+)?)?(?:;[\d:]*)?u/g;
 const KP_ENTER = 57414;
 
+/**
+ * Arrows, Home/End, F1-F4 and the `~` keys with an event type, `CSI 1;modifiers:event D`,
+ * as some terminals send them. Readline doesn't know the colon and types out the rest
+ * (a Left arrow as "1D"), so it's dropped; key releases are dropped whole.
+ */
+const KITTY_CSI = /\x1b\[(\d*)(?::\d*)*;(\d*)(?::(\d+))?(?:;[\d:]*)?([A-DFHPQS~])/g;
+
 export function legacyKeys(data: string): string {
+  data = data.replace(KITTY_CSI, (sequence, number: string, modifiers: string, event: string | undefined, final: string) => {
+    if (!event && !sequence.includes(':')) return sequence;
+    if (event === '3') return '';
+    return `\x1b[${number || '1'};${modifiers || '1'}${final}`;
+  });
   return data.replace(KITTY_KEY, (_sequence, code: string, modifiers = '1') => {
     // The keypad's Enter is Enter; other private-use codes are keys with no legacy
     // bytes (e.g. F13, media keys). A sequence split across reads isn't put back

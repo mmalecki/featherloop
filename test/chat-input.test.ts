@@ -34,6 +34,11 @@ test('kitty keys go back to legacy bytes, but Shift+Enter becomes Alt+Enter', ()
   assert.equal(legacyKeys('\x1b[57414;2u'), '\x1b\r'); // Shift+keypad Enter
   // Not kitty's: arrows and other CSI sequences pass.
   assert.equal(legacyKeys('\x1b[A\x1b[1;5C'), '\x1b[A\x1b[1;5C');
+  // Event types and alternates, which readline would type out ("1D"): dropped; releases too.
+  assert.equal(legacyKeys('\x1b[1;1:1D'), '\x1b[1;1D');
+  assert.equal(legacyKeys('\x1b[1;9:2C'), '\x1b[1;9C');
+  assert.equal(legacyKeys('\x1b[1;1:3D'), '');
+  assert.equal(legacyKeys('\x1b[3;5:1~'), '\x1b[3;5~');
 });
 
 test('the filter passes keys through and hands pastes to fold, whole', async () => {
