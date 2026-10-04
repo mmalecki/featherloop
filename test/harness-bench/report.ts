@@ -59,8 +59,17 @@ export interface RunResult {
   fetches?: Fetch[];
   /** Test literals a short solution returns: maybe answers hardcoded from the visible tests (guards.ts). */
   hardcoded?: string[];
-  /** Dollars, at the model's prices; priced models only. */
+  /** Dollars, at the model's prices, the advisor's included; priced models only. */
   costUsd?: number;
+  /** featherloop-advisor: the advisor's model, how often it was asked, from which request, and what it took. */
+  advisor?: {
+    model: string;
+    calls: number;
+    firstCall: number | null;
+    requests: number;
+    tokens: { prompt: number; cached: number; completion: number };
+    costUsd?: number;
+  };
   /** Distinct sampling settings the harness sent, the output limit apart. */
   params: Record<string, unknown>[];
   /** The largest output limit it asked for; none means the server's. */
@@ -118,6 +127,8 @@ export interface HarnessSummary {
   hardcoded: string[];
   /** Dollars, total; null for unpriced models. */
   cost: number | null;
+  /** featherloop-advisor only: runs that asked, calls per run, the advisor's dollars. */
+  advisor: { runsCalling: number; calls: number; cost: number | null } | null;
   solutionFetches: string[];
   hosts: Record<string, number>;
   linesChanged: number;
@@ -197,6 +208,13 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
     hardcoded: runs.filter((run) => run.hardcoded?.length).map((run) => `${run.case}: ${run.hardcoded!.join(', ')}`),
     cost: runs.some((run) => run.costUsd !== undefined) ? total((run) => run.costUsd ?? 0) : null,
+    advisor: runs.some((run) => run.advisor)
+      ? {
+          runsCalling: runs.filter((run) => run.advisor?.calls).length,
+          calls: mean((run) => run.advisor?.calls ?? 0),
+          cost: runs.some((run) => run.advisor?.costUsd !== undefined) ? total((run) => run.advisor?.costUsd ?? 0) : null,
+        }
+      : null,
     fetches: runs.some((run) => run.fetches) ? mean((run) => run.fetches?.length ?? 0) : null,
     solutionFetches: runs.flatMap((run) => (run.fetches ?? []).filter((fetch) => fetch.solutionSource).map((fetch) => `${run.case}: ${fetch.target}`)),
     hosts: runs.reduce<Record<string, number>>((hosts, run) => {
@@ -254,6 +272,13 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('↳ prompt (processed, not cached)', (s) => k(s.tokens.uncached)),
     row('↳ completion', (s) => k(s.tokens.completion)),
     row('Tokens / pass', (s) => (s.tokensPerPass === null ? '–' : k(s.tokensPerPass))),
+    ...(summaries.some((s) => s.advisor)
+      ? [
+          row('Advisor calls / run', (s) => (s.advisor ? s.advisor.calls.toFixed(1) : '–')),
+          row('Runs that asked the advisor', (s) => (s.advisor ? `${s.advisor.runsCalling}/${s.runs}` : '–')),
+          row('Advisor cost, all runs', (s) => (s.advisor?.cost == null ? '–' : `$${s.advisor.cost.toFixed(2)}`)),
+        ]
+      : []),
     ...(summaries.some((s) => s.cost !== null)
       ? [
           row('Cost / run', (s) => (s.cost === null ? '–' : `$${(s.cost / s.runs).toFixed(3)}`)),

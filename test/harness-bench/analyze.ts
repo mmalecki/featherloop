@@ -220,6 +220,33 @@ table(
   }),
 );
 
+const advised = clean.filter((run) => run.advisor);
+if (advised.length) {
+  section('Advisor', 'featherloop-advisor: whether the model asked for advice, when, and how the runs that asked did.');
+  table(
+    ['', 'runs', 'asked', 'calls / run', 'first call, median request', 'passed when asked', 'passed otherwise', 'advisor $'],
+    columns
+      .filter((column) => advised.some((run) => run.column === column))
+      .map((column) => {
+        const own = advised.filter((run) => run.column === column);
+        const asked = own.filter((run) => run.advisor!.calls > 0);
+        const not = own.filter((run) => !run.advisor!.calls);
+        const rate = (runs: Run[]) => (runs.length ? `${runs.filter((run) => run.pass).length}/${runs.length}` : '–');
+        const cost = own.reduce((sum, run) => sum + (run.advisor!.costUsd ?? 0), 0);
+        return [
+          column,
+          String(own.length),
+          String(asked.length),
+          (own.reduce((n, run) => n + run.advisor!.calls, 0) / own.length).toFixed(1),
+          fmt(quantile(asked.map((run) => run.advisor!.firstCall ?? 0), 0.5)),
+          rate(asked),
+          rate(not),
+          `$${cost.toFixed(2)}`,
+        ];
+      }),
+  );
+}
+
 section('Possibly hardcoded', 'Short solutions returning literals from the tests (guards.ts): look before trusting the pass.');
 const cases = new Map(loadCases().map((c) => [c.id, c]));
 table(

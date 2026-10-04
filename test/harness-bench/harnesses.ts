@@ -44,6 +44,8 @@ export interface HarnessContext {
   baseURL: string;
   model: Model;
   settings: Settings;
+  /** The advisor's model and the run's prefix on its proxy, with `/v1`, when the bench has one (`--advisor`). */
+  advisor?: { model: Model; baseURL: string };
 }
 
 /** Where the bench departs from a harness's own behaviour, by choice; recorded in meta.json, so reruns match. */
@@ -52,6 +54,8 @@ export interface Settings {
   nanocodeMaxTokens?: number;
   /** False: the proxy turns the model's thinking off on every request, whatever the harness asks for. */
   thinking?: boolean;
+  /** A model from models.json that `featherloop-advisor` asks for second opinions. */
+  advisor?: string;
 }
 
 export interface Invocation {
@@ -69,8 +73,10 @@ export interface Harness {
   setup(ctx: HarnessContext): Invocation;
   /** How it's set up, beyond the model and the proxy, for the report. */
   notes(settings: Settings): string[];
-  /** Whether it can run the model; all can, unless they say otherwise. */
-  supports?(model: Model): boolean;
+  /** Whether it can run the model with these settings; all can, unless they say otherwise. */
+  supports?(model: Model, settings: Settings): boolean;
+  /** Whether a run that names no harnesses includes it; by default, when it `supports` the model. */
+  byDefault?(model: Model, settings: Settings): boolean;
 }
 
 const REPO = resolve(import.meta.dirname, '..', '..');
@@ -82,27 +88,45 @@ const NANOCODE = {
   dir: join(CACHE, 'nanocode'),
 };
 
-const featherloop: Harness = {
-  name: 'featherloop',
-  description: 'This repository, from source, with --shell; config: harnesses/featherloop',
+/**
+ * featherloop from this repository. With `advised`, it also gets `--advisor`, on
+ * the bench's advisor model, as its own config would name it: an `advisor` alias.
+ */
+const featherloopHarness = (advised: boolean): Harness => ({
+  name: advised ? 'featherloop-advisor' : 'featherloop',
+  description: advised
+    ? 'This repository, from source, with --shell and --advisor; config: harnesses/featherloop, plus the advisor'
+    : 'This repository, from source, with --shell; config: harnesses/featherloop',
+  ...(advised ? { supports: (_model: Model, settings: Settings) => settings.advisor !== undefined } : {}),
   prepare: () => {
     const head = git(REPO, 'rev-parse', '--short', 'HEAD').trim();
     const dirty = git(REPO, 'status', '--porcelain', '--', 'src', 'bin').trim() ? '-dirty' : '';
     return `${head}${dirty}`;
   },
-  setup: ({ xdg, prompt, model }) => {
+  setup: ({ xdg, prompt, model, advisor }) => {
     const dir = join(xdg.config, 'featherloop');
     copyConfig('featherloop', dir);
     const file = join(dir, 'config.yaml');
     const config = parseDocument(readFileSync(file, 'utf8'));
     config.setIn(['provider', 'bench', 'flavor'], model.flavor);
     config.setIn(['provider', 'bench', 'models', model.id], { limit: { output: model.limit.output }, ...model.featherloop });
+    if (advised) {
+      if (!advisor) throw new Error('featherloop-advisor needs --advisor');
+      // Its own provider, on the advisor's proxy; the proxy supplies any key.
+      config.setIn(['provider', 'advisor'], {
+        flavor: advisor.model.flavor,
+        options: { baseURL: advisor.baseURL, apiKey: 'bench' },
+        models: { [advisor.model.id]: { limit: { output: advisor.model.limit.output }, ...advisor.model.featherloop } },
+      });
+      config.setIn(['aliases', 'advisor'], `advisor/${advisor.model.id}`);
+    }
     writeFileSync(file, config.toString());
     // `--` so no line of the prompt reads as a flag.
-    return { command: process.execPath, args: [join(REPO, 'bin', 'featherloop.ts'), '--shell', '--model', `bench/${model.id}`, '--', prompt] };
+    const flags = advised ? ['--shell', '--advisor'] : ['--shell'];
+    return { command: process.execPath, args: [join(REPO, 'bin', 'featherloop.ts'), ...flags, '--model', `bench/${model.id}`, '--', prompt] };
   },
-  notes: () => ['--shell; no advisor, no subagent'],
-};
+  notes: ({ advisor }) => [advised ? `--shell --advisor, advised by ${advisor}; no subagent` : '--shell; no advisor, no subagent'],
+});
 
 const opencode = (name: string, description: string, notes: string[]): Harness => ({
   name,
@@ -156,7 +180,9 @@ const nanocode: Harness = {
 const claudeCode: Harness = {
   name: 'claude-code',
   description: 'Claude Code, headless (-p), with permissions skipped',
-  supports: (model) => model.flavor === 'anthropic',
+  // llama.cpp serves the Messages API too; a run includes it by default only on Anthropic's.
+  supports: (model) => model.flavor === 'anthropic' || model.flavor === 'openai',
+  byDefault: (model) => model.flavor === 'anthropic',
   prepare: () => isolated((env) => execFileSync(claudeBin(), ['--version'], { encoding: 'utf8', env }).trim()),
   setup: ({ baseURL, model, prompt }) => ({
     command: claudeBin(),
@@ -176,7 +202,8 @@ const claudeCode: Harness = {
 };
 
 export const HARNESSES: Harness[] = [
-  featherloop,
+  featherloopHarness(false),
+  featherloopHarness(true),
   opencode('opencode-stock', 'opencode with only the provider configured; config: harnesses/opencode-stock', [
     'title agent off (it takes a server slot per run)',
   ]),

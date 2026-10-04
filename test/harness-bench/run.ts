@@ -34,6 +34,11 @@ const argv = await yargs(hideBin(process.argv))
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
+  .option('advisor', {
+    type: 'string',
+    choices: Object.keys(MODELS),
+    describe: 'A model from models.json to advise featherloop-advisor (and include that harness)',
+  })
   .option('max-cost', {
     type: 'number',
     describe: "Dollars: start no more runs once the runs so far cost this much (priced models only; runs in flight finish)",
@@ -59,15 +64,21 @@ const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
 // Reruns as the run they replace; results from before settings ran nanocode as shipped.
 const settings: Settings = rerun
   ? (rerun.meta.settings ?? {})
-  : { nanocodeMaxTokens: model.limit.output, ...(argv.thinking ? {} : { thinking: false }) };
+  : { nanocodeMaxTokens: model.limit.output, ...(argv.thinking ? {} : { thinking: false }), ...(argv.advisor ? { advisor: argv.advisor } : {}) };
+const advisorModel = settings.advisor === undefined ? undefined : MODELS[settings.advisor];
+if (settings.advisor !== undefined && !advisorModel) throw new Error(`No model ${settings.advisor} in models.json`);
 const cases = loadCases(argv._.map(String), rerun ? 'all' : argv.set).filter((c) => !rerun || rerun.cases.has(c.id));
 const harnesses = HARNESSES.filter(
   (harness) =>
-    (argv.harness?.length ? argv.harness.includes(harness.name) : (harness.supports?.(model) ?? true)) &&
+    (argv.harness?.length
+      ? argv.harness.includes(harness.name)
+      : (harness.byDefault ?? harness.supports)?.(model, settings) ?? true) &&
     (!rerun || rerun.harnesses.has(harness.name)),
 );
 for (const harness of harnesses) {
-  if (harness.supports && !harness.supports(model)) throw new Error(`${harness.name} can't run ${model.id} (${model.flavor})`);
+  if (harness.supports && !harness.supports(model, settings)) {
+    throw new Error(`${harness.name} can't run ${model.id} (${model.flavor})${settings.advisor ? '' : ' without --advisor'}`);
+  }
 }
 if (argv.list) {
   for (const harness of harnesses) console.log(`${harness.name}: ${harness.description}`);
@@ -125,12 +136,19 @@ if (settings.thinking === false && model.flavor !== 'openai') {
   throw new Error(`--no-thinking sets llama.cpp's chat template; ${model.id} speaks ${model.flavor}`);
 }
 // A hosted API's key stays here: the proxy adds it upstream, harnesses get none.
-const apiKey = model.flavor === 'anthropic' ? process.env.ANTHROPIC_API_KEY : undefined;
-if (model.flavor === 'anthropic' && !apiKey) throw new Error(`${model.id} needs ANTHROPIC_API_KEY (in .env)`);
+const keyFor = (m: typeof model) => {
+  if (m.flavor !== 'anthropic') return undefined;
+  if (!process.env.ANTHROPIC_API_KEY) throw new Error(`${m.id} needs ANTHROPIC_API_KEY (in .env)`);
+  return process.env.ANTHROPIC_API_KEY;
+};
+const apiKey = keyFor(model);
 const proxy = await MeteringProxy.start(upstream, {
   ...(settings.thinking === false ? { thinking: false } : {}),
   ...(apiKey ? { apiKey } : {}),
 });
+// The advisor's own proxy: its calls are metered apart from the model's.
+const advisorKey = advisorModel && keyFor(advisorModel);
+const advisorProxy = advisorModel && (await MeteringProxy.start(advisorModel.upstream, advisorKey ? { apiKey: advisorKey } : {}));
 let spent = 0;
 
 interface Job {
@@ -180,6 +198,7 @@ await Promise.all(
   }),
 );
 await proxy.stop();
+await advisorProxy?.stop();
 console.log(summarize(out));
 
 async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> {
@@ -199,7 +218,17 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   prepareWorkspace(c, workspace, toolchains.tools);
 
   const meter = proxy.open(id, join(dir, 'requests.jsonl'), join(dir, 'transcript.json'));
-  const ctx: HarnessContext = { home, xdg, workspace, prompt: c.prompt, baseURL: meter.baseURL, model, settings };
+  const advisorMeter = advisorProxy?.open(`${id}.advisor`, join(dir, 'advisor-requests.jsonl'), join(dir, 'advisor-transcript.json'));
+  const ctx: HarnessContext = {
+    home,
+    xdg,
+    workspace,
+    prompt: c.prompt,
+    baseURL: meter.baseURL,
+    model,
+    settings,
+    ...(advisorModel && advisorMeter ? { advisor: { model: advisorModel, baseURL: advisorMeter.baseURL } } : {}),
+  };
   const invocation = harness.setup(ctx);
   const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
   const started = new Date();
@@ -212,6 +241,7 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   });
   if (result.pid !== undefined) live.delete(result.pid);
   proxy.close(id);
+  advisorProxy?.close(`${id}.advisor`);
   if (interrupted) {
     rmSync(tmp, { recursive: true, force: true });
     return undefined;
@@ -227,6 +257,23 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
   const records = meter.records;
   // Model requests: not token counts and other side calls.
   const requests = records.filter((record) => record.dialect !== 'other');
+  // The advisor: how often the model asked (featherloop's subagent tool), and what the answers cost.
+  const advisorRecords = advisorMeter?.records.filter((record) => record.dialect !== 'other') ?? [];
+  const advised =
+    advisorModel && harness.name === 'featherloop-advisor'
+      ? {
+          model: advisorModel.id,
+          calls: requests.reduce((n, record) => n + record.toolCalls.filter((name) => name === 'subagent').length, 0),
+          requests: advisorRecords.length,
+          tokens: {
+            prompt: advisorRecords.reduce((n, record) => n + (record.tokens?.prompt ?? 0), 0),
+            cached: advisorRecords.reduce((n, record) => n + (record.tokens?.cached ?? 0), 0),
+            completion: advisorRecords.reduce((n, record) => n + (record.tokens?.completion ?? 0), 0),
+          },
+          firstCall: requests.findIndex((record) => record.toolCalls.includes('subagent')) + 1 || null,
+          ...(advisorModel.pricing ? { costUsd: cost(advisorRecords, advisorModel.pricing) } : {}),
+        }
+      : undefined;
   const sum = (pick: (tokens: { prompt: number; cached: number; completion: number }) => number) =>
     records.reduce((total, record) => total + (record.tokens ? pick(record.tokens) : 0), 0);
   const tools: Record<string, number> = {};
@@ -279,7 +326,10 @@ async function runJob({ harness, c, rep }: Job): Promise<RunResult | undefined> 
     sawCache: sawCache(dir),
     fetches: webFetches(readTranscript(dir)),
     hardcoded: hardcodedAnswers(changed.diff, c.solution, c.tests.map((name) => c.files.get(name)!)),
-    ...(model.pricing ? { costUsd: cost(records, model.pricing) } : {}),
+    ...(advised ? { advisor: advised } : {}),
+    ...(model.pricing || advised?.costUsd !== undefined
+      ? { costUsd: (model.pricing ? cost(records, model.pricing) : 0) + (advised?.costUsd ?? 0) }
+      : {}),
     params,
     maxOutput: limits.length ? Math.max(...limits) : null,
     ...(rerun ? { rerun: true } : {}),

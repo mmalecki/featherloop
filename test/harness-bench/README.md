@@ -10,6 +10,7 @@ npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
 npm run bench -- -m claude-haiku-4-5 --max-cost 20 -j 4   # a hosted model, with a spending limit
+npm run bench -- --advisor claude-sonnet-5-5 -H featherloop -H featherloop-advisor --max-cost 10   # with and without an advisor
 npm run bench -- --list                     # harnesses and cases
 npm run validate-cases                      # prove the grading, no model needed
 node test/harness-bench/report.ts test/harness-bench/results/<run>   # re-summarize
@@ -37,6 +38,7 @@ Results land in `results/<timestamp>/`: `summary.md` and `summary.json`, `result
 | `opencode-stock` | `opencode run --standalone --auto`, provider only | `harnesses/opencode-stock/opencode.json` |
 | `opencode-custom` | the same, with the agents for smaller models | `harnesses/opencode-custom/` |
 | `nanocode` | [1rgs/nanocode](https://github.com/1rgs/nanocode) at `b009d3d`, unmodified | `harnesses/nanocode/driver.py` |
+| `featherloop-advisor` | featherloop with `--advisor`, on the bench's `--advisor` model; only with `--advisor` | `harnesses.ts` |
 | `claude-code` | Claude Code, headless (`claude -p`), permissions skipped; Anthropic models only | `harnesses.ts` |
 
 The configs are copies of the user's (`~/.config/featherloop`, `~/.config/opencode`),
@@ -83,6 +85,13 @@ what the harness asked for, and mark the override.
 Each departure from a harness's own behaviour (this limit, opencode's title agent,
 websearch, featherloop's flags) is listed in the report, and recorded in `meta.json`,
 so reruns match the run they replace.
+
+`--advisor <model>` gives featherloop-advisor a second opinion from another model in
+`models.json`, hosted (Sonnet) or not (the 35B for a 9B): an `advisor` alias in its config,
+as a user would set one, on a proxy of its own, so the advisor's calls are metered apart.
+Results say how often the model asked (`advisor.calls`), from which request, and what the
+advice cost, which counts towards `--max-cost`; `bench:analyze` compares the runs that asked
+with those that didn't. Run featherloop beside it for the same cases with and without.
 
 Claude Code talks to the run's proxy (`ANTHROPIC_BASE_URL`, a dummy key the proxy
 replaces), with its background model set to the model under test, and telemetry,
