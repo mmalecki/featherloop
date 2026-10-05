@@ -180,8 +180,8 @@ is 15 minutes, and showed up as 504s). Only the transport changes.
 ## Analysis
 
 `bench:analyze` explains a results directory, or compares several: how each run
-ended (passed, a runaway response that ran into the timeout, iterating until it, time
-in tools, the output limit, stopped with tests failing), paired comparisons with a sign
+ended (passed, a runaway response that ran into the timeout or output budget, iterating
+until it, time in tools, the output limit, stopped with tests failing), paired comparisons with a sign
 test on the cases both columns ran, the cases they split on, how much and how early
 the model reasons, what it does right after failing tests, and the runaway responses
 themselves, with how much of their reasoning repeats. Given several directories, each

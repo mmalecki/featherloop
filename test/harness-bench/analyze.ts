@@ -33,7 +33,7 @@ const argv = await yargs(hideBin(process.argv))
   .strictOptions()
   .parseAsync();
 
-/** A response that ran this long, or reasoned this much, before the timeout cut it off ran away. */
+/** A response that ran this long, or reasoned this much, before the timeout or budget cut it off ran away. */
 const RUNAWAY_MS = 10 * 60_000;
 const RUNAWAY_CHARS = 50_000;
 /** Reasoning past this many characters is a long response. */
@@ -263,12 +263,12 @@ table(
 if (argv.runaways) {
   section(
     'Runaway responses',
-    'Timeouts that ended inside one response. Repeated: the share of its reasoning lines (over 20 characters) that repeat an earlier one.',
+    'Timeouts and budget stops that ended inside one response. Repeated: the share of its reasoning lines (over 20 characters) that repeat an earlier one.',
   );
   table(
     ['column', 'case', 'turn', 'minutes', 'reasoning', 'repeated', 'after'],
     clean
-      .filter((run) => classify(run) === 'timeout: runaway response')
+      .filter((run) => classify(run).endsWith(': runaway response'))
       .map((run) => {
         const last = run.reqs.at(-1)!;
         const reasoning = lastReasoning(readTranscript(run.dir));
@@ -301,11 +301,12 @@ function load(dir: string, prefix: string, label: number): Run[] {
 function classify(run: Run): string {
   // From the requests: older rows missed streams a server crash cut off.
   if (run.apiErrors || run.reqs.some(infrastructureError)) return 'API errors';
-  if (run.pass) return run.status === 'timeout' ? 'passed, then timed out' : 'passed';
+  if (run.pass) return run.status === 'timeout' ? 'passed, then timed out' : run.status === 'budget' ? 'passed, then out of budget' : 'passed';
   const last = run.reqs.at(-1);
-  if (run.status === 'budget') return 'out of output budget';
+  const runaway = last && abortedByBench(last) && (last.ms > RUNAWAY_MS || last.reasoningChars > RUNAWAY_CHARS);
+  if (run.status === 'budget') return runaway ? 'out of budget: runaway response' : 'out of budget: iterating';
   if (run.status === 'timeout') {
-    if (last && abortedByBench(last) && (last.ms > RUNAWAY_MS || last.reasoningChars > RUNAWAY_CHARS)) return 'timeout: runaway response';
+    if (runaway) return 'timeout: runaway response';
     if (run.wallMs && run.llmMs / run.wallMs < 0.5) return 'timeout: mostly in tools';
     return 'timeout: iterating';
   }
