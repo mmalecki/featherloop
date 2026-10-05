@@ -31,6 +31,15 @@
       }
     }
   },
+  "spark-x2.5-4b": {
+    "flavor": "openai",
+    "name": "Spark X2.5 4B",
+    "upstream": "http://34.70.64.197:9932/v1",
+    "limit": {
+      "context": 131072,
+      "output": 131072
+    }
+  },
   "claude-haiku-4-5": {
     "flavor": "anthropic",
     "name": "Claude Haiku 4.5",

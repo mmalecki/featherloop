@@ -60,6 +60,9 @@ server, display name, context and output limits, and featherloop's own settings
 (variants). For each run the bench adds the chosen model (`-m`, default `qwen3.5-9b`)
 to the copied configs and passes it to every harness, so all four run the same model
 with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server.
+`spark-x2.5-4b` is a curiosity rather than a model under study: a 4B on a server's CPU,
+which with thinking on reasons too slowly to finish a run in 30 minutes (see
+`reports/2026-10-05.md`).
 
 Benches on different models can run at once, from separate checkouts (e.g. a git
 worktree): each has its own proxy, temporary homes and results. Don't edit the checkout
