@@ -8,5 +8,7 @@ import { defineAgent } from '../agent.ts';
 export const generalAgent = defineAgent({
   name: 'general',
   description: 'General-purpose assistant',
-  system: ({ date, cwd }) => `Concise assistant. Today is ${date}. cwd: ${cwd}`,
+  system: ({ date, cwd }) =>
+    `Concise assistant. Today is ${date}. cwd: ${cwd}\n` +
+    "Run the tests without head or tail: the failures and the summary are in the full output.",
 });
