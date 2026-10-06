@@ -15,6 +15,42 @@
       }
     }
   },
+  "qwen3.5-9b-presence": {
+    "flavor": "openai",
+    "name": "Qwen3.5 9B, presence penalty 1.5",
+    "upstream": "http://34.61.203.44:9931/v1",
+    "limit": {
+      "context": 262144,
+      "output": 262144
+    },
+    "featherloop": {
+      "variants": {
+        "default": "sampling",
+        "sampling": {
+          "presence_penalty": 1.5
+        }
+      }
+    }
+  },
+  "qwen3.5-9b-dry": {
+    "flavor": "openai",
+    "name": "Qwen3.5 9B, DRY 0.8",
+    "upstream": "http://34.61.203.44:9931/v1",
+    "limit": {
+      "context": 262144,
+      "output": 262144
+    },
+    "featherloop": {
+      "variants": {
+        "default": "sampling",
+        "sampling": {
+          "dry_multiplier": 0.8,
+          "dry_base": 1.75,
+          "dry_allowed_length": 2
+        }
+      }
+    }
+  },
   "qwen3.6-35b-a3b": {
     "flavor": "openai",
     "name": "Qwen3.6 35B A3B",
