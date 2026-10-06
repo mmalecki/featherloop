@@ -10,7 +10,7 @@ npm run bench -- --servers-cmd "test/harness-bench/servers/gce-mig.sh llama-9b u
 npm run bench -- -H featherloop python/wordy
 npm run bench -- -m qwen3.6-35b-a3b -j 1      # another model from models.json
 npm run bench -- --no-thinking -j 4           # the model's thinking off, for every harness
-npm run bench -- --max-output 200000 --timeout 120 -j 8   # a budget of work, not wall clock
+npm run bench -- --max-output 200000 -j 8   # a budget of work, not wall clock
 npm run bench -- --reasoning-budget 4096 -j 4  # cap reasoning per response, for every harness
 npm run bench -- -m claude-haiku-4-5 --max-cost 20 -j 4   # a hosted model, with a spending limit
 npm run bench -- --advisor claude-sonnet-5-5 -H featherloop -H featherloop-advisor --max-cost 10   # with and without an advisor
@@ -247,7 +247,10 @@ and the load: a faster GPU, or fewer runs at once, lets a runaway response gener
 more before it's cut off, and moves pass rates. `--max-output N` ends a run once it has
 generated N tokens instead (status `budget`, 🪙 in the report), counted as they stream:
 the same amount of work on any machine, and a faster one finishes sooner rather than
-spending the time on more of the same. Keep a generous `--timeout` as a safety net.
+spending the time on more of the same. `--timeout` then defaults to a safety net rather than 20
+minutes: the time the budget takes at 10 tokens a second, and at least 120 minutes. 40k
+tokens at the 16 a second runs get at 60k contexts take 42 minutes, and a run the clock
+cuts off would score the load, not the work.
 
 `--reasoning-budget N` caps the model's reasoning per response, at the proxy, for every
 harness (`reasoning_budget_tokens`, which llama.cpp honours: thinking ends at the

@@ -31,7 +31,10 @@ const argv = await yargs(hideBin(process.argv))
     describe: "Runs at once on each server (default: its slots, from llama.cpp's /props; 1 on a hosted API)",
   })
   .option('reps', { alias: 'r', type: 'number', default: 1, describe: 'Runs of each harness on each case' })
-  .option('timeout', { type: 'number', default: 20, describe: 'Minutes a run may take before its harness is killed' })
+  .option('timeout', {
+    type: 'number',
+    describe: 'Minutes a run may take before its harness is killed (default: 20; with --max-output, a safety net: time for the budget at 10 tokens a second, at least 120)',
+  })
   .option('model', { alias: 'm', type: 'string', choices: Object.keys(MODELS), default: 'qwen3.5-9b', describe: 'Model under test, from models.json' })
   .option('base-url', {
     type: 'string',
@@ -92,7 +95,9 @@ const explicitUpstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM;
 const serversCmd: string | undefined = argv.serversCmd ?? (explicitUpstream === undefined ? rerun?.meta.serversCmd : undefined);
 const upstream: string | undefined = serversCmd === undefined ? (explicitUpstream ?? (rerun ? rerun.meta.upstream : model.upstream)) : undefined;
 if (serversCmd !== undefined && model.flavor !== 'openai') throw new Error(`--servers-cmd lists llama.cpp servers; ${model.id} speaks ${model.flavor}`);
-const timeout: number = rerun ? rerun.meta.timeoutMinutes : argv.timeout;
+// With a budget, the timeout is only a safety net, which load mustn't reach: 40k tokens at 16 a second (8 runs
+// at 60k contexts on a G4) take 42 minutes.
+const timeout: number = rerun ? rerun.meta.timeoutMinutes : (argv.timeout ?? (argv.maxOutput ? Math.max(120, Math.ceil(argv.maxOutput / 10 / 60)) : 20));
 // Reruns as the run they replace; results from before settings ran nanocode as shipped.
 const settings: Settings = rerun
   ? (rerun.meta.settings ?? {})
