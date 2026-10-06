@@ -1,7 +1,7 @@
 # featherloop
 Minimal agent execution loop with configurable, context-lean toolsets.
 
-TBD: screenshot
+![Featherloop screenshot](./docs/screenshot.png)
 
 featherloop is an agent harness designed to bring big possibilities to tiny models: (relatively) big results from
 small amounts of memory and compute.
@@ -11,7 +11,49 @@ Features:
 * tool result compaction - summarize some tool results to keep the context short, with a smaller model if you like
 * extremely small harness size
 * compatible with Anthropic and OpenAI APIs; tested with llama.cpp
-* under 4k lines of code, 50 kB package size
+* under 4k lines of code, 75 kB package size
+
+## Installation
+```sh
+npm -g i featherloop
+
+```
+
+## Usage
+Featherloop still needs to be configured with your model preferances. Here's a minimalistic example:
+
+```yaml
+
+model: anthropic/claude-opus-5-5
+provider:
+  anthropic:
+    flavor: anthropic
+    models:
+      claude-opus-5-5:
+        aliases:
+          advisor: anthropic/claude-fable-5-1
+        variants: *high_effort
+      claude-sonnet-5-5:
+        aliases:
+          advisor: anthropic/claude-opus-5-5
+        variants: *high_effort
+      # Takes no effort setting.
+      claude-haiku-4-5: {}
+  local:
+    flavor: openai
+    options:
+      baseURL: http://127.0.0.1:9931/v1
+    models: *models
+  framework:
+    flavor: openai
+    options:
+      baseURL: http://framework.sledzie:9931/v1
+    models: *models
+
+aliases:
+  advisor: anthropic/claude-opus-5-5
+
+```
 
 ## Motivation
 
