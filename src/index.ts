@@ -22,3 +22,4 @@ export * from './provider.ts';
 export * from './providers/index.ts';
 export * from './config.ts';
 export * from './models.ts';
+export * from './mcp/index.ts';

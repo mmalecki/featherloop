@@ -18,6 +18,44 @@ export interface Config {
    * A model's own aliases come first (see `ModelConfig.aliases`).
    */
   aliases?: Record<string, string | AliasConfig>;
+  /**
+   * MCP servers whose tools the model gets, by a name that prefixes them
+   * (`<name>_<tool>`). As in OpenCode, but without OAuth: a remote server's
+   * token goes in `headers`, e.g. `Authorization: "Bearer {env:TOKEN}"`.
+   */
+  mcp?: Record<string, McpConfig>;
+}
+
+export type McpConfig = LocalMcpConfig | RemoteMcpConfig;
+
+interface McpCommon {
+  /** On by default. */
+  enabled?: boolean;
+  /** Milliseconds to wait for the server's tools at startup; 5000 by default, as in OpenCode. */
+  timeout?: number;
+  /**
+   * The server's tools the model gets, by their names on the server; all of them
+   * by default. Each costs tokens on every turn. Not in OpenCode.
+   */
+  tools?: string[];
+}
+
+/** A server featherloop starts and talks to over stdio. */
+export interface LocalMcpConfig extends McpCommon {
+  type: 'local';
+  /** The command and its arguments. */
+  command: string[];
+  cwd?: string;
+  /** Added to featherloop's own environment. */
+  environment?: Record<string, string>;
+}
+
+/** A server featherloop talks to over Streamable HTTP. */
+export interface RemoteMcpConfig extends McpCommon {
+  type: 'remote';
+  url: string;
+  /** Sent with every request. */
+  headers?: Record<string, string>;
 }
 
 export interface AliasConfig {
@@ -114,7 +152,7 @@ export function parseConfig(text: string, env: NodeJS.ProcessEnv = process.env):
 /** Checks a config as parsed; throws a `ConfigError` naming the first problem's path. */
 export function checkConfig(value: unknown): Config {
   const config = object(value, 'config');
-  only(config, ['model', 'provider', 'aliases'], '');
+  only(config, ['model', 'provider', 'aliases', 'mcp'], '');
   if (config.model !== undefined) string(config.model, 'model');
   for (const [id, provider] of entries(config.provider, 'provider')) {
     const at = `provider.${id}`;
@@ -161,7 +199,44 @@ export function checkConfig(value: unknown): Config {
     }
   }
   if (config.aliases !== undefined) checkAliases(config, config.aliases, 'aliases', false);
+  for (const [name, server] of entries(config.mcp, 'mcp')) checkMcp(name, server);
   return config as Config;
+}
+
+function checkMcp(name: string, server: Fields): void {
+  const at = `mcp.${name}`;
+  // The name prefixes the server's tools, whose names the APIs limit to these.
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new ConfigError(`${at}: server names may only contain letters, digits, _ and -`);
+  if ('oauth' in server) throw new ConfigError(`${at}.oauth isn't supported; send a token in headers instead`);
+  const common = ['type', 'enabled', 'timeout', 'tools'];
+  if (server.type === 'local') {
+    only(server, [...common, 'command', 'cwd', 'environment'], at);
+    const { command } = server;
+    if (!(Array.isArray(command) && command.length && command.every((part) => typeof part === 'string'))) {
+      throw new ConfigError(`${at}.command must be a non-empty list of strings`);
+    }
+    if (server.cwd !== undefined) string(server.cwd, `${at}.cwd`);
+    strings(server.environment, `${at}.environment`);
+  } else if (server.type === 'remote') {
+    only(server, [...common, 'url', 'headers'], at);
+    string(server.url, `${at}.url`);
+    if (!/^https?:\/\//.test(server.url)) throw new ConfigError(`${at}.url must be an http or https URL`);
+    strings(server.headers, `${at}.headers`);
+  } else {
+    throw new ConfigError(`${at}.type must be local or remote`);
+  }
+  if (server.enabled !== undefined && typeof server.enabled !== 'boolean') throw new ConfigError(`${at}.enabled must be a boolean`);
+  const { timeout, tools } = server;
+  if (timeout !== undefined && !(Number.isInteger(timeout) && timeout > 0)) throw new ConfigError(`${at}.timeout must be a positive integer`);
+  if (tools !== undefined && !(Array.isArray(tools) && tools.every((tool) => typeof tool === 'string'))) {
+    throw new ConfigError(`${at}.tools must be a list of tool names`);
+  }
+}
+
+/** A mapping of strings, if present. */
+function strings(value: unknown, path: string): void {
+  if (value === undefined) return;
+  for (const [key, item] of Object.entries(object(value, path))) string(item, `${path}.${key}`);
 }
 
 type Fields = Record<string, any>;

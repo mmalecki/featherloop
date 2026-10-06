@@ -11,6 +11,7 @@ import {
   ConfigError,
   configDir,
   configPath,
+  connectMcp,
   findInstructions,
   FLAVORS,
   formatInstructions,
@@ -74,6 +75,11 @@ const argv = await yargs(hideBin(process.argv))
     default: true,
     describe: `Load AGENTS.md, or else CLAUDE.md, from ${configDir()} and each directory from the git root down to the cwd (--no-instructions to skip)`,
   })
+  .option('mcp', {
+    type: 'boolean',
+    default: true,
+    describe: "Start the config's MCP servers and give the model their tools (--no-mcp to skip)",
+  })
   .option('resume', {
     alias: 'r',
     type: 'string',
@@ -81,7 +87,7 @@ const argv = await yargs(hideBin(process.argv))
   })
   .epilogue(
     'Tools: read, write, update, grep, glob, webfetch; websearch when PARALLEL_API_KEY is set;\n' +
-      'shell with --shell; subagent with --subagent or --advisor.\n' +
+      "shell with --shell; subagent with --subagent or --advisor; the config's MCP servers' tools.\n" +
       'Keys: OPENAI_API_KEY, ANTHROPIC_API_KEY, PARALLEL_API_KEY.\n' +
       `Sessions are saved in ${sessionsDir()}. Flags aren't: a session on a bare model id\n` +
       'needs its --flavor and --base-url again to resume.',
@@ -102,7 +108,8 @@ if (piped !== undefined && !prompt) {
 
 const { shell, subagent } = argv;
 const advisor = argv.advisor || argv.advisorModel !== undefined;
-const registry = await exitOnUserError(() => new ModelRegistry(loadConfig(argv.config)));
+const config = await exitOnUserError(() => loadConfig(argv.config));
+const registry = await exitOnUserError(() => new ModelRegistry(config));
 const resumed = argv.resume === undefined ? undefined : await exitOnUserError(() => Session.open(argv.resume!));
 // A resumed session stays on its model and variant, unless the flags pick them.
 const ref = await exitOnUserError(() => argv.model ?? resumed?.model?.ref ?? process.env.MODEL ?? registry.default ?? onlyModel());
@@ -123,6 +130,12 @@ if (advisor) {
   });
 }
 
+// Started once and shared: every loop and subagent gets their tools, which keep no state.
+const mcp = await connectMcp(argv.mcp ? (config.mcp ?? {}) : {}, {
+  clientInfo: { name: 'featherloop', version: version() },
+  onWarning: (message) => console.error(message),
+});
+
 /**
  * Every tool an agent may get, built afresh: each loop and subagent tracks its own
  * file state. Flags decide what's here; agents' permissions pick from it, so even
@@ -130,6 +143,7 @@ if (advisor) {
  */
 const availableTools = (): Toolset => {
   const available: Toolset = {
+    ...mcp.tools(),
     // read, write and update; updates and overwrites only after a read.
     ...ManagedFileTools(),
     // rg and fd when installed, otherwise grep and find.
@@ -159,6 +173,7 @@ const startup = argv.instructions
   ? findInstructions({ onSkip: (path, err) => console.error(`Skipping instructions in ${path}: ${(err as Error).message}`) })
   : [];
 const loaded = resumed ? [] : startup.map(({ path }) => shortPath(path));
+const servers = [...mcp.servers].map(([name, count]) => `${name} (${count} tool${count === 1 ? '' : 's'})`);
 let first = true;
 
 const ui = new SimpleUI(createLoop, {
@@ -172,12 +187,14 @@ const ui = new SimpleUI(createLoop, {
     first = false;
     return generalAgent.system({ cwd, date: new Date().toISOString().slice(0, 10), model: initial.model, instructions: text });
   },
-  ...(loaded.length ? { notes: [`instructions: ${loaded.join(', ')}`] } : {}),
+  notes: [...(loaded.length ? [`instructions: ${loaded.join(', ')}`] : []), ...(servers.length ? [`mcp: ${servers.join(', ')}`] : [])],
 });
 
 // Piped stdin always has a prompt by now: with no terminal to chat in, it never starts the REPL.
 if (prompt) await ui.ask(prompt);
 else await ui.start();
+// Local servers would keep the process running.
+await mcp.close();
 // After /c, the UI's session is a newer one. One with only a system prompt (its first run failed) isn't worth it.
 if (ui.session?.messages.some((message) => message.role !== 'system')) console.error(`Resume with: featherloop --resume ${ui.session.id}`);
 

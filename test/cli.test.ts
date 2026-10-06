@@ -13,6 +13,7 @@ const home = mkdtempSync(join(tmpdir(), 'featherloop-cli-'));
 
 interface Request {
   messages: { role: string; content: string }[];
+  tools?: { function: { name: string } }[];
 }
 const requests: Request[] = [];
 
@@ -53,7 +54,8 @@ interface Run {
 function run(signal: AbortSignal, args: string[], stdin: 'ignore' | number, shellPipe?: string): Promise<Run> {
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, XDG_CONFIG_HOME: join(home, 'config'), XDG_STATE_HOME: join(home, 'state') };
   for (const key of ['MODEL', 'OPENAI_BASE_URL', 'OPENAI_API_KEY', 'PARALLEL_API_KEY']) delete env[key];
-  const argv = [cli, '--model', 'test-model', '--base-url', baseURL, '--no-instructions', '--config', join(home, 'none.yaml'), ...args];
+  const config = args.includes('--config') ? [] : ['--config', join(home, 'none.yaml')];
+  const argv = [cli, '--model', 'test-model', '--base-url', baseURL, '--no-instructions', ...config, ...args];
   // A real pipe needs a shell: Node gives a child's stdin as a socket, which the CLI ignores.
   const child =
     shellPipe === undefined
@@ -125,4 +127,18 @@ test('empty or blank piped stdin with no argument is an error, with no request',
     assert.match(stderr, /No prompt: pass one as an argument or pipe it on stdin/);
     assert.equal(requests.length, start);
   }
+});
+
+test("the config's MCP servers' tools reach the model, unless --no-mcp; their servers stop at exit", { timeout }, async (t) => {
+  const config = join(home, 'mcp.yaml');
+  const server = fileURLToPath(new URL('./mcp-server.ts', import.meta.url));
+  writeFileSync(config, `mcp:\n  fake:\n    type: local\n    command: ${JSON.stringify([process.execPath, server])}\n    tools: [echo]\n`);
+  const tools = async (args: string[]) => {
+    const start = requests.length;
+    const { code, stderr } = await run(t.signal, ['--config', config, ...args, 'hello'], 'ignore');
+    assert.equal(code, 0, stderr);
+    return requests[start]!.tools?.map((tool) => tool.function.name) ?? [];
+  };
+  assert.ok((await tools([])).includes('fake_echo'));
+  assert.ok(!(await tools(['--no-mcp'])).includes('fake_echo'));
 });

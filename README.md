@@ -11,6 +11,7 @@ Features:
 * tool result compaction - summarize some tool results to keep the context short, with a smaller model if you like
 * extremely small harness size
 * compatible with Anthropic and OpenAI APIs; tested with llama.cpp
+* MCP servers' tools, over stdio or HTTP, with no SDK
 * under 4k lines of code, 75 kB package size
 
 ## Installation
@@ -44,6 +45,24 @@ provider:
 aliases:
   advisor: anthropic/claude-sonnet-5-5
 
+```
+
+MCP servers go under `mcp`, as in OpenCode. Their tools are named `<server>_<tool>`; each costs tokens on every turn,
+so `tools` can pick the ones you want. featherloop speaks MCP 2026-07-28 only: older servers are left out with a warning.
+
+```yaml
+mcp:
+  issues:
+    type: remote
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer {env:ISSUES_TOKEN}"
+    tools: [search_issues, get_issue]
+  files:
+    type: local
+    command: [npx, -y, some-mcp-server]
+    environment:
+      ROOT: /srv
 ```
 
 ## Motivation
