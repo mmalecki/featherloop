@@ -80,6 +80,31 @@ describe('MeteringProxy upstreams', () => {
       await proxy.stop();
     }
   });
+
+  test('a request on a kept-alive connection the server closed goes again on a fresh one, and is no error', async () => {
+    const { url, server } = await stub('fresh');
+    servers.push(server);
+    // As a server that closes its end between requests: a second request on a connection meets a hang-up.
+    const used = new WeakSet<object>();
+    server.prependListener('request', (req: http.IncomingMessage) => {
+      if (used.has(req.socket)) req.socket.destroy();
+      used.add(req.socket);
+    });
+    const proxy = await MeteringProxy.start(url);
+    try {
+      const meter = proxy.open('kept', join(dir, 'kept.jsonl'), join(dir, 'kept.json'));
+      const content = (body: unknown) => (body as { choices: { message: { content: string } }[] }).choices[0]!.message.content;
+      assert.equal(content(await chat(meter.baseURL)), 'fresh');
+      assert.equal(content(await chat(meter.baseURL)), 'fresh');
+      const second = meter.records[1]!;
+      assert.equal(second.status, 200);
+      assert.equal(second.error, undefined);
+      assert.ok(second.resent);
+      assert.ok(!infrastructureError(second));
+    } finally {
+      await proxy.stop();
+    }
+  });
 });
 
 /** Streamed chunks so far, after a moment. */

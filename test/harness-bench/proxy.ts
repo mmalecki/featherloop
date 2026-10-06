@@ -67,6 +67,8 @@ export interface RequestRecord {
   status: number;
   /** Network failure, or the client hanging up mid-response. */
   error?: string;
+  /** Sent again, once, after this error on a kept-alive connection the server had closed, before any response. */
+  resent?: string;
   stream: boolean;
   /** Not streamed by the harness, so streamed upstream and answered whole: see `MeteringProxy`. */
   restreamed: boolean;
@@ -279,47 +281,60 @@ export class MeteringProxy {
     };
 
     const client = target.protocol === 'https:' ? https : http;
-    const upstream = client.request(target, { method: req.method, headers }, (up) => {
-      record.status = up.statusCode ?? 0;
-      // Errors come back whole either way, and pass through as they are.
-      const assemble = record.restreamed && record.status === 200;
-      const out: Record<string, string | string[]> = {};
-      for (const [name, value] of Object.entries(up.headers)) {
-        if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
-      }
-      if (!assemble) res.writeHead(record.status, out);
-      // An error's body says why: keep its start.
-      let errorBody = '';
-      up.on('data', (chunk: Buffer) => {
-        response.write(chunk);
-        if (!assemble) res.write(chunk);
-        if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
+    let upstream: http.ClientRequest;
+    const send = (again: boolean) => {
+      // Sent again, on a connection of its own: another kept-alive one may be just as stale.
+      upstream = client.request(target, { method: req.method, headers, ...(again ? {} : { agent: false }) }, (up) => {
+        record.status = up.statusCode ?? 0;
+        // Errors come back whole either way, and pass through as they are.
+        const assemble = record.restreamed && record.status === 200;
+        const out: Record<string, string | string[]> = {};
+        for (const [name, value] of Object.entries(up.headers)) {
+          if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
+        }
+        if (!assemble) res.writeHead(record.status, out);
+        // An error's body says why: keep its start.
+        let errorBody = '';
+        up.on('data', (chunk: Buffer) => {
+          response.write(chunk);
+          if (!assemble) res.write(chunk);
+          if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
+        });
+        up.on('end', () => {
+          if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
+        });
+        up.on('end', () => {
+          response.end();
+          if (assemble) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(response.assembled()));
+          else res.end();
+          finish();
+        });
+        up.on('error', (err) => {
+          res.destroy();
+          finish(err.message);
+        });
       });
-      up.on('end', () => {
-        if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
-      });
-      up.on('end', () => {
-        response.end();
-        if (assemble) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(response.assembled()));
-        else res.end();
-        finish();
-      });
-      up.on('error', (err) => {
-        res.destroy();
+      upstream.on('error', (err) => {
+        // A kept-alive connection the server closed as the request went out ("socket hang up"):
+        // no answer came, so send it again on a fresh one, once, as Node advises. Failing it
+        // would make it the run's infrastructure error, and the pool would requeue the run.
+        if (again && upstream.reusedSocket && !record.status && !finished) {
+          record.resent = err.message;
+          send(false);
+          return;
+        }
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
+        else res.destroy();
         finish(err.message);
       });
-    });
+      upstream.end(sent);
+    };
     const abort = (reason: string) => {
       upstream.destroy();
       finish(reason);
     };
     sink.live.add(abort);
     sink.inflight.add(record);
-    upstream.on('error', (err) => {
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
-      else res.destroy();
-      finish(err.message);
-    });
     // The harness gave up on this request (its own timeout, or it was killed): free the slot.
     res.on('close', () => {
       if (!res.writableFinished) {
@@ -327,7 +342,7 @@ export class MeteringProxy {
         finish('aborted: client disconnected');
       }
     });
-    upstream.end(sent);
+    send(true);
   }
 }
 

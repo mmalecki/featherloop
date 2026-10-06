@@ -146,7 +146,11 @@ are stopped and go back on the front of the queue; it joins again once it passes
 from the command's output takes no new runs, but finishes those it has. A run whose
 requests hit infrastructure errors (any, as `--rerun-api-errors` counts them, even if the
 harness got past them) goes back on the queue too, for another server if one is free, up
-to 3 attempts; the last stands, whatever it is. Its server is checked at once, and leaves
+to 3 attempts; the last stands, whatever it is. (One kind isn't counted: a request whose
+kept-alive connection the server had closed, "socket hang up" before any answer, which
+the proxy sends again, once, on a new connection, and marks `resent`. llama.cpp closes them
+now and then, and runs with many requests would otherwise use up their attempts on it,
+and drop out of the results more often than short ones.) Its server is checked at once, and leaves
 at the first failed check: a dead server refuses connections fast enough to fail run
 after run. A requeued attempt isn't graded or counted: its directory is kept as
 `<case>-r<rep>.replaced`, with a `requeued.json` that says why, and `meta.json` lists the
