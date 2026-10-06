@@ -172,6 +172,17 @@ credentials (see [Isolation](#isolation)).
 A hosted API is one server, taken as it is (no health checks), 1 run at a time unless `-j`
 says otherwise; `--servers-cmd` is for llama.cpp.
 
+`results/` is in no git and on no other machine: a bench box that goes away takes its
+transcripts with it. `--sync-cmd "<command>"` copies the results directory (its `$1`)
+somewhere that outlives it, when the bench starts, every `--sync-every` seconds (300)
+and once more at the end, summary included; a rerun copies where the run it reruns did.
+For a bucket:
+
+    --sync-cmd 'gcloud storage rsync --recursive "$1" gs://<bucket>/results/$(basename "$1")'
+
+A copy that fails is said, with where the results still are, and the bench goes on; it
+exits non-zero if the last one failed.
+
 ## Isolation
 
 Each run gets a fresh temporary directory with its own `HOME`, `XDG_CONFIG_HOME`,
