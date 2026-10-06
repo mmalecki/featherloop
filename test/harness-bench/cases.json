@@ -133,6 +133,33 @@
         "javascript/resistor-color-trio",
         "javascript/say"
       ]
+    },
+    "hard-9b": {
+      "description": [
+        "The cases Qwen3.5 9B failed at least once in the first round (2026-10-04), on which the second round compared prompts A/B/C, 3 reps each (reports/2026-10-05.md). Hard for a 9B: expect about half to pass.",
+        "Picked from failures, so a fresh run regresses to the mean: compare arms run together, not with the round that picked them."
+      ],
+      "cases": [
+        "python/book-store",
+        "python/bowling",
+        "python/connect",
+        "python/dominoes",
+        "python/forth",
+        "python/hangman",
+        "python/paasio",
+        "python/poker",
+        "python/pov",
+        "python/react",
+        "python/rest-api",
+        "python/robot-name",
+        "python/scale-generator",
+        "python/sgf-parsing",
+        "python/transpose",
+        "javascript/book-store",
+        "javascript/bowling",
+        "javascript/complex-numbers",
+        "javascript/connect"
+      ]
     }
   }
 }

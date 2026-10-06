@@ -198,6 +198,8 @@ holds the sets and why they are what they are:
 
 - `all` (default): all 82 Python and JavaScript exercises that grade correctly.
 - `quick`: 30 of the easier ones, for iterating.
+- `hard-9b`: the 19 the 9B failed at least once in the first round, on which prompts are
+  compared.
 
 Each run's workspace is the exercise's stub, tests and support files (never `.meta`,
 `.docs` or `.approaches`), committed to a fresh git repository. Jest's skipped tests are
