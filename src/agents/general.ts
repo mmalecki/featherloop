@@ -8,5 +8,7 @@ import { defineAgent } from '../agent.ts';
 export const generalAgent = defineAgent({
   name: 'general',
   description: 'General-purpose assistant',
-  system: ({ date, cwd }) => `Concise assistant. Today is ${date}. cwd: ${cwd}`,
+  system: ({ date, cwd }) =>
+    `Concise assistant. Today is ${date}. cwd: ${cwd}\n` +
+    "Change code with update, a few lines at a time, and keep what already passes; don't rewrite whole files.",
 });
