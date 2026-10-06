@@ -453,6 +453,7 @@ async function runJob({ job: { harness, c, rep }, attempt, final, server, signal
     unparsedToolCalls: records.filter((record) => record.unparsedToolCall).length,
     unknownToolCalls: records.reduce((total, record) => total + record.unknownTools.length, 0),
     lengthStops: records.filter((record) => record.finish === 'length' || record.finish === 'max_tokens').length,
+    resends: records.filter((record) => record.resent).length,
     reasoningChars: records.reduce((total, record) => total + record.reasoningChars, 0),
     linesAdded: changed.files.reduce((total, file) => total + file.added, 0),
     linesRemoved: changed.files.reduce((total, file) => total + file.removed, 0),

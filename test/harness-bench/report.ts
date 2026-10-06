@@ -50,6 +50,8 @@ export interface RunResult {
   unknownToolCalls: number;
   /** Responses cut off by the output limit. */
   lengthStops: number;
+  /** Requests the proxy sent again after a closed kept-alive connection; results from before don't say. */
+  resends?: number;
   reasoningChars: number;
   linesAdded: number;
   linesRemoved: number;
@@ -128,6 +130,7 @@ export interface HarnessSummary {
   unparsedToolCalls: number;
   unknownToolCalls: number;
   lengthStops: number;
+  resends: number;
   apiErrors: number;
   tamperedRuns: number;
   sawCacheRuns: number;
@@ -213,6 +216,7 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     unparsedToolCalls: total((run) => run.unparsedToolCalls),
     unknownToolCalls: total((run) => run.unknownToolCalls),
     lengthStops: total((run) => run.lengthStops),
+    resends: total((run) => run.resends ?? 0),
     apiErrors: total((run) => run.apiErrors),
     tamperedRuns: runs.filter((run) => run.tampered.length).length,
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
@@ -308,6 +312,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('Calls to tools not offered', (s) => String(s.unknownToolCalls)),
     row('Output cut off at limit', (s) => String(s.lengthStops)),
     row('API errors', (s) => String(s.apiErrors)),
+    row('Requests resent after a closed connection', (s) => String(s.resends)),
     row('Runs that changed the tests', (s) => String(s.tamperedRuns)),
     row('Runs that reached the bench cache', (s) => String(s.sawCacheRuns)),
     row('Web fetches / run', (s) => (s.fetches === null ? '–' : s.fetches.toFixed(2))),
