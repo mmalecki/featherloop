@@ -7,7 +7,7 @@ import { hardcodedAnswers } from './guards.ts';
 import { HARNESSES } from './harnesses.ts';
 import { abortedByBench, infrastructureError, type RequestRecord } from './proxy.ts';
 import type { RunResult } from './report.ts';
-import { lastReasoning, readTranscript, toolResults as transcriptResults, webFetches } from './transcript.ts';
+import { lastReasoning, readTranscript, toolCalls, toolResults as transcriptResults, webFetches } from './transcript.ts';
 
 /**
  * Why runs failed, and how harnesses differ where they disagree: failure modes,
@@ -42,6 +42,9 @@ const LONG_MS = 5 * 60_000;
 const EDITS = new Set(['write', 'edit', 'update', 'apply_patch', 'multiedit']);
 const TEST_RESULT = /\d+ (passed|failed)|^Tests:/m;
 const TEST_FAILED = /\d+ failed|^Tests:.*failed/m;
+/** A shell command that runs the tests, and one whose output is cut to its start or end. */
+const TEST_COMMAND = /pytest|jest|npm (run )?test|node --test/;
+const CUT = /\|\s*(head|tail)\b/;
 
 interface Run extends RunResult {
   /** Its column: the harness, or `<label>:<harness>` across directories. */
@@ -185,6 +188,30 @@ table(
   }),
 );
 
+section(
+  'Iterating',
+  'Tests passing at each test run, and what moved them: does a run build on what passes, or lose it? Fell: a test run passing fewer than the one before. Lost: runs whose last test run passed fewer than their best. Rewrites: whole-file writes to a file already written, once some tests passed. Cut: test commands piped through head or tail, which can hide the failures and the summary.',
+);
+table(
+  ['', 'runs with 2+ test runs', 'fell / run', 'lost', 'best − last, median', 'rewrites / run', 'cut test commands'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column).map(iteration);
+    const iterating = own.filter((run) => run.passing.length >= 2);
+    const lost = iterating.filter((run) => Math.max(...run.passing) > run.passing.at(-1)!);
+    const tests = own.reduce((sum, run) => sum + run.testCommands, 0);
+    const cut = own.reduce((sum, run) => sum + run.cutTestCommands, 0);
+    return [
+      column,
+      String(iterating.length),
+      (iterating.reduce((sum, run) => sum + run.fell, 0) / (iterating.length || 1)).toFixed(1),
+      String(lost.length),
+      fmt(quantile(lost.map((run) => Math.max(...run.passing) - run.passing.at(-1)!), 0.5)),
+      (own.reduce((sum, run) => sum + run.rewrites, 0) / (own.length || 1)).toFixed(1),
+      `${cut} of ${tests} (${pct(cut / (tests || 1))})`,
+    ];
+  }),
+);
+
 section('Long responses', `Responses over ${LONG_MS / 60_000} minutes, and the share of timed-out runs' time they took.`);
 table(
   ['', 'count', 'share of timed-out time', 'longest finished response, median (min)'],
@@ -317,6 +344,49 @@ function classify(run: Run): string {
 
 function toolResults(run: Run): string[] {
   return transcriptResults(readTranscript(run.dir));
+}
+
+/** How a run iterated: tests passing at each test run, in order, and the moves around them (see the section). */
+function iteration(run: Run): { passing: number[]; fell: number; rewrites: number; testCommands: number; cutTestCommands: number } {
+  const transcript = readTranscript(run.dir);
+  // Calls and their results line up; the last response's calls have none.
+  const calls = toolCalls(transcript);
+  const results = transcriptResults(transcript);
+  const passing: number[] = [];
+  const written = new Set<string>();
+  let rewrites = 0;
+  let testCommands = 0;
+  let cutTestCommands = 0;
+  calls.forEach((call, i) => {
+    const command = String(call.args.command ?? call.args.cmd ?? '');
+    if (TEST_COMMAND.test(command)) {
+      testCommands++;
+      if (CUT.test(command)) cutTestCommands++;
+    }
+    // By name: a harness may give the same file relative or absolute.
+    const path = basename(String(call.args.path ?? call.args.filePath ?? call.args.file_path ?? ''));
+    if (call.name === 'write' && path) {
+      if (written.has(path) && passing.some((count) => count > 0)) rewrites++;
+      written.add(path);
+    } else if (EDITS.has(call.name) && path) written.add(path);
+    const result = results[i];
+    const passed = result === undefined ? undefined : passingTests(result);
+    if (passed !== undefined) passing.push(passed);
+  });
+  const fell = passing.filter((count, i) => i > 0 && count < passing[i - 1]!).length;
+  return { passing, fell, rewrites, testCommands, cutTestCommands };
+}
+
+/**
+ * Tests passing in a test run's output: pytest's or Jest's summary line, or, when the
+ * output was cut before it, the per-test lines (pytest -v's PASSED, Jest's ✓).
+ */
+function passingTests(result: string): number | undefined {
+  const summary = /^(?:Tests:.*|=+ .*(?:passed|failed).* =+)$/m.exec(result)?.[0];
+  if (summary) return Number(/(\d+) passed/.exec(summary)?.[1] ?? 0);
+  const passed = (result.match(/ PASSED\b|^\s*✓ /gm) ?? []).length;
+  const failed = (result.match(/ FAILED\b|^\s*✕ /gm) ?? []).length;
+  return passed + failed ? passed : undefined;
 }
 
 function repetition(text: string): number {
