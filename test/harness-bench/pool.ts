@@ -11,10 +11,16 @@ import { basename } from 'node:path';
  * its runs go back on the queue, as do runs that hit infrastructure errors.
  */
 
-/** What the pool compares servers on, so results stay comparable: the model file and llama.cpp's build. */
+/** What the pool compares servers on, so results stay comparable: the model file, llama.cpp's build, and its settings. */
 export interface Reference {
   model: string | null;
   build: string | null;
+  /**
+   * What else changes what a run does: the server's default sampling, context, chat
+   * template, and the model file's size. Only the keys the reference has are compared,
+   * so reruns of results from before it still match.
+   */
+  settings?: Record<string, unknown>;
 }
 
 /** What a health check found: healthy or not, and llama.cpp's `/props` when it answers them. */
@@ -22,7 +28,7 @@ export interface Health {
   ok: boolean;
   /** Why not. */
   why?: string;
-  props?: { modelPath?: string; build?: string; slots?: number };
+  props?: { modelPath?: string; build?: string; slots?: number; settings?: Record<string, unknown> };
 }
 
 export interface Server {
@@ -257,8 +263,12 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
     server.failures = 0;
     const found = reference(health);
     const expected = (this.reference ??= found);
-    if (found.model !== expected.model || found.build !== expected.build) {
-      const why = `serves ${found.model} (build ${found.build}), not the pool's ${expected.model} (build ${expected.build})`;
+    const settings = differences(found.settings, expected.settings);
+    if (found.model !== expected.model || found.build !== expected.build || settings.length) {
+      const why =
+        found.model !== expected.model || found.build !== expected.build
+          ? `serves ${found.model} (build ${found.build}), not the pool's ${expected.model} (build ${expected.build})`
+          : `set up otherwise than the pool: ${settings.join(', ')}`;
       if (server.state !== 'refused' || server.why !== why) log(`refused: ${why}`);
       if (server.state !== 'refused') server.changed = this.#tick();
       server.state = 'refused';
@@ -276,9 +286,21 @@ export class ServerPool extends EventEmitter<{ join: [Server]; lost: [Server]; c
   }
 }
 
-/** What a healthy server serves: its model file, wherever it is, and build. */
+/** What a healthy server serves: its model file, wherever it is, build and settings. */
 function reference(health: Health): Reference {
-  return { model: health.props?.modelPath ? basename(health.props.modelPath) : null, build: health.props?.build ?? null };
+  return {
+    model: health.props?.modelPath ? basename(health.props.modelPath) : null,
+    build: health.props?.build ?? null,
+    ...(health.props?.settings ? { settings: health.props.settings } : {}),
+  };
+}
+
+/** A server's settings that differ from the reference's, each as `key value (pool: value)`; only the reference's keys count. */
+function differences(found: Record<string, unknown> | undefined, expected: Record<string, unknown> | undefined): string[] {
+  if (!expected) return [];
+  return Object.entries(expected)
+    .filter(([key, value]) => JSON.stringify(found?.[key]) !== JSON.stringify(value))
+    .map(([key, value]) => `${key} ${JSON.stringify(found?.[key])} (pool: ${JSON.stringify(value)})`);
 }
 
 /** One go at a job, on a server. */

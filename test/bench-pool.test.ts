@@ -264,6 +264,32 @@ describe('ServerPool and WorkQueue', () => {
     );
   });
 
+  test('servers set up otherwise are refused, saying how; a reference without settings compares none', async () => {
+    const set = (settings: Record<string, unknown>) => ({ ...props(1), settings });
+    const stock = { temperature: 0.6, presence_penalty: 0, chat_template: 'abc' };
+    const { pool: p, lines } = pool({
+      a: { ok: true, props: set(stock) },
+      b: { ok: true, props: set(stock) },
+      c: { ok: true, props: set({ ...stock, presence_penalty: 1.5 }) },
+      d: { ok: true, props: set({ temperature: 0.6, chat_template: 'abc' }) },
+    });
+    await p.start();
+    assert.deepEqual(
+      p.up().map((server) => server.url),
+      ['a', 'b'],
+    );
+    assert.ok(lines.includes('server c: refused: set up otherwise than the pool: presence_penalty 1.5 (pool: 0)'));
+    assert.ok(lines.includes('server d: refused: set up otherwise than the pool: presence_penalty undefined (pool: 0)'));
+
+    // A rerun of results from before settings were recorded.
+    const { pool: old } = pool({ a: { ok: true, props: set(stock) }, c: { ok: true, props: set({ ...stock, presence_penalty: 1.5 }) } }, { reference: { model: 'qwen.gguf', build: 'b1' } });
+    await old.start();
+    assert.deepEqual(
+      old.up().map((server) => server.url),
+      ['a', 'c'],
+    );
+  });
+
   test('a server that is loading joins once it is healthy', async () => {
     const servers: Record<string, Check> = { a: { ok: false, why: 'HTTP 503' } };
     const { pool: p } = pool(servers);

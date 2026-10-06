@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
@@ -86,6 +87,8 @@ const ATTEMPTS = 3;
 /** How often the pool checks its servers' health, and how long a check may take: two failed in a row and a server is out. */
 const HEALTH_EVERY_MS = 10_000;
 const PROBE_TIMEOUT_MS = 10_000;
+/** The server defaults the report shows: llama.cpp's samplers that change what a model writes. */
+const SAMPLING_SHOWN = ['temperature', 'top_k', 'top_p', 'min_p', 'presence_penalty', 'frequency_penalty', 'repeat_penalty', 'dry_multiplier', 'xtc_probability', 'typical_p', 'top_n_sigma', 'mirostat'];
 
 const rerun = argv.rerunApiErrors === undefined ? undefined : rerunTargets(argv.rerunApiErrors);
 // Results from before models.json are all on the default model.
@@ -189,7 +192,16 @@ const pool = new ServerPool({
   probe: hosted ? async () => ({ ok: true }) : probe,
   checkEvery: hosted ? Infinity : HEALTH_EVERY_MS,
   ...(argv.jobs !== undefined ? { jobs: argv.jobs } : hosted ? { jobs: 1 } : {}),
-  ...(rerun?.meta.server?.modelPath ? { reference: { model: basename(rerun.meta.server.modelPath), build: rerun.meta.server.build ?? null } } : {}),
+  ...(rerun?.meta.server?.modelPath
+    ? {
+        reference: {
+          model: basename(rerun.meta.server.modelPath),
+          build: rerun.meta.server.build ?? null,
+          // Results from before the pool compared settings have none: those reruns check model and build only.
+          ...(rerun.meta.server.settings ? { settings: rerun.meta.server.settings } : {}),
+        },
+      }
+    : {}),
   log: (line) => console.error(line),
 });
 await pool.start();
@@ -609,10 +621,26 @@ async function serverInfo(baseURL: string): Promise<Record<string, unknown>> {
     modelPath: props?.model_path,
     slots: props?.total_slots,
     defaults: props?.default_generation_settings?.params
-      ? Object.fromEntries(
-          ['temperature', 'top_k', 'top_p', 'min_p', 'presence_penalty', 'repeat_penalty'].map((key) => [key, props.default_generation_settings.params[key]]),
-        )
+      ? Object.fromEntries(SAMPLING_SHOWN.map((key) => [key, props.default_generation_settings.params[key]]).filter(([, value]) => value !== undefined))
       : undefined,
+    settings: props ? serverSettings(props, models) : undefined,
+  };
+}
+
+/**
+ * What a llama.cpp server is set to, beyond model and build, that changes what runs do,
+ * for the pool to compare servers on: every default sampling setting, the context, a hash
+ * of the chat template, and the model file's size and parameters (a file re-uploaded under
+ * the same name, as a VM made later downloads it, differs in those).
+ */
+function serverSettings(props: Record<string, any>, models: { data?: { meta?: any }[] } | undefined): Record<string, unknown> {
+  const meta = models?.data?.[0]?.meta;
+  return {
+    ...props.default_generation_settings?.params,
+    n_ctx: props.default_generation_settings?.n_ctx,
+    chat_template: createHash('sha256').update(String(props.chat_template ?? '')).digest('hex').slice(0, 12),
+    model_size: meta?.size,
+    model_params: meta?.n_params,
   };
 }
 
@@ -639,7 +667,10 @@ async function probe(url: string): Promise<Health> {
   const props = await get(`${root}/props`, {}, PROBE_TIMEOUT_MS);
   const json = props.status === 200 ? (tryParse(props.body) as Record<string, any> | undefined) : undefined;
   if (!json) return { ok: false, why: `/props: ${props.error ?? `HTTP ${props.status}`}` };
-  return { ok: true, props: { modelPath: json.model_path, build: json.build_info, slots: json.total_slots } };
+  const models = await get(`${root}/v1/models`, {}, PROBE_TIMEOUT_MS);
+  const list = models.status === 200 ? (tryParse(models.body) as { data?: { meta?: unknown }[] } | undefined) : undefined;
+  if (!list) return { ok: false, why: `/v1/models: ${models.error ?? `HTTP ${models.status}`}` };
+  return { ok: true, props: { modelPath: json.model_path, build: json.build_info, slots: json.total_slots, settings: serverSettings(json, list) } };
 }
 
 async function getJson(url: string, headers: Record<string, string> = {}): Promise<unknown> {

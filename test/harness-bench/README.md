@@ -129,9 +129,13 @@ line, which the bench runs again every `--servers-every` seconds (60): servers j
 leave as its output changes. A command that fails leaves the pool as it was.
 
 A server joins once `/health` answers 200 (llama.cpp answers 503 while it loads the model)
-and `/props` names the same model file and build as the rest: what most of the first
-servers serve or, for `--rerun-api-errors`, what the run it reruns did, so results stay
-comparable. Others are refused, and the bench says why. Each server takes as many runs at
+and `/props` names the same model file and build as the rest, set up the same: every
+default sampling setting, the context, the chat template (hashed) and, from `/v1/models`,
+the model file's size and parameters (a VM made later may download a file re-uploaded
+under the same name). The reference is what most of the first servers have or, for
+`--rerun-api-errors`, what the run it reruns recorded in `meta.json` (`server.settings`;
+results from before have none, and are compared on model and build). Others are refused,
+and the bench says which settings differ. Each server takes as many runs at
 once as it has slots (`total_slots`), or `-j` if that's fewer: `-j` is per server. One
 queue feeds them all, in order, and whichever server has a free slot takes the next run.
 Result rows, and `meta.json`'s `servers`, say which server ran what.
@@ -261,8 +265,9 @@ Both are recorded in `meta.json`, so reruns match.
 
 - Wall clock depends on load. Jobs are ordered case by case, harness by harness, so with
   as many slots as harnesses (4) each case's runs share a server at once.
-- The pool checks its servers' model and build, not their hardware: a slower GPU gets less
-  done before the timeout. Make a pool's servers from one template.
+- The pool checks its servers' model, build and settings, not their hardware or the KV
+  cache's size (`-c`, which `/props` doesn't report): a slower GPU gets less done before
+  the timeout, and a smaller cache overflows sooner. Make a pool's servers from one template.
 - The timeout and `-j` are coupled: busy slots share the GPU, so each run generates more
   slowly. Measured on short prompts: 59 tokens/s alone, 38 per stream with 4 at once
   (141 in all, 2.7× the throughput); long contexts slow it further. A run gets less done
