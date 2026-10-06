@@ -20,7 +20,8 @@ npm -g i featherloop
 ```
 
 ## Usage
-Featherloop still needs to be configured with your model preferances. Here's a minimalistic example:
+Featherloop still needs to be configured with your model preferances. Here's a minimalistic configuration example that gets you
+talking to Sonnet 5.5, if you pass it an `ANTHROPIC_API_KEY`.
 
 ```yaml
 
@@ -39,19 +40,9 @@ provider:
         variants: *high_effort
       # Takes no effort setting.
       claude-haiku-4-5: {}
-  local:
-    flavor: openai
-    options:
-      baseURL: http://127.0.0.1:9931/v1
-    models: *models
-  framework:
-    flavor: openai
-    options:
-      baseURL: http://framework.sledzie:9931/v1
-    models: *models
 
 aliases:
-  advisor: anthropic/claude-opus-5-5
+  advisor: anthropic/claude-sonnet-5-5
 
 ```
 
