@@ -160,6 +160,23 @@
         "javascript/complex-numbers",
         "javascript/connect"
       ]
+    },
+    "hard-9b-mid": {
+      "description": [
+        "The 9 cases of hard-9b whose pass rate was neither near 0 nor near 1 across the 228 runs of 2026-10-06 (between 0.1 and 0.9): the ones a change can move either way. The rest of hard-9b passed nearly always or never, and added noise but no information.",
+        "Picked on those rates, so a fresh run regresses toward 0 or 1: compare arms run together."
+      ],
+      "cases": [
+        "python/book-store",
+        "python/connect",
+        "python/forth",
+        "python/paasio",
+        "python/pov",
+        "python/react",
+        "python/transpose",
+        "javascript/book-store",
+        "javascript/complex-numbers"
+      ]
     }
   }
 }
