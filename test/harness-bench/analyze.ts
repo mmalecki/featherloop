@@ -7,7 +7,7 @@ import { hardcodedAnswers } from './guards.ts';
 import { HARNESSES } from './harnesses.ts';
 import { abortedByBench, infrastructureError, type RequestRecord } from './proxy.ts';
 import type { RunResult } from './report.ts';
-import { lastReasoning, readTranscript, toolResults as transcriptResults, webFetches } from './transcript.ts';
+import { lastReasoning, readTranscript, toolCalls, toolResults as transcriptResults, webFetches } from './transcript.ts';
 
 /**
  * Why runs failed, and how harnesses differ where they disagree: failure modes,
@@ -42,6 +42,14 @@ const LONG_MS = 5 * 60_000;
 const EDITS = new Set(['write', 'edit', 'update', 'apply_patch', 'multiedit']);
 const TEST_RESULT = /\d+ (passed|failed)|^Tests:/m;
 const TEST_FAILED = /\d+ failed|^Tests:.*failed/m;
+/** A shell command that runs the tests, and one whose output is cut to its start or end. */
+const TEST_COMMAND = /pytest|jest|npm (run )?test|node --test/;
+const CUT = /\|\s*(head|tail)\b/;
+/** The repeat sensor's note in a shell result, and how many shell calls after it count as doing the same again. */
+const REPEAT_NOTE = /\[Same output as (the previous run|\d+ runs ago)\]/;
+const REPEAT_LOOKAHEAD = 3;
+/** featherloop's events (background work reporting), which aren't the user speaking. */
+const EVENT = /^\[Event, not from the user\]/;
 
 interface Run extends RunResult {
   /** Its column: the harness, or `<label>:<harness>` across directories. */
@@ -108,6 +116,31 @@ for (const [i, a] of columns.entries()) {
   }
 }
 table(['', 'wins', 'p'], pairs);
+
+section(
+  'Test score',
+  'The share of its tests a run passed at the end, averaged: partial credit, so a run that gets 29 of 31 counts for more than one that gets 3. Differences between columns: a stratified permutation test, shuffling runs between the two columns within each case, so case mix cancels out.',
+);
+const score = (run: Run) => (run.tests.total ? run.tests.passed / run.tests.total : 0);
+table(
+  ['', 'runs', 'mean score'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column);
+    return [column, String(own.length), pct(own.reduce((sum, run) => sum + score(run), 0) / (own.length || 1))];
+  }),
+);
+const scorePairs: string[][] = [];
+for (const [i, a] of columns.entries()) {
+  for (const b of columns.slice(i + 1)) {
+    const { diff, p } = permutationTest(
+      clean.filter((run) => run.column === a),
+      clean.filter((run) => run.column === b),
+      score,
+    );
+    scorePairs.push([`${a} vs ${b}`, `${diff >= 0 ? '+' : ''}${(100 * diff).toFixed(1)} points`, p.toFixed(3)]);
+  }
+}
+table(['', 'second minus first', 'p'], scorePairs);
 
 section('Split cases', 'Cases some columns passed and others failed, with how each failure ended.');
 const split: string[][] = [];
@@ -181,6 +214,50 @@ table(
       fmt(quantile(next, 0.5)),
       pct(next.filter((chars) => chars > LONG_CHARS).length / (next.length || 1)),
       `${fmt(quantile(sizes, 0.5))} / ${fmt(quantile(sizes, 0.9))}`,
+    ];
+  }),
+);
+
+section(
+  'Iterating',
+  'Tests passing at each test run, and what moved them: does a run build on what passes, or lose it? Fell: a test run passing fewer than the one before. Lost: runs whose last test run passed fewer than their best. Rewrites: whole-file writes to a file already written, once some tests passed. Cut: test commands piped through head or tail, which can hide the failures and the summary.',
+);
+table(
+  ['', 'runs with 2+ test runs', 'fell / run', 'lost', 'best − last, median', 'rewrites / run', 'cut test commands'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column).map(iteration);
+    const iterating = own.filter((run) => run.passing.length >= 2);
+    const lost = iterating.filter((run) => Math.max(...run.passing) > run.passing.at(-1)!);
+    const tests = own.reduce((sum, run) => sum + run.testCommands, 0);
+    const cut = own.reduce((sum, run) => sum + run.cutTestCommands, 0);
+    return [
+      column,
+      String(iterating.length),
+      (iterating.reduce((sum, run) => sum + run.fell, 0) / (iterating.length || 1)).toFixed(1),
+      String(lost.length),
+      fmt(quantile(lost.map((run) => Math.max(...run.passing) - run.passing.at(-1)!), 0.5)),
+      (own.reduce((sum, run) => sum + run.rewrites, 0) / (own.length || 1)).toFixed(1),
+      `${cut} of ${tests} (${pct(cut / (tests || 1))})`,
+    ];
+  }),
+);
+
+section(
+  'Repeats',
+  `Notes: shell results saying "[Same output as …]", the repeat sensor. Again: notes after which the model ran the same command again within its next ${REPEAT_LOOKAHEAD} shell calls, still doing what didn't work. Mid-run: user messages after the task that aren't the harness's events (a nudge, if one runs).`,
+);
+table(
+  ['', 'notes / run', 'runs with any', 'again', 'mid-run user messages / run'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column).map(repeats);
+    const notes = own.reduce((sum, run) => sum + run.notes, 0);
+    const again = own.reduce((sum, run) => sum + run.again, 0);
+    return [
+      column,
+      (notes / (own.length || 1)).toFixed(1),
+      String(own.filter((run) => run.notes).length),
+      `${again} of ${notes} (${pct(again / (notes || 1))})`,
+      (own.reduce((sum, run) => sum + run.userMessages, 0) / (own.length || 1)).toFixed(1),
     ];
   }),
 );
@@ -319,9 +396,109 @@ function toolResults(run: Run): string[] {
   return transcriptResults(readTranscript(run.dir));
 }
 
+/** How a run iterated: tests passing at each test run, in order, and the moves around them (see the section). */
+function iteration(run: Run): { passing: number[]; fell: number; rewrites: number; testCommands: number; cutTestCommands: number } {
+  const transcript = readTranscript(run.dir);
+  // Calls and their results line up; the last response's calls have none.
+  const calls = toolCalls(transcript);
+  const results = transcriptResults(transcript);
+  const passing: number[] = [];
+  const written = new Set<string>();
+  let rewrites = 0;
+  let testCommands = 0;
+  let cutTestCommands = 0;
+  calls.forEach((call, i) => {
+    const command = String(call.args.command ?? call.args.cmd ?? '');
+    if (TEST_COMMAND.test(command)) {
+      testCommands++;
+      if (CUT.test(command)) cutTestCommands++;
+    }
+    // By name: a harness may give the same file relative or absolute.
+    const path = basename(String(call.args.path ?? call.args.filePath ?? call.args.file_path ?? ''));
+    if (call.name === 'write' && path) {
+      if (written.has(path) && passing.some((count) => count > 0)) rewrites++;
+      written.add(path);
+    } else if (EDITS.has(call.name) && path) written.add(path);
+    const result = results[i];
+    const passed = result === undefined ? undefined : passingTests(result);
+    if (passed !== undefined) passing.push(passed);
+  });
+  const fell = passing.filter((count, i) => i > 0 && count < passing[i - 1]!).length;
+  return { passing, fell, rewrites, testCommands, cutTestCommands };
+}
+
+/** The repeat sensor's notes in a run, how often the noted command ran again soon after, and the user messages after the task. */
+function repeats(run: Run): { notes: number; again: number; userMessages: number } {
+  const transcript = readTranscript(run.dir);
+  const calls = toolCalls(transcript);
+  const results = transcriptResults(transcript);
+  const shell = calls.map((call, i) => ({ command: String(call.args.command ?? call.args.cmd ?? '').trim(), result: results[i] })).filter((call) => call.command);
+  let notes = 0;
+  let again = 0;
+  shell.forEach((call, i) => {
+    if (call.result === undefined || !REPEAT_NOTE.test(call.result)) return;
+    notes++;
+    if (shell.slice(i + 1, i + 1 + REPEAT_LOOKAHEAD).some((next) => next.command === call.command)) again++;
+  });
+  const users = (transcript?.request.messages ?? []).filter((message: { role: string }) => message.role === 'user');
+  const userMessages = users.slice(1).filter((message: { content: unknown }) => !EVENT.test(typeof message.content === 'string' ? message.content : '')).length;
+  return { notes, again, userMessages };
+}
+
+/**
+ * Tests passing in a test run's output: pytest's or Jest's summary line, or, when the
+ * output was cut before it, the per-test lines (pytest -v's PASSED, Jest's ✓).
+ */
+function passingTests(result: string): number | undefined {
+  const summary = /^(?:Tests:.*|=+ .*(?:passed|failed).* =+)$/m.exec(result)?.[0];
+  if (summary) return Number(/(\d+) passed/.exec(summary)?.[1] ?? 0);
+  const passed = (result.match(/ PASSED\b|^\s*✓ /gm) ?? []).length;
+  const failed = (result.match(/ FAILED\b|^\s*✕ /gm) ?? []).length;
+  return passed + failed ? passed : undefined;
+}
+
 function repetition(text: string): number {
   const lines = text.split('\n').map((line) => line.trim()).filter((line) => line.length > 20);
   return lines.length ? 1 - new Set(lines).size / lines.length : 0;
+}
+
+/**
+ * How much higher `b`'s mean is than `a`'s, and how often shuffling each case's runs
+ * between the two does as well (two-sided): runs of a case are exchangeable if the
+ * columns don't differ, so case mix can't make a difference. Seeded: the same results
+ * give the same p.
+ */
+function permutationTest(a: Run[], b: Run[], value: (run: Run) => number, rounds = 10_000): { diff: number; p: number } {
+  const cases = [...new Set([...a, ...b].map((run) => run.case))];
+  const groups = cases.map((c) => ({
+    values: [...a, ...b].filter((run) => run.case === c).map(value),
+    size: a.filter((run) => run.case === c).length,
+  }));
+  const mean = (values: number[]) => values.reduce((sum, v) => sum + v, 0) / (values.length || 1);
+  const statistic = (split: { first: number[]; second: number[] }[]) =>
+    mean(split.flatMap((g) => g.second)) - mean(split.flatMap((g) => g.first));
+  const observed = statistic(groups.map((g) => ({ first: g.values.slice(0, g.size), second: g.values.slice(g.size) })));
+  // mulberry32: a small seeded generator.
+  let seed = 0x9e3779b9;
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  let extreme = 0;
+  for (let round = 0; round < rounds; round++) {
+    const split = groups.map((g) => {
+      const values = [...g.values];
+      for (let i = values.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        [values[i], values[j]] = [values[j]!, values[i]!];
+      }
+      return { first: values.slice(0, g.size), second: values.slice(g.size) };
+    });
+    if (Math.abs(statistic(split)) >= Math.abs(observed) - 1e-12) extreme++;
+  }
+  return { diff: observed, p: (extreme + 1) / (rounds + 1) };
 }
 
 function signTest(a: number, b: number): number {

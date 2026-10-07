@@ -65,11 +65,14 @@ to the copied configs and passes it to every harness, so all four run the same m
 with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server, and
 `--servers-cmd` at several (see [Servers](#servers)).
 
-A sampling setting gets a model of its own, on the same server: `qwen3.5-9b-presence`
-(`presence_penalty` 1.5, Qwen's setting against circular thinking) and `qwen3.5-9b-dry`
-(llama.cpp's DRY sampler) send theirs from featherloop's default variant, so the server
-keeps its defaults for every other arm. Only featherloop sends them; the report lists
-each harness's fields under "Sampling settings sent".
+Qwen models run with `presence_penalty` 1.5, Qwen's setting against circular thinking:
+without it the 9B ended a quarter of its hard-set runs in one response repeating itself
+(reports/2026-10-06.md). `qwen3.5-9b` sends it from featherloop's default variant, so it
+holds whatever the server defaults to. Other sampling gets a model of its own, on the same
+server: `qwen3.5-9b-nopenalty` (`presence_penalty` 0, as runs before 2026-10-06 had) and
+`qwen3.5-9b-dry` (llama.cpp's DRY sampler, penalty 0) send theirs the same way;
+`qwen3.5-9b-presence` is `qwen3.5-9b` under its earlier name, for reruns. Only featherloop
+sends them; the report lists each harness's fields under "Sampling settings sent".
 
 Benches on different models can run at once, from separate checkouts (e.g. a git
 worktree): each has its own proxy, temporary homes and results. Don't edit the checkout
@@ -172,6 +175,17 @@ credentials (see [Isolation](#isolation)).
 A hosted API is one server, taken as it is (no health checks), 1 run at a time unless `-j`
 says otherwise; `--servers-cmd` is for llama.cpp.
 
+`results/` is in no git and on no other machine: a bench box that goes away takes its
+transcripts with it. `--sync-cmd "<command>"` copies the results directory (its `$1`)
+somewhere that outlives it, when the bench starts, every `--sync-every` seconds (300)
+and once more at the end, summary included; a rerun copies where the run it reruns did.
+For a bucket:
+
+    --sync-cmd 'gcloud storage rsync --recursive "$1" gs://<bucket>/results/$(basename "$1")'
+
+A copy that fails is said, with where the results still are, and the bench goes on; it
+exits non-zero if the last one failed.
+
 ## Isolation
 
 Each run gets a fresh temporary directory with its own `HOME`, `XDG_CONFIG_HOME`,
@@ -198,6 +212,10 @@ holds the sets and why they are what they are:
 
 - `all` (default): all 82 Python and JavaScript exercises that grade correctly.
 - `quick`: 30 of the easier ones, for iterating.
+- `hard-9b`: the 19 the 9B failed at least once in the first round, on which prompts are
+  compared.
+- `hard-9b-mid`: the 9 of those that pass sometimes, neither nearly always nor never: the
+  ones a change can move.
 
 Each run's workspace is the exercise's stub, tests and support files (never `.meta`,
 `.docs` or `.approaches`), committed to a fresh git repository. Jest's skipped tests are

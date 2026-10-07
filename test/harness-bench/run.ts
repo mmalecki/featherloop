@@ -49,6 +49,12 @@ const argv = await yargs(hideBin(process.argv))
   })
   .option('servers-every', { type: 'number', default: 60, describe: 'Seconds between runs of --servers-cmd' })
   .option('out', { type: 'string', describe: 'Results directory (default: results/<timestamp>)' })
+  .option('sync-cmd', {
+    type: 'string',
+    describe:
+      'A shell command that copies the results directory, its $1, somewhere that outlives this machine (e.g. \'gcloud storage rsync --recursive "$1" gs://<bucket>/results/$(basename "$1")\'): run every --sync-every seconds and once at the end; a failure is said, and the bench goes on',
+  })
+  .option('sync-every', { type: 'number', default: 300, describe: 'Seconds between runs of --sync-cmd' })
   .option('keep', { type: 'boolean', default: false, describe: "Keep each run's temporary home and workspace" })
   .option('list', { type: 'boolean', default: false, describe: 'List the harnesses and cases, and exit' })
   .option('set', { type: 'string', choices: SETS, default: 'all', describe: 'Case set from cases.json' })
@@ -96,6 +102,9 @@ const model = MODELS[rerun ? (rerun.meta.model ?? 'qwen3.5-9b') : argv.model]!;
 // One server, or a command that lists them; a rerun's, unless told otherwise.
 const explicitUpstream = argv.baseUrl ?? process.env.BENCH_UPSTREAM;
 const serversCmd: string | undefined = argv.serversCmd ?? (explicitUpstream === undefined ? rerun?.meta.serversCmd : undefined);
+// A rerun copies its results where the run it reruns did.
+const syncCmd: string | undefined = argv.syncCmd ?? rerun?.meta.syncCmd;
+let syncing: Promise<boolean> | undefined;
 const upstream: string | undefined = serversCmd === undefined ? (explicitUpstream ?? (rerun ? rerun.meta.upstream : model.upstream)) : undefined;
 if (serversCmd !== undefined && model.flavor !== 'openai') throw new Error(`--servers-cmd lists llama.cpp servers; ${model.id} speaks ${model.flavor}`);
 // With a budget, the timeout is only a safety net, which load mustn't reach: 40k tokens at 16 a second (8 runs
@@ -216,6 +225,7 @@ const started = new Date().toISOString();
 const record: Record<string, any> = {
   started,
   ...(serversCmd === undefined ? { upstream } : { serversCmd }),
+  ...(syncCmd ? { syncCmd } : {}),
   server: await serverInfo(first.url),
   servers: [] as { url: string; joined: string; slots: number }[],
   requeues: [] as { run: string; attempt: number; server: string; why: string; at: string }[],
@@ -288,6 +298,9 @@ queue = new WorkQueue(pool, jobs, {
   log: (line) => console.error(line),
 });
 queue.pump();
+// Results only on this machine are lost with it: copy them as they come, from the start, so a command that fails says so at once.
+if (syncCmd) void sync();
+const syncTimer = syncCmd ? setInterval(() => void sync(), argv.syncEvery * 1000) : undefined;
 const { left } = await queue.done;
 pool.stop();
 await proxy.stop();
@@ -297,6 +310,13 @@ else if (left) console.error(`Stopped, ${left} runs not started`);
 // The servers can go: nothing left to run.
 else console.error(`queue drained: ${done} of ${jobs.length} runs done, none in flight`);
 console.log(summarize(out));
+if (syncCmd) {
+  clearInterval(syncTimer);
+  // After any copy in flight, one of everything, the summary included.
+  await syncing;
+  if (await sync()) console.error(`results copied: ${syncCmd}`);
+  else process.exitCode = 1;
+}
 
 /**
  * Runs a harness on a case, on a server, and records the result; or, when the
@@ -643,6 +663,17 @@ function serverSettings(props: Record<string, any>, models: { data?: { meta?: an
     model_size: meta?.size,
     model_params: meta?.n_params,
   };
+}
+
+/** Copies the results with `--sync-cmd`, one copy at a time: whether it worked. A failure is said, and the bench goes on. */
+function sync(): Promise<boolean> {
+  return (syncing ??= new Promise<boolean>((resolve) => {
+    execFile('sh', ['-c', syncCmd!, 'sync', out], { timeout: 30 * 60_000, maxBuffer: 16 * 1024 * 1024 }, (err, _stdout, stderr) => {
+      if (err) console.error(`--sync-cmd failed, results are only in ${out}: ${stderr.trim().split('\n').slice(-3).join(' ') || err.message}`);
+      syncing = undefined;
+      resolve(!err);
+    });
+  }));
 }
 
 /** Runs `--servers-cmd`: its output's lines are the servers. Fails, and the pool keeps its last list, if the command does. */
