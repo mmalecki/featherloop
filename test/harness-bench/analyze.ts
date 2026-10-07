@@ -45,6 +45,11 @@ const TEST_FAILED = /\d+ failed|^Tests:.*failed/m;
 /** A shell command that runs the tests, and one whose output is cut to its start or end. */
 const TEST_COMMAND = /pytest|jest|npm (run )?test|node --test/;
 const CUT = /\|\s*(head|tail)\b/;
+/** The repeat sensor's note in a shell result, and how many shell calls after it count as doing the same again. */
+const REPEAT_NOTE = /\[Same output as (the previous run|\d+ runs ago)\]/;
+const REPEAT_LOOKAHEAD = 3;
+/** featherloop's events (background work reporting), which aren't the user speaking. */
+const EVENT = /^\[Event, not from the user\]/;
 
 interface Run extends RunResult {
   /** Its column: the harness, or `<label>:<harness>` across directories. */
@@ -111,6 +116,31 @@ for (const [i, a] of columns.entries()) {
   }
 }
 table(['', 'wins', 'p'], pairs);
+
+section(
+  'Test score',
+  'The share of its tests a run passed at the end, averaged: partial credit, so a run that gets 29 of 31 counts for more than one that gets 3. Differences between columns: a stratified permutation test, shuffling runs between the two columns within each case, so case mix cancels out.',
+);
+const score = (run: Run) => (run.tests.total ? run.tests.passed / run.tests.total : 0);
+table(
+  ['', 'runs', 'mean score'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column);
+    return [column, String(own.length), pct(own.reduce((sum, run) => sum + score(run), 0) / (own.length || 1))];
+  }),
+);
+const scorePairs: string[][] = [];
+for (const [i, a] of columns.entries()) {
+  for (const b of columns.slice(i + 1)) {
+    const { diff, p } = permutationTest(
+      clean.filter((run) => run.column === a),
+      clean.filter((run) => run.column === b),
+      score,
+    );
+    scorePairs.push([`${a} vs ${b}`, `${diff >= 0 ? '+' : ''}${(100 * diff).toFixed(1)} points`, p.toFixed(3)]);
+  }
+}
+table(['', 'second minus first', 'p'], scorePairs);
 
 section('Split cases', 'Cases some columns passed and others failed, with how each failure ended.');
 const split: string[][] = [];
@@ -208,6 +238,26 @@ table(
       fmt(quantile(lost.map((run) => Math.max(...run.passing) - run.passing.at(-1)!), 0.5)),
       (own.reduce((sum, run) => sum + run.rewrites, 0) / (own.length || 1)).toFixed(1),
       `${cut} of ${tests} (${pct(cut / (tests || 1))})`,
+    ];
+  }),
+);
+
+section(
+  'Repeats',
+  `Notes: shell results saying "[Same output as …]", the repeat sensor. Again: notes after which the model ran the same command again within its next ${REPEAT_LOOKAHEAD} shell calls, still doing what didn't work. Mid-run: user messages after the task that aren't the harness's events (a nudge, if one runs).`,
+);
+table(
+  ['', 'notes / run', 'runs with any', 'again', 'mid-run user messages / run'],
+  columns.map((column) => {
+    const own = clean.filter((run) => run.column === column).map(repeats);
+    const notes = own.reduce((sum, run) => sum + run.notes, 0);
+    const again = own.reduce((sum, run) => sum + run.again, 0);
+    return [
+      column,
+      (notes / (own.length || 1)).toFixed(1),
+      String(own.filter((run) => run.notes).length),
+      `${again} of ${notes} (${pct(again / (notes || 1))})`,
+      (own.reduce((sum, run) => sum + run.userMessages, 0) / (own.length || 1)).toFixed(1),
     ];
   }),
 );
@@ -377,6 +427,24 @@ function iteration(run: Run): { passing: number[]; fell: number; rewrites: numbe
   return { passing, fell, rewrites, testCommands, cutTestCommands };
 }
 
+/** The repeat sensor's notes in a run, how often the noted command ran again soon after, and the user messages after the task. */
+function repeats(run: Run): { notes: number; again: number; userMessages: number } {
+  const transcript = readTranscript(run.dir);
+  const calls = toolCalls(transcript);
+  const results = transcriptResults(transcript);
+  const shell = calls.map((call, i) => ({ command: String(call.args.command ?? call.args.cmd ?? '').trim(), result: results[i] })).filter((call) => call.command);
+  let notes = 0;
+  let again = 0;
+  shell.forEach((call, i) => {
+    if (call.result === undefined || !REPEAT_NOTE.test(call.result)) return;
+    notes++;
+    if (shell.slice(i + 1, i + 1 + REPEAT_LOOKAHEAD).some((next) => next.command === call.command)) again++;
+  });
+  const users = (transcript?.request.messages ?? []).filter((message: { role: string }) => message.role === 'user');
+  const userMessages = users.slice(1).filter((message: { content: unknown }) => !EVENT.test(typeof message.content === 'string' ? message.content : '')).length;
+  return { notes, again, userMessages };
+}
+
 /**
  * Tests passing in a test run's output: pytest's or Jest's summary line, or, when the
  * output was cut before it, the per-test lines (pytest -v's PASSED, Jest's ✓).
@@ -392,6 +460,45 @@ function passingTests(result: string): number | undefined {
 function repetition(text: string): number {
   const lines = text.split('\n').map((line) => line.trim()).filter((line) => line.length > 20);
   return lines.length ? 1 - new Set(lines).size / lines.length : 0;
+}
+
+/**
+ * How much higher `b`'s mean is than `a`'s, and how often shuffling each case's runs
+ * between the two does as well (two-sided): runs of a case are exchangeable if the
+ * columns don't differ, so case mix can't make a difference. Seeded: the same results
+ * give the same p.
+ */
+function permutationTest(a: Run[], b: Run[], value: (run: Run) => number, rounds = 10_000): { diff: number; p: number } {
+  const cases = [...new Set([...a, ...b].map((run) => run.case))];
+  const groups = cases.map((c) => ({
+    values: [...a, ...b].filter((run) => run.case === c).map(value),
+    size: a.filter((run) => run.case === c).length,
+  }));
+  const mean = (values: number[]) => values.reduce((sum, v) => sum + v, 0) / (values.length || 1);
+  const statistic = (split: { first: number[]; second: number[] }[]) =>
+    mean(split.flatMap((g) => g.second)) - mean(split.flatMap((g) => g.first));
+  const observed = statistic(groups.map((g) => ({ first: g.values.slice(0, g.size), second: g.values.slice(g.size) })));
+  // mulberry32: a small seeded generator.
+  let seed = 0x9e3779b9;
+  const random = () => {
+    seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  let extreme = 0;
+  for (let round = 0; round < rounds; round++) {
+    const split = groups.map((g) => {
+      const values = [...g.values];
+      for (let i = values.length - 1; i > 0; i--) {
+        const j = Math.floor(random() * (i + 1));
+        [values[i], values[j]] = [values[j]!, values[i]!];
+      }
+      return { first: values.slice(0, g.size), second: values.slice(g.size) };
+    });
+    if (Math.abs(statistic(split)) >= Math.abs(observed) - 1e-12) extreme++;
+  }
+  return { diff: observed, p: (extreme + 1) / (rounds + 1) };
 }
 
 function signTest(a: number, b: number): number {
