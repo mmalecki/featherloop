@@ -67,6 +67,8 @@ export interface RequestRecord {
   status: number;
   /** Network failure, or the client hanging up mid-response. */
   error?: string;
+  /** Sent again, once, after this error on a kept-alive connection the server had closed, before any response. */
+  resent?: string;
   stream: boolean;
   /** Not streamed by the harness, so streamed upstream and answered whole: see `MeteringProxy`. */
   restreamed: boolean;
@@ -112,13 +114,15 @@ export interface Meter {
 
 interface Sink {
   meter: Meter;
+  /** The server this run's requests go to, with `/v1/`. */
+  upstream: URL;
   /** Each record is appended here as it completes. */
   file: string;
   /** The last request and its assembled response: the whole conversation, for reading what happened. */
   transcript: string;
   seq: number;
   /** Responses still being proxied, to abort if the run ends first. */
-  live: Set<() => void>;
+  live: Set<(reason: string) => void>;
   /** Their records, to count their output as it streams. */
   inflight: Set<RequestRecord>;
 }
@@ -153,8 +157,7 @@ export class MeteringProxy {
 
   private constructor(upstream: string, options: ProxyOptions) {
     this.options = options;
-    // Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces.
-    this.upstream = new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
+    this.upstream = withSlash(upstream);
     this.#server = http.createServer((req, res) => void this.#handle(req, res));
     // Requests last as long as the model takes; the harness owns the timeouts.
     this.#server.requestTimeout = 0;
@@ -170,8 +173,11 @@ export class MeteringProxy {
     return proxy;
   }
 
-  /** Starts metering a run; `file` gets a line per request, `transcript` the last exchange. */
-  open(run: string, file: string, transcript: string): Meter {
+  /**
+   * Starts metering a run; `file` gets a line per request, `transcript` the last
+   * exchange. Its requests go to `upstream` (with `/v1`), or the proxy's.
+   */
+  open(run: string, file: string, transcript: string, upstream?: string): Meter {
     if (!/^[\w.-]+$/.test(run)) throw new Error(`Bad run id: ${run}`);
     const inflight = new Set<RequestRecord>();
     const records: RequestRecord[] = [];
@@ -183,15 +189,19 @@ export class MeteringProxy {
         [...inflight].reduce((sum, record) => sum + record.chunks, 0),
     };
     writeFileSync(file, '');
-    this.#runs.set(run, { meter, file, transcript, seq: 0, live: new Set(), inflight });
+    this.#runs.set(run, { meter, file, transcript, upstream: upstream === undefined ? this.upstream : withSlash(upstream), seq: 0, live: new Set(), inflight });
     return meter;
   }
 
-  /** Stops metering a run, aborting its requests still in flight so they free their server slots. */
-  close(run: string): void {
+  /**
+   * Stops metering a run, aborting its requests still in flight so they free their
+   * server slots. Their records say `reason`: the bench's own, unless it ended the run
+   * because its server was lost, which is the infrastructure's (`infrastructureError`).
+   */
+  close(run: string, reason: string = RUN_ENDED): void {
     const sink = this.#runs.get(run);
     if (!sink) return;
-    for (const abort of sink.live) abort();
+    for (const abort of sink.live) abort(reason);
     this.#runs.delete(run);
   }
 
@@ -242,7 +252,7 @@ export class MeteringProxy {
           )
         : body;
     const response = new ResponseParser(record, offered);
-    const target = new URL(path, this.upstream);
+    const target = new URL(path, sink.upstream);
 
     const headers: Record<string, string> = {};
     for (const name of ['content-type', 'authorization', 'x-api-key', 'anthropic-version', 'anthropic-beta', 'accept']) {
@@ -271,47 +281,60 @@ export class MeteringProxy {
     };
 
     const client = target.protocol === 'https:' ? https : http;
-    const upstream = client.request(target, { method: req.method, headers }, (up) => {
-      record.status = up.statusCode ?? 0;
-      // Errors come back whole either way, and pass through as they are.
-      const assemble = record.restreamed && record.status === 200;
-      const out: Record<string, string | string[]> = {};
-      for (const [name, value] of Object.entries(up.headers)) {
-        if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
-      }
-      if (!assemble) res.writeHead(record.status, out);
-      // An error's body says why: keep its start.
-      let errorBody = '';
-      up.on('data', (chunk: Buffer) => {
-        response.write(chunk);
-        if (!assemble) res.write(chunk);
-        if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
+    let upstream: http.ClientRequest;
+    const send = (again: boolean) => {
+      // Sent again, on a connection of its own: another kept-alive one may be just as stale.
+      upstream = client.request(target, { method: req.method, headers, ...(again ? {} : { agent: false }) }, (up) => {
+        record.status = up.statusCode ?? 0;
+        // Errors come back whole either way, and pass through as they are.
+        const assemble = record.restreamed && record.status === 200;
+        const out: Record<string, string | string[]> = {};
+        for (const [name, value] of Object.entries(up.headers)) {
+          if (value !== undefined && !['connection', 'keep-alive', 'transfer-encoding', 'content-length'].includes(name)) out[name] = value;
+        }
+        if (!assemble) res.writeHead(record.status, out);
+        // An error's body says why: keep its start.
+        let errorBody = '';
+        up.on('data', (chunk: Buffer) => {
+          response.write(chunk);
+          if (!assemble) res.write(chunk);
+          if (record.status >= 400 && errorBody.length < 500) errorBody += chunk.toString().slice(0, 500 - errorBody.length);
+        });
+        up.on('end', () => {
+          if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
+        });
+        up.on('end', () => {
+          response.end();
+          if (assemble) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(response.assembled()));
+          else res.end();
+          finish();
+        });
+        up.on('error', (err) => {
+          res.destroy();
+          finish(err.message);
+        });
       });
-      up.on('end', () => {
-        if (errorBody) record.error = `HTTP ${record.status}: ${errorBody.trim()}`;
-      });
-      up.on('end', () => {
-        response.end();
-        if (assemble) res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(response.assembled()));
-        else res.end();
-        finish();
-      });
-      up.on('error', (err) => {
-        res.destroy();
+      upstream.on('error', (err) => {
+        // A kept-alive connection the server closed as the request went out ("socket hang up"):
+        // no answer came, so send it again on a fresh one, once, as Node advises. Failing it
+        // would make it the run's infrastructure error, and the pool would requeue the run.
+        if (again && upstream.reusedSocket && !record.status && !finished) {
+          record.resent = err.message;
+          send(false);
+          return;
+        }
+        if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
+        else res.destroy();
         finish(err.message);
       });
-    });
-    const abort = () => {
+      upstream.end(sent);
+    };
+    const abort = (reason: string) => {
       upstream.destroy();
-      finish('aborted: run ended');
+      finish(reason);
     };
     sink.live.add(abort);
     sink.inflight.add(record);
-    upstream.on('error', (err) => {
-      if (!res.headersSent) res.writeHead(502, { 'content-type': 'application/json' }).end(JSON.stringify({ error: { message: err.message } }));
-      else res.destroy();
-      finish(err.message);
-    });
     // The harness gave up on this request (its own timeout, or it was killed): free the slot.
     res.on('close', () => {
       if (!res.writableFinished) {
@@ -319,9 +342,14 @@ export class MeteringProxy {
         finish('aborted: client disconnected');
       }
     });
-    upstream.end(sent);
+    send(true);
   }
 }
+
+const RUN_ENDED = 'aborted: run ended';
+
+/** What a request's record says when the bench ended its run because the run's server was lost: the infrastructure's doing. */
+export const SERVER_LOST = 'aborted: server lost';
 
 /** The bench's own aborts, when a run ends or its harness hangs up: not the server's doing. */
 const OWN_ABORT = /^aborted: (run ended|client disconnected)$/;
@@ -397,6 +425,11 @@ function foldSystem(messages: Json[], dialect: 'openai' | 'anthropic'): Json[] |
     }
   });
   return changed ? out : undefined;
+}
+
+/** Trailing slash, so `new URL('chat/completions', upstream)` appends rather than replaces. */
+function withSlash(upstream: string): URL {
+  return new URL(upstream.endsWith('/') ? upstream : `${upstream}/`);
 }
 
 function tryParse(text: Buffer | string): unknown {

@@ -92,11 +92,11 @@ export function loadCases(filters: string[] = [], set = 'all'): Case[] {
   ensureRepo(POLYGLOT.repo, POLYGLOT.commit, POLYGLOT.dir);
   const selected = SELECTION.sets[set];
   if (!selected) throw new Error(`No case set ${set}: ${SETS.join(', ')}`);
-  const ids = selected.cases.filter(
-    (id) => !filters.length || filters.some((filter) => id === filter || id.startsWith(`${filter}/`) || id.endsWith(`/${filter}`)),
-  );
-  if (!ids.length) throw new Error(`No cases match ${filters.join(', ')}`);
-  return ids.map(loadCase);
+  const matches = (id: string, filter: string) => id === filter || id.startsWith(`${filter}/`) || id.endsWith(`/${filter}`);
+  // A filter that matches nothing is a typo or a case from another set: running the rest would quietly shrink the bench.
+  const unmatched = filters.filter((filter) => !selected.cases.some((id) => matches(id, filter)));
+  if (unmatched.length) throw new Error(`No case in set ${set} matches ${unmatched.join(', ')}`);
+  return selected.cases.filter((id) => !filters.length || filters.some((filter) => matches(id, filter))).map(loadCase);
 }
 
 function loadCase(id: string): Case {

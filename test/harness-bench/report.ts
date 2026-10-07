@@ -50,6 +50,8 @@ export interface RunResult {
   unknownToolCalls: number;
   /** Responses cut off by the output limit. */
   lengthStops: number;
+  /** Requests the proxy sent again after a closed kept-alive connection; results from before don't say. */
+  resends?: number;
   reasoningChars: number;
   linesAdded: number;
   linesRemoved: number;
@@ -79,6 +81,10 @@ export interface RunResult {
   maxOutput: number | null;
   /** Run again, replacing an earlier row for the same harness, case and rep (`--rerun-api-errors`). */
   rerun?: boolean;
+  /** The server it ran on, with /v1; none in results from before the server pool. */
+  server?: string;
+  /** Its attempt, when earlier ones were requeued after infrastructure errors (from 2). */
+  attempt?: number;
 }
 
 /** Harnesses name their tools differently; these are what they do. */
@@ -124,6 +130,7 @@ export interface HarnessSummary {
   unparsedToolCalls: number;
   unknownToolCalls: number;
   lengthStops: number;
+  resends: number;
   apiErrors: number;
   tamperedRuns: number;
   sawCacheRuns: number;
@@ -209,6 +216,7 @@ function summarizeHarness(harness: string, runs: RunResult[]): HarnessSummary {
     unparsedToolCalls: total((run) => run.unparsedToolCalls),
     unknownToolCalls: total((run) => run.unknownToolCalls),
     lengthStops: total((run) => run.lengthStops),
+    resends: total((run) => run.resends ?? 0),
     apiErrors: total((run) => run.apiErrors),
     tamperedRuns: runs.filter((run) => run.tampered.length).length,
     sawCacheRuns: runs.filter((run) => run.sawCache).length,
@@ -247,7 +255,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     meta.server?.build === 'hosted API'
       ? `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'}, hosted API.`
       : `Model: ${meta.server?.models?.map((model: { id: string }) => model.id).join(', ') ?? '?'} (${meta.server?.modelPath?.split('/').pop() ?? '?'}), llama.cpp ${meta.server?.build ?? '?'}, ${meta.server?.slots ?? '?'} slot${meta.server?.slots === 1 ? '' : 's'}.`,
-    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.settings?.thinking === false ? 'Thinking off (set by the bench for every request). ' : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${meta.jobs} at a time, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
+    `${meta.model ? `Bench model ${meta.model}. ` : ''}${meta.settings?.thinking === false ? 'Thinking off (set by the bench for every request). ' : ''}${meta.cases?.length} cases × ${meta.reps} reps, ${concurrency(meta)}, ${meta.timeoutMinutes} min timeout. Started ${meta.started}.`,
     ...(results.some((result) => result.rerun)
       ? [`${results.filter((result) => result.rerun).length} runs were run again after API errors (see meta.json's reruns).`]
       : []),
@@ -304,6 +312,7 @@ function render(meta: Record<string, any>, summaries: HarnessSummary[], results:
     row('Calls to tools not offered', (s) => String(s.unknownToolCalls)),
     row('Output cut off at limit', (s) => String(s.lengthStops)),
     row('API errors', (s) => String(s.apiErrors)),
+    row('Requests resent after a closed connection', (s) => String(s.resends)),
     row('Runs that changed the tests', (s) => String(s.tamperedRuns)),
     row('Runs that reached the bench cache', (s) => String(s.sawCacheRuns)),
     row('Web fetches / run', (s) => (s.fetches === null ? '–' : s.fetches.toFixed(2))),
@@ -405,4 +414,11 @@ if (import.meta.main) {
     process.exit(1);
   }
   console.log(summarize(resolve(dir)));
+}
+
+/** How many runs ran at once: from before the server pool, `-j`; since, a cap per server, on however many servers joined. */
+function concurrency(meta: Record<string, any>): string {
+  if (!Array.isArray(meta.servers)) return `${meta.jobs} at a time`;
+  const servers = new Set([meta, ...(meta.reruns ?? [])].flatMap((entry) => (entry.servers ?? []).map((server: { url: string }) => server.url))).size;
+  return `${meta.jobs ? `up to ${meta.jobs} at a time per server` : 'as many at a time as each server has slots'}, on ${servers} server${servers === 1 ? '' : 's'}`;
 }
