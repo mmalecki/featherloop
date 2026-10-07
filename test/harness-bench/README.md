@@ -65,11 +65,14 @@ to the copied configs and passes it to every harness, so all four run the same m
 with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server, and
 `--servers-cmd` at several (see [Servers](#servers)).
 
-A sampling setting gets a model of its own, on the same server: `qwen3.5-9b-presence`
-(`presence_penalty` 1.5, Qwen's setting against circular thinking) and `qwen3.5-9b-dry`
-(llama.cpp's DRY sampler) send theirs from featherloop's default variant, so the server
-keeps its defaults for every other arm. Only featherloop sends them; the report lists
-each harness's fields under "Sampling settings sent".
+Qwen models run with `presence_penalty` 1.5, Qwen's setting against circular thinking:
+without it the 9B ended a quarter of its hard-set runs in one response repeating itself
+(reports/2026-10-06.md). `qwen3.5-9b` sends it from featherloop's default variant, so it
+holds whatever the server defaults to. Other sampling gets a model of its own, on the same
+server: `qwen3.5-9b-nopenalty` (`presence_penalty` 0, as runs before 2026-10-06 had) and
+`qwen3.5-9b-dry` (llama.cpp's DRY sampler, penalty 0) send theirs the same way;
+`qwen3.5-9b-presence` is `qwen3.5-9b` under its earlier name, for reruns. Only featherloop
+sends them; the report lists each harness's fields under "Sampling settings sent".
 
 Benches on different models can run at once, from separate checkouts (e.g. a git
 worktree): each has its own proxy, temporary homes and results. Don't edit the checkout
