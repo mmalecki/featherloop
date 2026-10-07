@@ -14,6 +14,7 @@ import {
 import type { Submodel } from './models.ts';
 import { toProvider, type ApiClient } from './providers/index.ts';
 import { ToolInputError, type Tool, type Toolset } from './tool.ts';
+import { REPEAT_NOTE } from './tools/shell.ts';
 
 export type { AssistantMessage, Message, Usage } from './provider.ts';
 
@@ -33,6 +34,14 @@ export const noToolCalls: EndCriteria = ({ message }) => !message.tool_calls?.le
 
 /** Starts each event message: what tools' background work reports, so the model can tell it from the user. */
 export const EVENT_PREFIX = '[Event, not from the user]';
+
+/**
+ * Said, as the user, after a command's output repeats one before it: a small model
+ * gets the note in the tool result, and runs the same thing again anyway. An
+ * instruction from the user, at the moment it's stuck, is harder to pass over.
+ */
+export const REPEAT_NUDGE =
+  "You've run this before and got the same result: it isn't working. Before your next command, say what you expected, what you got, and what you'll do differently.";
 
 export interface LoopOptions {
   endCriteria?: EndCriteria;
@@ -210,6 +219,7 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
           messages.push(result);
           this.emit('message', result);
         }
+        if (results.some((result) => typeof result.content === 'string' && REPEAT_NOTE.test(result.content))) this.queue(REPEAT_NUDGE);
       }
 
       const done = message.stop === 'refusal' || (await endCriteria({ message, messages, turn }));

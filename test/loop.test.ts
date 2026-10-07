@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentLoop, EVENT_PREFIX, type AssistantMessage } from '../src/loop.ts';
+import { AgentLoop, EVENT_PREFIX, REPEAT_NUDGE, type AssistantMessage } from '../src/loop.ts';
 import type { Provider, TurnRequest } from '../src/provider.ts';
 import type { Toolset } from '../src/tool.ts';
 
@@ -186,4 +186,27 @@ test('an abort ends a waiting run, and what the work reports after is dropped', 
   const next = fakeProvider([{ role: 'assistant', content: 'Hi.', stop: 'end' }]);
   const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Hello.' }], api: next });
   assert.deepEqual(messages.map((m) => m.content), ['Hello.', 'Hi.']);
+});
+
+test('a result saying its output repeats is followed by a nudge from the user, before the next turn', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const api = fakeProvider([call('call_1'), call('call_2'), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const outputs = ['1 failed\n', '1 failed\n[Same output as the previous run]'];
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => outputs.shift()!,
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  // None after the first result; one after the repeat, right behind it.
+  assert.ok(!api.requests[1]!.messages.some((message) => message.content === REPEAT_NUDGE));
+  const last = api.requests[2]!.messages;
+  assert.deepEqual(last.at(-1), { role: 'user', content: REPEAT_NUDGE });
+  assert.equal(last.at(-2)!.role, 'tool');
 });
