@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentLoop, EVENT_PREFIX, REPEAT_NUDGE, type AssistantMessage } from '../src/loop.ts';
+import { AgentLoop, EVENT_PREFIX, REPEAT_ADVICE_LIMIT, REPEAT_ASK, REPEAT_NUDGE, type AssistantMessage } from '../src/loop.ts';
 import type { Provider, TurnRequest } from '../src/provider.ts';
 import type { Toolset } from '../src/tool.ts';
 
@@ -209,4 +209,60 @@ test('a result saying its output repeats is followed by a nudge from the user, b
   const last = api.requests[2]!.messages;
   assert.deepEqual(last.at(-1), { role: 'user', content: REPEAT_NUDGE });
   assert.equal(last.at(-2)!.role, 'tool');
+});
+
+test('on a repeat, an advisor on offer is asked, with the conversation, and its advice follows the nudge; a few times a run at most', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const repeats = REPEAT_ADVICE_LIMIT + 1;
+  const api = fakeProvider([...Array.from({ length: repeats + 1 }, (_, i) => call(`call_${i}`)), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const asked: unknown[] = [];
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => '1 failed\n[Same output as the previous run]',
+    },
+    subagent: {
+      schema: () => ({ description: 'Subagent', parameters: { type: 'object', properties: {} } }),
+      invoke: (params) => {
+        asked.push(params);
+        return 'Two groups of four beat five and three.';
+      },
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.deepEqual(asked[0], { agent: 'advisor', input: REPEAT_ASK, transcript: true });
+  assert.equal(asked.length, REPEAT_ADVICE_LIMIT);
+  const said = (i: number) => api.requests[i]!.messages.at(-1)!.content;
+  assert.equal(said(1), `${REPEAT_NUDGE}\n\nA stronger model looked at what you've done so far. Its advice:\n\nTwo groups of four beat five and three.`);
+  // Past the limit, the nudge alone.
+  assert.equal(said(repeats + 1), REPEAT_NUDGE);
+});
+
+test('on a repeat, an advisor that fails leaves the nudge alone', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const api = fakeProvider([call('call_1'), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => '1 failed\n[Same output as the previous run]',
+    },
+    subagent: {
+      schema: () => ({ description: 'Subagent', parameters: { type: 'object', properties: {} } }),
+      invoke: () => {
+        throw new Error('Unknown agent "advisor"');
+      },
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.equal(api.requests[1]!.messages.at(-1)!.content, REPEAT_NUDGE);
 });

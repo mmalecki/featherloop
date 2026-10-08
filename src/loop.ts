@@ -43,6 +43,17 @@ export const EVENT_PREFIX = '[Event, not from the user]';
 export const REPEAT_NUDGE =
   "You've run this before and got the same result: it isn't working. Before your next command, say what you expected, what you got, and what you'll do differently.";
 
+/**
+ * What the advisor is asked when a command's output repeats, if one is on offer: the
+ * small model acts on a nudge, but stays stuck for want of the idea, which a stronger
+ * model can give it. A hint, not the solution: the agent still does the work.
+ */
+export const REPEAT_ASK =
+  "The agent you advise is going round in circles: its last command's output repeated an earlier one. From the task, what it has tried and the code, say what it's missing and what to try next, in a few sentences. Don't write the solution.";
+
+/** Advisor calls a run makes on repeats, at most: each costs a stronger model's time. */
+export const REPEAT_ADVICE_LIMIT = 3;
+
 export interface LoopOptions {
   endCriteria?: EndCriteria;
   /** Run every tool call in the model's order, one at a time. Off by default. */
@@ -184,6 +195,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     const tools = toolSpecs(toolset);
     // Looked up by the names the model sends, so a Map: `constructor` isn't a tool.
     const byName: ReadonlyMap<string, Tool> = new Map(Object.entries(toolset));
+    // Advice asked on repeats this run, against REPEAT_ADVICE_LIMIT.
+    const advised = { count: 0 };
     let usage = emptyUsage();
     let turn = 0;
     const track: Track = (used, info) => {
@@ -219,7 +232,9 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
           messages.push(result);
           this.emit('message', result);
         }
-        if (results.some((result) => typeof result.content === 'string' && REPEAT_NOTE.test(result.content))) this.queue(REPEAT_NUDGE);
+        if (results.some((result) => typeof result.content === 'string' && REPEAT_NOTE.test(result.content))) {
+          this.queue(await this.#onRepeat(advised, byName, { api, model, submodel, signal, track, messages }));
+        }
       }
 
       const done = message.stop === 'refusal' || (await endCriteria({ message, messages, turn }));
@@ -283,6 +298,26 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
    * Runs a turn's calls concurrently, except sequential ones, which wait for
    * everything before them and run alone. Results keep the model's order.
    */
+  /**
+   * What to say after a command's output repeats: the nudge, and, while the run has
+   * advice left and an advisor is on offer, the advisor's take on where the agent is
+   * stuck. The loop asks it itself, through the subagent tool, with the conversation:
+   * a small model doesn't ask on its own, however it's told when to.
+   */
+  async #onRepeat(advised: { count: number }, toolset: ReadonlyMap<string, Tool>, context: InvokeContext): Promise<string> {
+    if (advised.count >= REPEAT_ADVICE_LIMIT || !toolset.has('subagent')) return REPEAT_NUDGE;
+    advised.count++;
+    const call: ChatCompletionMessageFunctionToolCall = {
+      id: `repeat_advice_${advised.count}`,
+      type: 'function',
+      function: { name: 'subagent', arguments: JSON.stringify({ agent: 'advisor', input: REPEAT_ASK, transcript: true }) },
+    };
+    const advice = await this.#invoke(call, toolset, context);
+    // No advisor on offer, or it failed: the nudge alone.
+    if (advice.is_error || typeof advice.content !== 'string' || !advice.content.trim()) return REPEAT_NUDGE;
+    return `${REPEAT_NUDGE}\n\nA stronger model looked at what you've done so far. Its advice:\n\n${advice.content.trim()}`;
+  }
+
   async #invokeAll(calls: ChatCompletionMessageFunctionToolCall[], toolset: ReadonlyMap<string, Tool>, context: InvokeContext): Promise<ToolMessage[]> {
     const results: ToolMessage[] = [];
     let batch: Promise<ToolMessage>[] = [];
