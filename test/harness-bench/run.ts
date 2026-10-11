@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import https from 'node:https';
 import { tmpdir } from 'node:os';
@@ -537,8 +537,30 @@ function isolatedEnv(tmp: string, toolPath: string[], { home, xdg, baseURL }: Ha
 function sawCache(dir: string): boolean {
   return ['transcript.json', 'stdout.log'].some((name) => {
     const path = join(dir, name);
-    return existsSync(path) && readFileSync(path, 'utf8').includes(POLYGLOT.dir);
+    return existsSync(path) && fileIncludes(path, POLYGLOT.dir);
   });
+}
+
+/**
+ * Whether a file has `text` in it, read a megabyte at a time: a harness's log can
+ * outgrow a string (nanocode's stdout once reached 33 GB, a command printing for two hours).
+ */
+function fileIncludes(path: string, text: string): boolean {
+  const needle = Buffer.from(text);
+  const chunk = Buffer.alloc(1 << 20);
+  const fd = openSync(path, 'r');
+  try {
+    // The end of the last chunk, in case the text spans two.
+    let carry = Buffer.alloc(0);
+    for (let n: number; (n = readSync(fd, chunk, 0, chunk.length, null)) > 0; ) {
+      const window = Buffer.concat([carry, chunk.subarray(0, n)]);
+      if (window.includes(needle)) return true;
+      carry = window.subarray(Math.max(0, window.length - needle.length + 1));
+    }
+    return false;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**
