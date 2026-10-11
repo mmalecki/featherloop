@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { AgentLoop, EVENT_PREFIX, type AssistantMessage } from '../src/loop.ts';
+import { AgentLoop, EVENT_PREFIX, REPEAT_ADVICE, REPEAT_ADVICE_LIMIT, REPEAT_ASK, type AssistantMessage } from '../src/loop.ts';
 import type { Provider, TurnRequest } from '../src/provider.ts';
 import type { Toolset } from '../src/tool.ts';
 
@@ -186,4 +186,78 @@ test('an abort ends a waiting run, and what the work reports after is dropped', 
   const next = fakeProvider([{ role: 'assistant', content: 'Hi.', stop: 'end' }]);
   const { messages } = await loop.run({ model: 'm', input: [{ role: 'user', content: 'Hello.' }], api: next });
   assert.deepEqual(messages.map((m) => m.content), ['Hello.', 'Hi.']);
+});
+
+test('a result saying its output repeats, with no advisor on offer, is followed by nothing', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const api = fakeProvider([call('call_1'), call('call_2'), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const outputs = ['1 failed\n', '1 failed\n[Same output as the previous run]'];
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => outputs.shift()!,
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.equal(api.requests[2]!.messages.at(-1)!.role, 'tool');
+});
+
+test('on a repeat, an advisor on offer is asked, with the conversation, and its advice is said as the user; a few times a run at most', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const repeats = REPEAT_ADVICE_LIMIT + 1;
+  const api = fakeProvider([...Array.from({ length: repeats + 1 }, (_, i) => call(`call_${i}`)), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const asked: unknown[] = [];
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => '1 failed\n[Same output as the previous run]',
+    },
+    subagent: {
+      schema: () => ({ description: 'Subagent', parameters: { type: 'object', properties: {} } }),
+      invoke: (params) => {
+        asked.push(params);
+        return 'Check the discount for two groups of four.';
+      },
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.deepEqual(asked[0], { agent: 'advisor', input: REPEAT_ASK, transcript: true });
+  assert.equal(asked.length, REPEAT_ADVICE_LIMIT);
+  assert.deepEqual(api.requests[1]!.messages.at(-1), { role: 'user', content: `${REPEAT_ADVICE}\n\nCheck the discount for two groups of four.` });
+  // Past the limit, nothing.
+  assert.equal(api.requests[repeats + 1]!.messages.at(-1)!.role, 'tool');
+});
+
+test('on a repeat, an advisor that fails is followed by nothing', async () => {
+  const call = (id: string): AssistantMessage => ({
+    role: 'assistant',
+    content: null,
+    stop: 'tool_use',
+    tool_calls: [{ id, type: 'function', function: { name: 'run', arguments: '{}' } }],
+  });
+  const api = fakeProvider([call('call_1'), { role: 'assistant', content: 'Done.', stop: 'end' }]);
+  const toolset: Toolset = {
+    run: {
+      schema: () => ({ description: 'Run', parameters: { type: 'object', properties: {} } }),
+      invoke: () => '1 failed\n[Same output as the previous run]',
+    },
+    subagent: {
+      schema: () => ({ description: 'Subagent', parameters: { type: 'object', properties: {} } }),
+      invoke: () => {
+        throw new Error('Unknown agent "advisor"');
+      },
+    },
+  };
+  await new AgentLoop(api, toolset).run({ model: 'm', input: [{ role: 'user', content: 'Go.' }] });
+  assert.equal(api.requests[1]!.messages.at(-1)!.role, 'tool');
 });

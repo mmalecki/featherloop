@@ -243,6 +243,9 @@ class Repeats {
   }
 }
 
+/** The note a repeated command's result carries, for whoever acts on it (the loop, which asks the advisor). */
+export const REPEAT_NOTE = /\[Same output as (the previous run|\d+ runs ago)\]/;
+
 /**
  * Hashes a run's whole output, from its file, with what changes between identical
  * runs normalised away. Line by line, so long output never has to fit in memory.
