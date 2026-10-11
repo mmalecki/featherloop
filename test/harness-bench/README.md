@@ -88,8 +88,11 @@ the model's output limit instead, as the other harnesses' configs do. It's a req
 field the server stops at, which the model never sees: a larger model that reasons
 past 8192 tokens would otherwise end its run with a reply of nothing but thinking.
 
-Pi is installed from npm into `cache/pi` on first use, at a pinned version, with its
-dependencies as they were on its release (`npm --before`). It was
+Pi is installed from npm into `~/.cache/pi-coding-agent/<version>` (under
+`XDG_CACHE_HOME`, if set) on first use, at a pinned version, with its dependencies as they
+were on its release (`npm --before`). Not in `cache/`: its system prompt names where it's
+installed, for its own docs, and a path there would name the bench and lead the model to
+the exercises' checkout. It was
 `@mariozechner/pi-coding-agent` until 0.73; it's `@earendil-works/pi-coding-agent` now.
 It runs headless, `pi --mode json` (the agent `-p` runs, with its events on stdout), with
 the model in `~/.pi/agent/models.json` in the run's home: the proxy, a dummy key, and the
@@ -99,11 +102,10 @@ and it checks for updates and reports installs only interactively. The model has
 `reasoning` flag (Pi's default), so Pi sends no thinking controls whatever its thinking
 level, and the system prompt goes as `system` (with the flag, it'd be `developer`, and
 `reasoning_effort`, which llama.cpp ignores for Qwen). It asks for the model's output
-limit itself, less the context in use (`max_completion_tokens`). Its system prompt names
-where it's installed, for its own docs: a path in the bench cache, beside the exercises'
-checkout; a run that goes there is flagged, as any other. It reads `AGENTS.md` and
+limit itself, less the context in use (`max_completion_tokens`). It reads `AGENTS.md` and
 `CLAUDE.md` from the workspace and the directories above it, as it would anywhere; there
-are none.
+are none. Its `stdout.log` is large: an event per streamed delta, about 2 MB for 6k tokens
+of output.
 
 A model's `flavor` in `models.json` is the API it speaks, as featherloop names it:
 `openai` (Chat Completions, e.g. llama.cpp) or `anthropic` (Messages). An `anthropic`

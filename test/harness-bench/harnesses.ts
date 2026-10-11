@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import { CACHE, ensureRepo, git } from './cases.ts';
@@ -92,12 +92,19 @@ const NANOCODE = {
   dir: join(CACHE, 'nanocode'),
 };
 
-/** Pi, from npm (it moved from @mariozechner/pi-coding-agent at 0.73), with its dependencies as they were the day after its release (`npm --before`). */
+/**
+ * Pi, from npm (it moved from @mariozechner/pi-coding-agent at 0.73), with its dependencies
+ * as they were the day after its release (`npm --before`). Not in the bench cache: its
+ * system prompt names where it's installed, and that mustn't point the model at the
+ * exercises' checkout, or name the bench.
+ */
+const PI_VERSION = '1.1.0';
 const PI = {
   package: '@earendil-works/pi-coding-agent',
-  version: '1.1.0',
+  version: PI_VERSION,
   before: '2026-10-08T00:00:00Z',
-  dir: join(CACHE, 'pi'),
+  // As a user's cache would have it.
+  dir: join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'pi-coding-agent', PI_VERSION),
 };
 
 /**
@@ -230,7 +237,7 @@ const pi: Harness = {
     "--mode json; no other flags: headless, it asks for no approvals, and keeps its session in the run's home",
     "the model without `reasoning` (Pi's default for a model it doesn't know): no thinking controls sent, whatever its thinking level",
     "max_completion_tokens its own: the model's output limit, less the context in use",
-    'its system prompt names its install, in the bench cache; it reads AGENTS.md and CLAUDE.md from the workspace and above (none)',
+    'it reads AGENTS.md and CLAUDE.md from the workspace and above (none)',
   ],
 };
 
@@ -282,12 +289,12 @@ export const HARNESSES: Harness[] = [
   claudeCode,
 ];
 
-/** Pi in the cache, as npm links it. */
+/** Pi, as npm links it. */
 function piBin(): string {
   return join(PI.dir, 'node_modules', '.bin', 'pi');
 }
 
-/** The version of Pi in the cache, if any. */
+/** The version of Pi installed, if any. */
 function piVersion(): string | undefined {
   try {
     return (JSON.parse(readFileSync(join(PI.dir, 'node_modules', ...PI.package.split('/'), 'package.json'), 'utf8')) as { version: string }).version;

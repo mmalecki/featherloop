@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { after, before, describe, test } from 'node:test';
 import { HARNESSES, MODELS, type HarnessContext, type Model } from './harness-bench/harnesses.ts';
 
@@ -47,6 +47,13 @@ describe('pi', () => {
     });
     assert.deepEqual(invocation.args, ['--mode', 'json', '--model', 'bench/qwen3.5-9b', '--', ctx.prompt]);
     assert.equal(invocation.env, undefined);
+  });
+
+  test("runs from outside the repository: its system prompt names its install, which mustn't lead to the exercises", () => {
+    const { command } = harness('pi').setup(context(dir, MODELS['qwen3.5-9b']!));
+    const repo = resolve(import.meta.dirname, '..');
+    assert.ok(!command.startsWith(`${repo}${sep}`), command);
+    assert.doesNotMatch(command, /harness-bench|polyglot|featherloop/);
   });
 
   test('speaks Messages to an Anthropic model, with a dummy key the proxy replaces', async () => {
