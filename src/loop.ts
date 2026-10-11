@@ -14,6 +14,7 @@ import {
 import type { Submodel } from './models.ts';
 import { toProvider, type ApiClient } from './providers/index.ts';
 import { ToolInputError, type Tool, type Toolset } from './tool.ts';
+import { REPEAT_NOTE } from './tools/shell.ts';
 
 export type { AssistantMessage, Message, Usage } from './provider.ts';
 
@@ -33,6 +34,21 @@ export const noToolCalls: EndCriteria = ({ message }) => !message.tool_calls?.le
 
 /** Starts each event message: what tools' background work reports, so the model can tell it from the user. */
 export const EVENT_PREFIX = '[Event, not from the user]';
+
+/**
+ * What the advisor is asked when a command's output repeats, if one is on offer: the
+ * small model gets a note in the tool result, and runs the same thing again anyway,
+ * for want of the idea, which a stronger model can give it. A hint, not the solution:
+ * the agent still does the work.
+ */
+export const REPEAT_ASK =
+  "The agent you advise is going round in circles: its last command's output repeated an earlier one. From the task, what it has tried and the code, say what it's missing and what to try next, in a few sentences. Don't write the solution.";
+
+/** Leads the advice, as the user. */
+export const REPEAT_ADVICE = "Your last command's output repeated an earlier one. A stronger model looked at what you've done so far. Its advice:";
+
+/** Advisor calls a run makes on repeats, at most: each costs a stronger model's time. */
+export const REPEAT_ADVICE_LIMIT = 3;
 
 export interface LoopOptions {
   endCriteria?: EndCriteria;
@@ -175,6 +191,8 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
     const tools = toolSpecs(toolset);
     // Looked up by the names the model sends, so a Map: `constructor` isn't a tool.
     const byName: ReadonlyMap<string, Tool> = new Map(Object.entries(toolset));
+    // Advice asked on repeats this run, against REPEAT_ADVICE_LIMIT.
+    const advised = { count: 0 };
     let usage = emptyUsage();
     let turn = 0;
     const track: Track = (used, info) => {
@@ -209,6 +227,10 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
         for (const result of results) {
           messages.push(result);
           this.emit('message', result);
+        }
+        if (results.some((result) => typeof result.content === 'string' && REPEAT_NOTE.test(result.content))) {
+          const advice = await this.#onRepeat(advised, byName, { api, model, submodel, signal, track, messages });
+          if (advice) this.queue(advice);
         }
       }
 
@@ -267,6 +289,26 @@ export class AgentLoop extends EventEmitter<LoopEvents> {
       messages.push(message);
       this.emit('message', message);
     }
+  }
+
+  /**
+   * The advisor's take on where the agent is stuck, after a command's output repeats,
+   * while the run has advice left and an advisor is on offer; nothing otherwise. The
+   * loop asks it itself, through the subagent tool, with the conversation: a small
+   * model doesn't ask on its own, however it's told when to. Said as the user, which
+   * is harder to pass over than a note in a tool result.
+   */
+  async #onRepeat(advised: { count: number }, toolset: ReadonlyMap<string, Tool>, context: InvokeContext): Promise<string | undefined> {
+    if (advised.count >= REPEAT_ADVICE_LIMIT || !toolset.has('subagent')) return undefined;
+    advised.count++;
+    const call: ChatCompletionMessageFunctionToolCall = {
+      id: `repeat_advice_${advised.count}`,
+      type: 'function',
+      function: { name: 'subagent', arguments: JSON.stringify({ agent: 'advisor', input: REPEAT_ASK, transcript: true }) },
+    };
+    const advice = await this.#invoke(call, toolset, context);
+    if (advice.is_error || typeof advice.content !== 'string' || !advice.content.trim()) return undefined;
+    return `${REPEAT_ADVICE}\n\n${advice.content.trim()}`;
   }
 
   /**
