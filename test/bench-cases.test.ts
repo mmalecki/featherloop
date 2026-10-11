@@ -45,12 +45,13 @@ error: could not compile \`wordy\` (test "wordy") due to 1 previous error
     assert.equal(rust.passed('test test_result_ok_5_passed ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored\n'), 1);
   });
 
-  test('runs the shipped test targets, ignored tests included, past a failing one', () => {
+  test('runs the shipped test targets, ignored tests included, past a failing one, without features', () => {
     const c = { tests: ['tests/doubly-linked-list.rs', 'tests/step_4_leak_test_1.rs'] } as Case;
     assert.deepEqual(rust.testCommand(c), [
       'cargo',
       'test',
       '--no-fail-fast',
+      '--no-default-features',
       '--test',
       'doubly-linked-list',
       '--test',

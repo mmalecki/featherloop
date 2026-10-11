@@ -85,8 +85,17 @@ export const LANGUAGES: Record<Lang, Language> = {
   rust: {
     // The test targets by name: not doc-tests (react's stub has some) or unit tests an agent adds, whose results would
     // count as the suite's. All of them, past a failing one, for partial credit; and the tests Exercism marks
-    // #[ignore], as Aider's runner has them.
-    testCommand: (c) => ['cargo', 'test', '--no-fail-fast', ...c.tests.flatMap((name) => ['--test', basename(name, '.rs')]), '--', '--include-ignored'],
+    // #[ignore], as Aider's runner has them. No features, whatever defaults the agent gives its Cargo.toml: the
+    // tests they gate aren't counted.
+    testCommand: (c) => [
+      'cargo',
+      'test',
+      '--no-fail-fast',
+      '--no-default-features',
+      ...c.tests.flatMap((name) => ['--test', basename(name, '.rs')]),
+      '--',
+      '--include-ignored',
+    ],
     countTests: (source) => rustTests(source),
     // A line per test binary; none when the tests don't compile.
     passed: (output) => [...output.matchAll(/^test result: \w+\. (\d+) passed/gm)].reduce((sum, match) => sum + Number(match[1]), 0),

@@ -235,10 +235,11 @@ the toolchain `rustc` resolves to when the bench starts (rustup's default), reco
 `~/.rustup` and would find nothing in a run's empty home. The crates the exercises and
 their reference solutions ask for are vendored once into `cache/rust`; each run gets a
 cargo home of its own that builds from them, offline, so nothing is fetched or shared
-between runs. The grader runs each `tests/*.rs` by name (`cargo test --no-fail-fast --test
-<name>... -- --include-ignored`, the command agents are given too): not doc-tests or unit
-tests an agent adds, and every target, past a failing one, for partial credit. Tests
-behind a cargo feature aren't run, as in Aider's runner, or counted.
+between runs. The grader runs each `tests/*.rs` by name (`cargo test --no-fail-fast
+--no-default-features --test <name>... -- --include-ignored`, the command agents are given
+too): not doc-tests or unit tests an agent adds, and every target, past a failing one, for
+partial credit. Tests behind a cargo feature (wordy's exponentials, which its docs offer)
+aren't run, as in Aider's runner, or counted, whatever defaults an agent gives `Cargo.toml`.
 
 ## Metrics
 
