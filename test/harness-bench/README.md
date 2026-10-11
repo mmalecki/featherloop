@@ -74,6 +74,10 @@ server: `qwen3.5-9b-nopenalty` (`presence_penalty` 0, as runs before 2026-10-06 
 `qwen3.5-9b-presence` is `qwen3.5-9b` under its earlier name, for reruns. Only featherloop
 sends them; the report lists each harness's fields under "Sampling settings sent".
 
+`ornith-1.5-9b` (built on Qwen3.5, per its model card) sends nothing of its own: every harness gets the
+server's defaults, which for the bench's server are the model card's settings for coding
+(temperature 0.6, `presence_penalty` 0).
+
 Benches on different models can run at once, from separate checkouts (e.g. a git
 worktree): each has its own proxy, temporary homes and results. Don't edit the checkout
 a bench runs from: featherloop runs from its source, and configs are copied per run.

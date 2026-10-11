@@ -90,6 +90,16 @@
       }
     }
   },
+  "ornith-1.5-9b": {
+    "flavor": "openai",
+    "name": "Ornith 1.5 9B",
+    "upstream": "http://34.31.180.67:9931/v1",
+    "limit": {
+      "context": 262144,
+      "output": 262144
+    },
+    "featherloop": {}
+  },
   "claude-haiku-4-5": {
     "flavor": "anthropic",
     "name": "Claude Haiku 4.5",
