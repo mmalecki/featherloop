@@ -352,7 +352,7 @@ async function runJob({ job: { harness, c, rep }, attempt, final, server, signal
     ...(advisorModel && advisorMeter ? { advisor: { model: advisorModel, baseURL: advisorMeter.baseURL } } : {}),
   };
   const invocation = harness.setup(ctx);
-  const env = isolatedEnv(tmp, toolchains.path, ctx, invocation.env);
+  const env = isolatedEnv(tmp, toolchains, ctx, invocation.env);
   const started = new Date();
   // A budget of output, checked as it streams: past it, the run ends as at the timeout.
   let overBudget = false;
@@ -503,10 +503,16 @@ async function runJob({ job: { harness, c, rep }, attempt, final, server, signal
  * The bench's environment for a harness, minus anything that would let it reach
  * past its run: keys (a config that misses the proxy fails instead of reaching a paid API), Google Cloud's credentials and
  * config (for `--servers-cmd`), `MODEL` (featherloop and nanocode read it), opencode's
- * overrides, npm's script variables (`INIT_CWD` among them), and the user's XDG directories.
+ * overrides, npm's script variables (`INIT_CWD` among them), the user's XDG directories,
+ * and their cargo and rustup settings (a `CARGO_TARGET_DIR` would share builds between runs).
  */
-function isolatedEnv(tmp: string, toolPath: string[], { home, xdg, baseURL }: HarnessContext, extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const strip = /^(OPENCODE_|ANTHROPIC_|OPENAI_|OPENROUTER_|PARALLEL_|GOOGLE_|CLOUDSDK_|CLAUDE|FEATHERLOOP|XDG_|npm_)|^(MODEL|INIT_CWD|OLDPWD)$/i;
+function isolatedEnv(
+  tmp: string,
+  toolchains: { path: string[]; env: Record<string, string> },
+  { home, xdg, baseURL }: HarnessContext,
+  extra: Record<string, string> = {},
+): NodeJS.ProcessEnv {
+  const strip = /^(OPENCODE_|ANTHROPIC_|OPENAI_|OPENROUTER_|PARALLEL_|GOOGLE_|CLOUDSDK_|CLAUDE|FEATHERLOOP|XDG_|npm_|CARGO_|RUSTUP_|RUSTC|RUSTDOC|RUSTFLAGS)|^(MODEL|INIT_CWD|OLDPWD)$/i;
   const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([name]) => !strip.test(name)));
   // The proxy is local: whatever proxy the environment sets, harnesses must reach it directly.
   const noProxy = [...new Set([...(process.env.NO_PROXY ?? process.env.no_proxy ?? '').split(',').filter(Boolean), '127.0.0.1', 'localhost'])].join(',');
@@ -519,7 +525,8 @@ function isolatedEnv(tmp: string, toolPath: string[], { home, xdg, baseURL }: Ha
     XDG_CACHE_HOME: xdg.cache,
     XDG_RUNTIME_DIR: join(tmp, 'run'),
     TMPDIR: join(tmp, 'tmp'),
-    PATH: [...toolPath, process.env.PATH ?? ''].join(delimiter),
+    PATH: [...toolchains.path, process.env.PATH ?? ''].join(delimiter),
+    ...toolchains.env,
     NO_PROXY: noProxy,
     no_proxy: noProxy,
     // The harness configs point their provider here.
