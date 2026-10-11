@@ -92,11 +92,11 @@ const NANOCODE = {
   dir: join(CACHE, 'nanocode'),
 };
 
-/** Pi, from npm (it moved from @mariozechner/pi-coding-agent at 0.73), with its dependencies as they were when it was published. */
+/** Pi, from npm (it moved from @mariozechner/pi-coding-agent at 0.73), with its dependencies as they were the day after its release (`npm --before`). */
 const PI = {
   package: '@earendil-works/pi-coding-agent',
   version: '1.1.0',
-  published: '2026-10-08T00:00:00Z',
+  before: '2026-10-08T00:00:00Z',
   dir: join(CACHE, 'pi'),
 };
 
@@ -199,7 +199,7 @@ const pi: Harness = {
       // --before: its dependencies' ranges resolve as they did on release, not to whatever came after.
       execFileSync(
         'npm',
-        ['install', '--prefix', PI.dir, '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', `--before=${PI.published}`, `${PI.package}@${PI.version}`],
+        ['install', '--prefix', PI.dir, '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', `--before=${PI.before}`, `${PI.package}@${PI.version}`],
         { stdio: 'inherit' },
       );
     }
@@ -229,6 +229,8 @@ const pi: Harness = {
   notes: () => [
     "--mode json; no other flags: headless, it asks for no approvals, and keeps its session in the run's home",
     "the model without `reasoning` (Pi's default for a model it doesn't know): no thinking controls sent, whatever its thinking level",
+    "max_completion_tokens its own: the model's output limit, less the context in use",
+    'its system prompt names its install, in the bench cache; it reads AGENTS.md and CLAUDE.md from the workspace and above (none)',
   ],
 };
 
