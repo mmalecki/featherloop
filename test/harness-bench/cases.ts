@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, sep } from 'node:path';
 
 /**
@@ -7,7 +7,7 @@ import { basename, dirname, join, sep } from 'node:path';
  * toolchains their tests need, a workspace per run and grading what the agent left.
  */
 
-/** Checkouts, the pytest venv and the shared JS `node_modules`: fetched once, reused by every run. */
+/** Checkouts, the pytest venv, the shared JS `node_modules` and Rust's crates: fetched once, reused by every run. */
 export const CACHE = join(import.meta.dirname, 'cache');
 
 const SELECTION = JSON.parse(readFileSync(join(import.meta.dirname, 'cases.json'), 'utf8')) as {
@@ -20,7 +20,7 @@ export const SETS = Object.keys(SELECTION.sets);
 
 export const POLYGLOT = { ...SELECTION.source, dir: join(CACHE, 'polyglot-benchmark') };
 
-export type Lang = 'python' | 'javascript';
+export type Lang = 'python' | 'javascript' | 'rust';
 
 export interface Case {
   /** `<lang>/<exercise>`, as in `cases.json`. */
@@ -64,9 +64,11 @@ interface Language {
   passed(output: string): number;
   /** Sets up a fresh workspace's toolchain, from the run's `linkToolchains` directory. */
   link(workspace: string, tools: string): void;
+  /** The test files, where the runner runs more than the exercise's config lists. */
+  tests?(dir: string): string[];
 }
 
-const LANGUAGES: Record<Lang, Language> = {
+export const LANGUAGES: Record<Lang, Language> = {
   python: {
     testCommand: (c) => ['python3', '-m', 'pytest', ...c.tests],
     countTests: (source) => source.match(/^\s*def test_\w+/gm)?.length ?? 0,
@@ -80,7 +82,57 @@ const LANGUAGES: Record<Lang, Language> = {
     // One install for all: every exercise's package.json asks for the same jest and babel.
     link: (workspace, tools) => symlinkSync(join(tools, 'node_modules'), join(workspace, 'node_modules')),
   },
+  rust: {
+    // The test targets by name: not doc-tests (react's stub has some) or unit tests an agent adds, whose results would
+    // count as the suite's. All of them, past a failing one, for partial credit; and the tests Exercism marks
+    // #[ignore], as Aider's runner has them. No features, whatever defaults the agent gives its Cargo.toml: the
+    // tests they gate aren't counted.
+    testCommand: (c) => [
+      'cargo',
+      'test',
+      '--no-fail-fast',
+      '--no-default-features',
+      ...c.tests.flatMap((name) => ['--test', basename(name, '.rs')]),
+      '--',
+      '--include-ignored',
+    ],
+    countTests: (source) => rustTests(source),
+    // A line per test binary; none when the tests don't compile.
+    passed: (output) => [...output.matchAll(/^test result: \w+\. (\d+) passed/gm)].reduce((sum, match) => sum + Number(match[1]), 0),
+    link: () => {},
+    // Cargo runs every tests/*.rs, listed or not: doubly-linked-list's leak tests aren't.
+    tests: (dir) => readdirSync(join(dir, 'tests')).filter((name) => name.endsWith('.rs')).map((name) => `tests/${name}`).sort(),
+  },
 };
+
+/**
+ * A Rust test file's `#[test]`s, less those under `#[cfg(feature = ...)]`, on the test or a module around it:
+ * cargo builds no features unless asked, and nor does Aider's runner (wordy's exponentials, xorcism's io).
+ */
+export function rustTests(source: string): number {
+  // Braces in comments and literals aren't blocks.
+  const code = source.replace(
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|\bb?r(#*)"[\s\S]*?"\1|b?"(?:\\[\s\S]|[^"\\])*"|b?'(?:\\(?:u\{[0-9a-fA-F]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\n])'/g,
+    '""',
+  );
+  let tests = 0;
+  // The attributes since the last item, and whether each open block is compiled out.
+  let attributes: string[] = [];
+  const gated = [false];
+  for (const [token] of code.matchAll(/#\[[^\]]*\]|[{};]/g)) {
+    if (token.startsWith('#')) attributes.push(token);
+    else if (token === '{') {
+      const out = gated.at(-1)! || attributes.some((attribute) => /^#\[cfg\(feature\b/.test(attribute));
+      if (!out && attributes.includes('#[test]')) tests++;
+      gated.push(out);
+      attributes = [];
+    } else {
+      if (token === '}' && gated.length > 1) gated.pop();
+      attributes = [];
+    }
+  }
+  return tests;
+}
 
 /** Exercism skips all but the first JS test; Aider's runner un-skips them, and so do we, before the agent sees them. */
 function unskip(source: string): string {
@@ -104,7 +156,8 @@ function loadCase(id: string): Case {
   if (!Object.hasOwn(LANGUAGES, lang)) throw new Error(`${id}: unsupported language`);
   const dir = join(POLYGLOT.dir, lang, 'exercises', 'practice', exercise);
   const config = JSON.parse(readFileSync(join(dir, '.meta', 'config.json'), 'utf8')) as { files: { solution: string[]; test: string[] } };
-  const { solution, test: tests } = config.files;
+  const { solution } = config.files;
+  const tests = LANGUAGES[lang].tests?.(dir) ?? config.files.test;
   // Not .meta (the reference solution), .docs (in the prompt), .approaches or .articles (solutions, discussed).
   const support = readdirSync(dir, { recursive: true, encoding: 'utf8' })
     .filter((path) => !path.split(sep).some((part) => part.startsWith('.') && statSync(join(dir, part)).isDirectory()))
@@ -148,7 +201,7 @@ export function prepareWorkspace(c: Case, workspace: string, tools: string): voi
   LANGUAGES[c.lang].link(workspace, tools);
   git(workspace, 'init', '-q');
   // Out of sight, unlike a .gitignore the agent would find.
-  writeFileSync(join(workspace, '.git', 'info', 'exclude'), 'node_modules\n__pycache__/\n.pytest_cache/\n');
+  writeFileSync(join(workspace, '.git', 'info', 'exclude'), 'node_modules\n__pycache__/\n.pytest_cache/\ntarget/\nCargo.lock\n');
   git(workspace, 'add', '-A');
   git(workspace, 'commit', '-q', '--no-verify', '-m', `Start ${c.id}`);
 }
@@ -314,17 +367,51 @@ export function ensureToolchains(cases: Case[]): void {
       execFileSync('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error'], { cwd: dir, stdio: 'inherit' });
     }
   }
+  if (langs.has('rust')) {
+    const dir = join(CACHE, 'rust');
+    if (!existsSync(join(dir, 'vendor'))) {
+      console.error('Fetching crates');
+      // Every Rust exercise's manifest, and its reference solution's (validate-cases builds those), each a package
+      // of its own: two ask for different rands. Into the cache's own cargo home, then vendored for runs.
+      const manifests: string[] = [];
+      const exercises = join(POLYGLOT.dir, 'rust', 'exercises', 'practice');
+      for (const exercise of readdirSync(exercises).sort()) {
+        for (const [name, manifest] of [[exercise, 'Cargo.toml'], [`${exercise}-example`, join('.meta', 'Cargo-example.toml')]] as const) {
+          if (!existsSync(join(exercises, exercise, manifest))) continue;
+          const pkg = join(dir, 'manifests', name);
+          mkdirSync(join(pkg, 'src'), { recursive: true });
+          cpSync(join(exercises, exercise, manifest), join(pkg, 'Cargo.toml'));
+          writeFileSync(join(pkg, 'src', 'lib.rs'), '');
+          manifests.push(join(pkg, 'Cargo.toml'));
+        }
+      }
+      const [first, ...rest] = manifests as [string, ...string[]];
+      rmSync(join(dir, 'vendor.partial'), { recursive: true, force: true });
+      const args = ['vendor', '--quiet', '--manifest-path', first, ...rest.flatMap((manifest) => ['--sync', manifest]), join(dir, 'vendor.partial')];
+      execFileSync('cargo', args, { env: { ...process.env, CARGO_HOME: join(dir, 'cargo') }, stdio: ['ignore', 'ignore', 'inherit'] });
+      renameSync(join(dir, 'vendor.partial'), join(dir, 'vendor'));
+    }
+    // The toolchain rustup picks here, linked from its own directory: runs call it directly, not through rustup's
+    // proxies, which read ~/.rustup and would find nothing in a run's empty home.
+    const sysroot = execFileSync('rustc', ['--print', 'sysroot'], { encoding: 'utf8' }).trim();
+    const link = join(dir, 'toolchain');
+    if (!existsSync(link) || readlinkSync(link) !== sysroot) {
+      rmSync(link, { force: true });
+      symlinkSync(sysroot, link);
+    }
+  }
 }
 
 /**
  * Links the cached toolchains into `<root>/tools`, and returns the PATH entries
- * for them: agents and their test output see that path, not the bench's cache,
- * which names the repository and sits next to the reference solutions.
+ * and environment for them: agents and their test output see that path, not the
+ * bench's cache, which names the repository and sits next to the reference solutions.
  */
-export function linkToolchains(root: string): { tools: string; path: string[] } {
+export function linkToolchains(root: string): { tools: string; path: string[]; env: Record<string, string> } {
   const tools = join(root, 'tools');
   mkdirSync(tools, { recursive: true });
   const path: string[] = [];
+  const env: Record<string, string> = {};
   const venv = join(CACHE, 'python');
   if (existsSync(venv)) {
     // Python finds the venv from the path it's run by, so the link works as the venv itself.
@@ -334,7 +421,23 @@ export function linkToolchains(root: string): { tools: string; path: string[] } 
   }
   const modules = join(CACHE, 'javascript', 'node_modules');
   if (existsSync(modules)) symlinkSync(modules, join(tools, 'node_modules'));
-  return { tools, path };
+  const rust = join(CACHE, 'rust');
+  if (existsSync(join(rust, 'toolchain'))) {
+    symlinkSync(join(rust, 'toolchain'), join(tools, 'rust'));
+    // Its cargo finds the rustc beside it on the PATH.
+    path.push(join(tools, 'rust', 'bin'));
+    symlinkSync(join(rust, 'vendor'), join(tools, 'vendor'));
+    // A cargo home of the run's own, offline, with the vendored crates for crates.io: nothing to fetch, and
+    // nothing (registry, locks, installs) shared with other runs or the user's ~/.cargo.
+    const cargo = join(tools, 'cargo');
+    mkdirSync(cargo);
+    writeFileSync(
+      join(cargo, 'config.toml'),
+      `[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = ${JSON.stringify(join(tools, 'vendor'))}\n\n[net]\noffline = true\n`,
+    );
+    env.CARGO_HOME = cargo;
+  }
+  return { tools, path, env };
 }
 
 /** Versions of the test toolchains, for the results' metadata. */
@@ -344,6 +447,11 @@ export function toolchainVersions(): Record<string, string> {
   if (existsSync(pytest)) versions.pytest = execFileSync(pytest, ['--version'], { encoding: 'utf8' }).trim();
   const jest = join(CACHE, 'javascript', 'node_modules', 'jest', 'package.json');
   if (existsSync(jest)) versions.jest = (JSON.parse(readFileSync(jest, 'utf8')) as { version: string }).version;
+  const rust = join(CACHE, 'rust', 'toolchain', 'bin');
+  if (existsSync(rust)) {
+    versions.rustc = execFileSync(join(rust, 'rustc'), ['--version'], { encoding: 'utf8' }).trim();
+    versions.cargo = execFileSync(join(rust, 'cargo'), ['--version'], { encoding: 'utf8' }).trim();
+  }
   versions.python = execFileSync('python3', ['--version'], { encoding: 'utf8' }).trim();
   versions.node = process.version;
   return versions;

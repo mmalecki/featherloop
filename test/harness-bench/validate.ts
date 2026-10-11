@@ -1,4 +1,4 @@
-import { cpSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { cpSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import yargs from 'yargs';
@@ -21,8 +21,8 @@ const argv = await yargs(hideBin(process.argv))
 const cases = loadCases(argv._.map(String), argv.set);
 ensureToolchains(cases);
 const root = mkdtempSync(join(tmpdir(), 'bench-validate-'));
-const { tools, path } = linkToolchains(root);
-const env = { ...process.env, PATH: [...path, process.env.PATH].join(delimiter), HOME: join(root, 'home'), TMPDIR: root };
+const { tools, path, env: toolEnv } = linkToolchains(root);
+const env = { ...process.env, ...toolEnv, PATH: [...path, process.env.PATH].join(delimiter), HOME: join(root, 'home'), TMPDIR: root };
 
 let failures = 0;
 const queue = [...cases];
@@ -51,8 +51,12 @@ async function check(c: Case): Promise<string[]> {
   const solved = join(root, `${c.lang}-${c.exercise}-reference`);
   prepareWorkspace(c, solved, tools);
   const config = JSON.parse(readFileSync(join(c.dir, '.meta', 'config.json'), 'utf8')) as { files: { example: string[] } };
-  if (config.files.example.length !== 1 || c.solution.length !== 1) problems.push('expected one solution file');
-  cpSync(join(c.dir, config.files.example[0]!), join(solved, c.solution[0]!));
+  // A Rust solution is its code and its manifest; the reference's manifest, when it needs crates, is apart.
+  const code = c.solution.filter((name) => name !== 'Cargo.toml');
+  if (config.files.example.length !== 1 || code.length !== 1) problems.push('expected one solution file');
+  cpSync(join(c.dir, config.files.example[0]!), join(solved, code[0]!));
+  const manifest = join(c.dir, '.meta', 'Cargo-example.toml');
+  if (existsSync(manifest)) cpSync(manifest, join(solved, 'Cargo.toml'));
   const after = await grade(c, solved, env);
   if (!after.pass) problems.push(`reference fails: ${after.passed}/${after.total} passed, exit ${after.exitCode}\n${after.output.slice(-1500)}`);
   return problems;

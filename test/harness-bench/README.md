@@ -220,7 +220,8 @@ it). Sessions, databases, caches and the user's own instructions (`~/.config/*/A
 
 The environment loses API keys (`OPENAI_*`, `ANTHROPIC_*`, `OPENROUTER_*`, `PARALLEL_*`),
 Google Cloud's credentials and config (`GOOGLE_*`, `CLOUDSDK_*`), `OPENCODE_*`, `PI_*`, `MODEL` (featherloop and nanocode read it), npm's script variables
-(`INIT_CWD` among them) and `PWD`, which is set to the workspace: opencode trusts it
+(`INIT_CWD` among them), cargo's and rustup's settings (`CARGO_*`, `RUSTUP_*`, `RUSTC*`,
+`RUSTDOC*`, `RUSTFLAGS`: a `CARGO_TARGET_DIR` would share builds between runs) and `PWD`, which is set to the workspace: opencode trusts it
 over its real working directory. Harnesses run in their own process group, killed at the
 timeout and after exit, with anything they left running.
 
@@ -231,10 +232,12 @@ flagged in the results.
 ## Cases
 
 From [Aider's polyglot benchmark](https://github.com/Aider-AI/polyglot-benchmark) at a
-pinned commit, fetched into `cache/` on first use, with pytest and jest. `cases.json`
-holds the sets and why they are what they are:
+pinned commit, fetched into `cache/` on first use, with pytest, jest and the crates the
+Rust exercises use. `cases.json` holds the sets and why they are what they are:
 
 - `all` (default): all 82 Python and JavaScript exercises that grade correctly.
+- `rust`: all 30 Rust exercises.
+- `all-rust`: `all` and `rust`, 112 cases; `all` stays as it was, so results compare.
 - `quick`: 30 of the easier ones, for iterating.
 - `hard-9b`: the 19 the 9B failed at least once in the first round, on which prompts are
   compared.
@@ -243,13 +246,24 @@ holds the sets and why they are what they are:
 
 Each run's workspace is the exercise's stub, tests and support files (never `.meta`,
 `.docs` or `.approaches`), committed to a fresh git repository. Jest's skipped tests are
-un-skipped first, as Aider's runner does. The prompt is Aider's (the exercise's docs,
+un-skipped first, as Aider's runner does; Rust's `#[ignore]`d ones run with
+`--include-ignored`, as there. The prompt is Aider's (the exercise's docs,
 then which files to change), plus where the tests are and how to run them: agents can
 run their own check loop, as they would on real work. After the run, tests and support
 files are put back as shipped and the tests are run; a run passes when they all do.
 Changed tests are reported.
 
-Only Python and JavaScript: the bench assumes no go, rust, java or cmake toolchains.
+Python, JavaScript and Rust: the bench assumes no go, java or cmake toolchains. Rust is
+the toolchain `rustc` resolves to when the bench starts (rustup's default), recorded in
+`meta.json`. Runs get its own `bin/` on their `PATH`, not rustup's proxies, which read
+`~/.rustup` and would find nothing in a run's empty home. The crates the exercises and
+their reference solutions ask for are vendored once into `cache/rust`; each run gets a
+cargo home of its own that builds from them, offline, so nothing is fetched or shared
+between runs. The grader runs each `tests/*.rs` by name (`cargo test --no-fail-fast
+--no-default-features --test <name>... -- --include-ignored`, the command agents are given
+too): not doc-tests or unit tests an agent adds, and every target, past a failing one, for
+partial credit. Tests behind a cargo feature (wordy's exponentials, which its docs offer)
+aren't run, as in Aider's runner, or counted, whatever defaults an agent gives `Cargo.toml`.
 
 ## Metrics
 
