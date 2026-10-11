@@ -132,18 +132,20 @@ function subagentTool(all: SubagentToolOptions, { depth, chain, pool }: Nesting)
         runner = resolved;
       }
 
+      // Only an agent with agents of its own gets a subagent tool, for those.
+      const { subagent: _, ...available } = tools();
+      const nested = depth < maxDepth ? await offer(agent, runner) : undefined;
+      if (nested) available.subagent = nested.tool;
+      const toolset = agent.toolset(available, permissions);
       const dir = cwd ?? process.cwd();
       const system = agent.system({
         cwd: dir,
         date: new Date().toISOString().slice(0, 10),
         model: runner.model,
+        // Its rules may still deny it the tool.
+        ...(nested && toolset.subagent ? { agents: nested.agents } : {}),
         ...(instructions === undefined ? {} : { instructions: typeof instructions === 'function' ? instructions(dir) : instructions }),
       });
-      // Only an agent with agents of its own gets a subagent tool, for those.
-      const { subagent: _, ...available } = tools();
-      const nested = depth < maxDepth ? await offer(agent, runner) : undefined;
-      if (nested) available.subagent = nested;
-      const toolset = agent.toolset(available, permissions);
       const task = transcript ? `${render(messages!)}\n\n<task>\n${input}\n</task>` : input;
       // The subagent's tools set up models as its own model refers to them.
       const loop = Loop(runner.api, toolset, { ...loopOptions, ...(runner.submodel ? { submodel: runner.submodel } : {}) });
@@ -162,8 +164,8 @@ function subagentTool(all: SubagentToolOptions, { depth, chain, pool }: Nesting)
     },
   })(options);
 
-  /** A subagent tool for `agent`'s own agents that `runner` can run, one level down; none if there are none. */
-  async function offer(agent: Agent, runner: Runner): Promise<Tool | undefined> {
+  /** A subagent tool for `agent`'s own agents that `runner` can run, one level down, and their names; none if there are none. */
+  async function offer(agent: Agent, runner: Runner): Promise<{ tool: Tool; agents: string[] } | undefined> {
     const below = runner.ref === undefined ? chain : [...chain, key(runner)];
     const offered: Agent[] = [];
     for (const name of agent.agents) {
@@ -177,7 +179,7 @@ function subagentTool(all: SubagentToolOptions, { depth, chain, pool }: Nesting)
       offered.push(next);
     }
     if (!offered.length) return undefined;
-    return subagentTool({ ...all, agents: offered }, { depth: depth + 1, chain: below, pool });
+    return { tool: subagentTool({ ...all, agents: offered }, { depth: depth + 1, chain: below, pool }), agents: offered.map(({ name }) => name) };
   }
 }
 
