@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import { CACHE, ensureRepo, git } from './cases.ts';
@@ -93,6 +93,21 @@ const NANOCODE = {
 };
 
 /**
+ * Pi, from npm (it moved from @mariozechner/pi-coding-agent at 0.73), with its dependencies
+ * as they were the day after its release (`npm --before`). Not in the bench cache: its
+ * system prompt names where it's installed, and that mustn't point the model at the
+ * exercises' checkout, or name the bench.
+ */
+const PI_VERSION = '1.1.0';
+const PI = {
+  package: '@earendil-works/pi-coding-agent',
+  version: PI_VERSION,
+  before: '2026-10-08T00:00:00Z',
+  // As a user's cache would have it.
+  dir: join(process.env.XDG_CACHE_HOME || join(homedir(), '.cache'), 'pi-coding-agent', PI_VERSION),
+};
+
+/**
  * featherloop from this repository. With `advised`, it also gets `--advisor`, on
  * the bench's advisor model, as its own config would name it: an `advisor` alias.
  */
@@ -176,6 +191,57 @@ const nanocode: Harness = {
 };
 
 /**
+ * Pi, headless (`--mode json`: the agent as `-p` runs it, with its events on stdout),
+ * with the model under test in its `models.json`, in the run's home, as a user adds a
+ * server Pi doesn't know. It asks nothing headless, and checks for updates and reports
+ * installs only interactively, so it needs no flags for them.
+ */
+const pi: Harness = {
+  name: 'pi',
+  description: `Pi (${PI.package}@${PI.version}), headless (--mode json), provider only`,
+  prepare: () => {
+    if (piVersion() !== PI.version) {
+      console.error(`Installing ${PI.package}@${PI.version}`);
+      mkdirSync(PI.dir, { recursive: true });
+      // --before: its dependencies' ranges resolve as they did on release, not to whatever came after.
+      execFileSync(
+        'npm',
+        ['install', '--prefix', PI.dir, '--save-exact', '--no-audit', '--no-fund', '--loglevel=error', `--before=${PI.before}`, `${PI.package}@${PI.version}`],
+        { stdio: 'inherit' },
+      );
+    }
+    return isolated((env) => execFileSync(piBin(), ['--version'], { encoding: 'utf8', env }).trim());
+  },
+  setup: ({ home, baseURL, prompt, model }) => {
+    const dir = join(home, '.pi', 'agent');
+    mkdirSync(dir, { recursive: true });
+    // The proxy supplies any key; the Anthropic SDK adds /v1 itself.
+    const provider =
+      model.flavor === 'anthropic'
+        ? { baseUrl: baseURL.replace(/\/v1\/?$/, ''), api: 'anthropic-messages' }
+        : { baseUrl: baseURL, api: 'openai-completions' };
+    const models = {
+      providers: {
+        bench: {
+          ...provider,
+          apiKey: 'bench',
+          models: [{ id: model.id, name: model.name, contextWindow: model.limit.context, maxTokens: model.limit.output }],
+        },
+      },
+    };
+    writeFileSync(join(dir, 'models.json'), `${JSON.stringify(models, null, 2)}\n`);
+    // `--` so no line of the prompt reads as a flag.
+    return { command: piBin(), args: ['--mode', 'json', '--model', `bench/${model.id}`, '--', prompt] };
+  },
+  notes: () => [
+    "--mode json; no other flags: headless, it asks for no approvals, and keeps its session in the run's home",
+    "the model without `reasoning` (Pi's default for a model it doesn't know): no thinking controls sent, whatever its thinking level",
+    "max_completion_tokens its own: the model's output limit, less the context in use",
+    'it reads AGENTS.md and CLAUDE.md from the workspace and above (none)',
+  ],
+};
+
+/**
  * Claude Code, headless (`-p`), against the run's proxy: `ANTHROPIC_BASE_URL` and a
  * dummy key the proxy replaces. Its background model is the model under test, so
  * every call it makes is metered; telemetry, nonessential traffic and updates are off.
@@ -219,8 +285,23 @@ export const HARNESSES: Harness[] = [
     'websearch off (it needs a key; the cases are offline)',
   ]),
   nanocode,
+  pi,
   claudeCode,
 ];
+
+/** Pi, as npm links it. */
+function piBin(): string {
+  return join(PI.dir, 'node_modules', '.bin', 'pi');
+}
+
+/** The version of Pi installed, if any. */
+function piVersion(): string | undefined {
+  try {
+    return (JSON.parse(readFileSync(join(PI.dir, 'node_modules', ...PI.package.split('/'), 'package.json'), 'utf8')) as { version: string }).version;
+  } catch {
+    return undefined;
+  }
+}
 
 /** `CLAUDE_BIN`, or `claude` on the PATH. */
 function claudeBin(): string {

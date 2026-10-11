@@ -46,6 +46,7 @@ Results land in `results/<timestamp>/`: `summary.md` and `summary.json`, `result
 | `opencode-stock` | `opencode run --standalone --auto`, provider only | `harnesses/opencode-stock/opencode.json` |
 | `opencode-custom` | the same, with the agents for smaller models | `harnesses/opencode-custom/` |
 | `nanocode` | [1rgs/nanocode](https://github.com/1rgs/nanocode) at `b009d3d`, unmodified | `harnesses/nanocode/driver.py` |
+| `pi` | [Pi](https://github.com/earendil-works/pi) 1.1.0, `pi --mode json`, provider only | `harnesses.ts` |
 | `featherloop-advisor` | featherloop with `--advisor`, on the bench's `--advisor` model; only with `--advisor` | `harnesses.ts` |
 | `claude-code` | Claude Code, headless (`claude -p`), permissions skipped; Anthropic models only | `harnesses.ts` |
 
@@ -61,7 +62,7 @@ cases are offline). featherloop runs without its advisor.
 `models.json` holds the models under test, each as the user's configs have it: its
 server, display name, context and output limits, and featherloop's own settings
 (variants). For each run the bench adds the chosen model (`-m`, default `qwen3.5-9b`)
-to the copied configs and passes it to every harness, so all four run the same model
+to the copied configs and passes it to every harness, so all of them run the same model
 with the same limits. `--base-url` (or `BENCH_UPSTREAM`) points at another server, and
 `--servers-cmd` at several (see [Servers](#servers)).
 
@@ -90,6 +91,25 @@ even with no terminal. nanocode asks for at most 8192 output tokens; the bench a
 the model's output limit instead, as the other harnesses' configs do. It's a request
 field the server stops at, which the model never sees: a larger model that reasons
 past 8192 tokens would otherwise end its run with a reply of nothing but thinking.
+
+Pi is installed from npm into `~/.cache/pi-coding-agent/<version>` (under
+`XDG_CACHE_HOME`, if set) on first use, at a pinned version, with its dependencies as they
+were on its release (`npm --before`). Not in `cache/`: its system prompt names where it's
+installed, for its own docs, and a path there would name the bench and lead the model to
+the exercises' checkout. It was
+`@mariozechner/pi-coding-agent` until 0.73; it's `@earendil-works/pi-coding-agent` now.
+It runs headless, `pi --mode json` (the agent `-p` runs, with its events on stdout), with
+the model in `~/.pi/agent/models.json` in the run's home: the proxy, a dummy key, and the
+model's context and output limits, as a user adds a server Pi doesn't know. Nothing else
+needs turning off: headless, it asks for no approvals, its session goes to the run's home,
+and it checks for updates and reports installs only interactively. The model has no
+`reasoning` flag (Pi's default), so Pi sends no thinking controls whatever its thinking
+level, and the system prompt goes as `system` (with the flag, it'd be `developer`, and
+`reasoning_effort`, which llama.cpp ignores for Qwen). It asks for the model's output
+limit itself, less the context in use (`max_completion_tokens`). It reads `AGENTS.md` and
+`CLAUDE.md` from the workspace and the directories above it, as it would anywhere; there
+are none. Its `stdout.log` is large: an event per streamed delta, about 2 MB for 6k tokens
+of output.
 
 A model's `flavor` in `models.json` is the API it speaks, as featherloop names it:
 `openai` (Chat Completions, e.g. llama.cpp) or `anthropic` (Messages). An `anthropic`
@@ -199,7 +219,7 @@ it). Sessions, databases, caches and the user's own instructions (`~/.config/*/A
 `~/.claude/CLAUDE.md`) don't carry over between runs or in from the user.
 
 The environment loses API keys (`OPENAI_*`, `ANTHROPIC_*`, `OPENROUTER_*`, `PARALLEL_*`),
-Google Cloud's credentials and config (`GOOGLE_*`, `CLOUDSDK_*`), `OPENCODE_*`, `MODEL` (featherloop and nanocode read it), npm's script variables
+Google Cloud's credentials and config (`GOOGLE_*`, `CLOUDSDK_*`), `OPENCODE_*`, `PI_*`, `MODEL` (featherloop and nanocode read it), npm's script variables
 (`INIT_CWD` among them) and `PWD`, which is set to the workspace: opencode trusts it
 over its real working directory. Harnesses run in their own process group, killed at the
 timeout and after exit, with anything they left running.
