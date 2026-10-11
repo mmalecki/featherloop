@@ -32,6 +32,8 @@ export interface AgentContext {
   /** Today, as YYYY-MM-DD. */
   date: string;
   model: string;
+  /** The agents it may hand tasks to, by name: those its subagent tool offers. None without one. */
+  agents?: readonly string[];
   /** From the user and the project (e.g. `formatInstructions()`), for `system()` to append. */
   instructions?: string;
 }

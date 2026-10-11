@@ -142,11 +142,12 @@ const availableTools = (): Toolset => {
   return available;
 };
 
+// Those the subagent tool offers. Subagents get the same tools, but never this one (SubagentTool leaves it out).
+const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
+
 // A factory, so `/c` starts over with fresh tool state (e.g. which files were read).
 const createLoop = () => {
   const available = availableTools();
-  // Subagents get the same tools, but never this one (SubagentTool leaves it out).
-  const agents = [...(subagent ? [generalAgent] : []), ...(advisor ? [advisorAgent] : [])];
   if (agents.length) available.subagent = SubagentTool({ agents, tools: availableTools, instructions });
   // The UI passes each run the current model's provider; this one is only the default.
   return Loop(initial.api, generalAgent.toolset(available), { submodel: initial.submodel! });
@@ -170,7 +171,13 @@ const ui = new SimpleUI(createLoop, {
     const cwd = process.cwd();
     const text = first ? formatInstructions(startup) : instructions(cwd);
     first = false;
-    return generalAgent.system({ cwd, date: new Date().toISOString().slice(0, 10), model: initial.model, instructions: text });
+    return generalAgent.system({
+      cwd,
+      date: new Date().toISOString().slice(0, 10),
+      model: initial.model,
+      agents: agents.map(({ name }) => name),
+      instructions: text,
+    });
   },
   ...(loaded.length ? { notes: [`instructions: ${loaded.join(', ')}`] } : {}),
 });

@@ -337,3 +337,29 @@ test('advisors hand tasks on only as deep as allowed', async () => {
   assert.equal((await askAdvisors(chain, 'm0')).reply, 'm0: m1: m2: m3 ok');
   assert.equal((await askAdvisors(chain, 'm0', { maxDepth: 1 })).reply, 'm0: m1 ok');
 });
+
+test("a subagent's system prompt names the agents it may hand tasks to, if its rules let it", async () => {
+  const advisor = defineAgent({ name: 'advisor', system: 'You advise.', model: 'advisor' });
+  const lead = (name: string, permissions?: PermissionRule[]) =>
+    defineAgent({ name, system: ({ agents }) => `You lead ${agents?.join(', ') ?? 'no one'}.`, agents: ['advisor'], ...(permissions ? { permissions } : {}) });
+  const tool = SubagentTool({ agents: [lead('open'), lead('alone', [{ action: 'subagent', effect: 'deny' }]), advisor], tools: () => ({}) });
+  const strong = fakeProvider(() => say('fine'));
+  const submodel = async (ref: string) => ({ ref: 'big/claude', alias: ref, api: strong, model: 'claude' });
+  const systems: string[] = [];
+  let turn = 0;
+  const parent = fakeProvider((request) => {
+    if (request.messages[0]!.content !== 'You lead.') {
+      systems.push(String(request.messages[0]!.content));
+      return say('done');
+    }
+    return [call('subagent', { agent: 'open', input: 'Go.' }), call('subagent', { agent: 'alone', input: 'Go.' })][turn++] ?? say('done');
+  });
+  await Loop(parent, { subagent: tool }, { submodel }).run({
+    model: 'small',
+    input: [
+      { role: 'system', content: 'You lead.' },
+      { role: 'user', content: 'Fix it.' },
+    ],
+  });
+  assert.deepEqual(systems, ['You lead advisor.', 'You lead no one.']);
+});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { Agent, defineAgent, type PermissionRule, type Tool, type Toolset } from '../src/index.ts';
+import { ADVISOR_REVIEWS, Agent, defineAgent, generalAgent, type PermissionRule, type Tool, type Toolset } from '../src/index.ts';
 
 // The toolset only needs names here; nothing gets invoked.
 const tool = {} as Tool;
@@ -73,6 +73,13 @@ test('system prompts can depend on where and when they run', () => {
   const ctx = { cwd: '/work', date: '2026-10-02', model: 'm' };
   assert.equal(agent().system(ctx), 'You test.');
   assert.equal(defineAgent({ name: 'x', system: ({ cwd, date }) => `${date} in ${cwd}` }).system(ctx), '2026-10-02 in /work');
+});
+
+test('the general agent asks for reviews only when it has an advisor to ask', () => {
+  const ctx = { cwd: '/work', date: '2026-10-02', model: 'm' };
+  assert.equal(generalAgent.system(ctx), 'Concise assistant. Today is 2026-10-02. cwd: /work');
+  assert.equal(generalAgent.system({ ...ctx, agents: ['general'] }), 'Concise assistant. Today is 2026-10-02. cwd: /work');
+  assert.equal(generalAgent.system({ ...ctx, agents: ['general', 'advisor'] }), `Concise assistant. ${ADVISOR_REVIEWS} Today is 2026-10-02. cwd: /work`);
 });
 
 test('is an Agent, and keeps its own copy of the rules', () => {
